@@ -1,8 +1,11 @@
+// Base path for API calls (empty for development, '/code' for production)
+const BASE_PATH = window.location.pathname.startsWith('/code/') ? '/code' : '';
+
 function dashboardApp() {
     return {
         // User data
         username: '',
-        
+
         // Projects
         projects: [],
         currentProjectId: '',
@@ -97,15 +100,15 @@ function dashboardApp() {
         },
         
         async loadUser() {
-            const response = await apiRequest('/api/auth/me');
+            const response = await apiRequest(`${BASE_PATH}/api/auth/me`);
             if (response && response.ok) {
                 const user = await response.json();
                 this.username = user.username;
             }
         },
-        
+
         async loadProjects() {
-            const response = await apiRequest('/api/projects/');
+            const response = await apiRequest(`${BASE_PATH}/api/projects/`);
             if (response && response.ok) {
                 this.projects = await response.json();
                 if (this.projects.length > 0 && !this.currentProjectId) {
@@ -134,10 +137,10 @@ function dashboardApp() {
         },
         
         async loadConversations() {
-            const url = this.currentProjectId 
-                ? `/api/chat/conversations?project_id=${this.currentProjectId}`
-                : '/api/chat/conversations';
-            
+            const url = this.currentProjectId
+                ? `${BASE_PATH}/api/chat/conversations?project_id=${this.currentProjectId}`
+                : `${BASE_PATH}/api/chat/conversations`;
+
             const response = await apiRequest(url);
             if (response && response.ok) {
                 this.conversations = await response.json();
@@ -150,7 +153,7 @@ function dashboardApp() {
         },
         
         async createConversation() {
-            const response = await apiRequest('/api/chat/conversations', {
+            const response = await apiRequest(`${BASE_PATH}/api/chat/conversations`, {
                 method: 'POST',
                 body: {
                     title: 'New Conversation',
@@ -198,7 +201,7 @@ function dashboardApp() {
                 return;
             }
 
-            const response = await apiRequest(`/api/chat/conversations/${conversationId}`, {
+            const response = await apiRequest(`${BASE_PATH}/api/chat/conversations/${conversationId}`, {
                 method: 'PUT',
                 body: {
                     title: this.editingConversationTitle.trim()
@@ -223,17 +226,17 @@ function dashboardApp() {
         },
         
         async loadMessages() {
-            const response = await apiRequest(`/api/chat/conversations/${this.currentConversationId}/messages`);
+            const response = await apiRequest(`${BASE_PATH}/api/chat/conversations/${this.currentConversationId}/messages`);
             if (response && response.ok) {
                 this.messages = await response.json();
                 this.$nextTick(() => this.scrollToBottom());
             }
         },
-        
+
         connectWebSocket() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/api/chat/ws/${this.currentConversationId}`;
-            
+            const wsUrl = `${protocol}//${window.location.host}${BASE_PATH}/api/chat/ws/${this.currentConversationId}`;
+
             this.ws = new WebSocket(wsUrl);
             
             this.ws.onmessage = (event) => {
@@ -284,15 +287,15 @@ function dashboardApp() {
         },
         
         async scanProjects() {
-            const response = await apiRequest('/api/projects/scan');
+            const response = await apiRequest(`${BASE_PATH}/api/projects/scan`);
             if (response && response.ok) {
                 this.scannedProjects = await response.json();
                 this.showProjectScan = true;
             }
         },
-        
+
         async addProject(project) {
-            const response = await apiRequest('/api/projects/', {
+            const response = await apiRequest(`${BASE_PATH}/api/projects/`, {
                 method: 'POST',
                 body: {
                     name: project.name,
@@ -319,28 +322,28 @@ function dashboardApp() {
         
         async loadFileTree() {
             if (!this.currentProjectId) return;
-            
-            const response = await apiRequest(`/api/files/${this.currentProjectId}/tree`);
+
+            const response = await apiRequest(`${BASE_PATH}/api/files/${this.currentProjectId}/tree`);
             if (response && response.ok) {
                 this.fileTree = await response.json();
             }
         },
-        
+
         async openFile(path) {
             if (!this.currentProjectId) return;
-            
-            const response = await apiRequest(`/api/files/${this.currentProjectId}/content?path=${encodeURIComponent(path)}`);
+
+            const response = await apiRequest(`${BASE_PATH}/api/files/${this.currentProjectId}/content?path=${encodeURIComponent(path)}`);
             if (response && response.ok) {
                 const data = await response.json();
                 this.currentFile = path;
                 this.fileContent = data.content;
             }
         },
-        
+
         async saveFile() {
             if (!this.currentProjectId || !this.currentFile) return;
-            
-            const response = await apiRequest(`/api/files/${this.currentProjectId}/content?path=${encodeURIComponent(this.currentFile)}`, {
+
+            const response = await apiRequest(`${BASE_PATH}/api/files/${this.currentProjectId}/content?path=${encodeURIComponent(this.currentFile)}`, {
                 method: 'PUT',
                 body: {
                     content: this.fileContent
@@ -355,12 +358,12 @@ function dashboardApp() {
         async loadGitStatus() {
             if (!this.currentProjectId) return;
 
-            const response = await apiRequest(`/api/git/${this.currentProjectId}/status`);
+            const response = await apiRequest(`${BASE_PATH}/api/git/${this.currentProjectId}/status`);
             if (response && response.ok) {
                 this.gitStatus = await response.json();
             }
 
-            const logResponse = await apiRequest(`/api/git/${this.currentProjectId}/log?limit=10`);
+            const logResponse = await apiRequest(`${BASE_PATH}/api/git/${this.currentProjectId}/log?limit=10`);
             if (logResponse && logResponse.ok) {
                 this.gitLog = await logResponse.json();
             }
@@ -465,7 +468,7 @@ function dashboardApp() {
             }
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/api/terminal/ws/${this.currentProjectId}`;
+            const wsUrl = `${protocol}//${window.location.host}${BASE_PATH}/api/terminal/ws/${this.currentProjectId}`;
 
             const ws = new WebSocket(wsUrl);
             terminalData.ws = ws;

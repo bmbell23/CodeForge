@@ -1,8 +1,9 @@
 """Main FastAPI application."""
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from fastapi.responses import RedirectResponse, HTMLResponse
 from pathlib import Path
 
 from .database import engine, Base
@@ -15,13 +16,13 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="CodeForge",
     description="Web-based IDE centered around Augment CLI",
-    version="0.1.0",
+    version="0.1.4",
 )
 
 # Get the package directory
 package_dir = Path(__file__).parent
 
-# Mount static files
+# Mount static files (nginx will handle the /code/ prefix)
 static_dir = package_dir / "static"
 static_dir.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -41,8 +42,11 @@ app.include_router(terminal.router, prefix="/api/terminal", tags=["terminal"])
 app.include_router(pages.router, tags=["pages"])
 
 
+# Root redirect removed - nginx handles the /code/ prefix
+
+
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy"}
+    return {"status": "healthy", "version": "0.1.4"}
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=CodeForge - AI-Powered Web IDE
+After=network.target
+
+[Service]
+Type=simple
+User=brandon
+Group=brandon
+WorkingDirectory=/home/brandon/projects/CodeForge
+Environment="PATH=/home/brandon/projects/CodeForge/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONPATH=/home/brandon/projects/CodeForge/src"
+ExecStart=/home/brandon/projects/CodeForge/venv/bin/python scripts/server.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+

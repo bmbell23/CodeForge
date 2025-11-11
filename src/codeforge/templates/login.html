@@ -51,7 +51,7 @@
                     <div class="relative flex justify-center text-sm">
                         <span class="px-2 text-gray-500 dark:text-gray-400">
                             Don't have an account?
-                            <a href="/register" class="font-medium text-blue-600 hover:text-blue-500">
+                            <a href="/code/register" class="font-medium text-blue-600 hover:text-blue-500">
                                 Register
                             </a>
                         </span>
@@ -63,27 +63,30 @@
 </div>
 
 <script>
+// Detect if we're running under /code/ prefix
+const BASE_PATH = window.location.pathname.startsWith('/code/') ? '/code' : '';
+
 document.getElementById('loginForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    
+
     const username = document.getElementById('username').value;
     const password = document.getElementById('password').value;
     const errorDiv = document.getElementById('errorMessage');
-    
+
     try {
         const formData = new FormData();
         formData.append('username', username);
         formData.append('password', password);
-        
-        const response = await fetch('/api/auth/login', {
+
+        const response = await fetch(`${BASE_PATH}/api/auth/login`, {
             method: 'POST',
             body: formData
         });
-        
+
         if (response.ok) {
             const data = await response.json();
             localStorage.setItem('token', data.access_token);
-            window.location.href = '/dashboard';
+            window.location.href = `${BASE_PATH}/dashboard`;
         } else {
             const error = await response.json();
             errorDiv.textContent = error.detail || 'Login failed';

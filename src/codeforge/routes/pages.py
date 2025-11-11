@@ -18,7 +18,9 @@ templates = Jinja2Templates(directory=str(templates_dir))
 @router.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     """Landing page - redirects to login or dashboard."""
-    return RedirectResponse(url="/login")
+    # Check if we're behind a proxy with /code/ prefix
+    prefix = "/code" if request.headers.get("x-forwarded-prefix") == "/code" else ""
+    return RedirectResponse(url=f"{prefix}/login")
 
 
 @router.get("/login", response_class=HTMLResponse)

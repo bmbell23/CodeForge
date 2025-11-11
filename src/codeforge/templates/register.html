@@ -58,7 +58,7 @@
                     <div class="relative flex justify-center text-sm">
                         <span class="px-2 text-gray-500 dark:text-gray-400">
                             Already have an account?
-                            <a href="/login" class="font-medium text-blue-600 hover:text-blue-500">
+                            <a href="/code/login" class="font-medium text-blue-600 hover:text-blue-500">
                                 Sign in
                             </a>
                         </span>
@@ -70,38 +70,41 @@
 </div>
 
 <script>
+// Detect if we're running under /code/ prefix
+const BASE_PATH = window.location.pathname.startsWith('/code/') ? '/code' : '';
+
 document.getElementById('registerForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    
+
     const username = document.getElementById('username').value;
     const email = document.getElementById('email').value;
     const password = document.getElementById('password').value;
     const errorDiv = document.getElementById('errorMessage');
-    
+
     try {
-        const response = await fetch('/api/auth/register', {
+        const response = await fetch(`${BASE_PATH}/api/auth/register`, {
             method: 'POST',
             headers: {
                 'Content-Type': 'application/json'
             },
             body: JSON.stringify({ username, email, password })
         });
-        
+
         if (response.ok) {
             // Auto-login after registration
             const formData = new FormData();
             formData.append('username', username);
             formData.append('password', password);
-            
-            const loginResponse = await fetch('/api/auth/login', {
+
+            const loginResponse = await fetch(`${BASE_PATH}/api/auth/login`, {
                 method: 'POST',
                 body: formData
             });
-            
+
             if (loginResponse.ok) {
                 const data = await loginResponse.json();
                 localStorage.setItem('token', data.access_token);
-                window.location.href = '/dashboard';
+                window.location.href = `${BASE_PATH}/dashboard`;
             }
         } else {
             const error = await response.json();
