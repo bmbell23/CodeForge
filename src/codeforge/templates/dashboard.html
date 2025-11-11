@@ -38,6 +38,9 @@
         
         <div class="flex items-center space-x-4">
             <span x-text="'User: ' + username" class="text-sm"></span>
+            <a :href="`${BASE_PATH}/settings`" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm">
+                ⚙️ Settings
+            </a>
             <button @click="logout()" class="bg-red-600 hover:bg-red-700 px-3 py-1 rounded text-sm">
                 Logout
             </button>

@@ -41,6 +41,12 @@ async def dashboard(request: Request):
     return templates.TemplateResponse("dashboard.html", {"request": request})
 
 
+@router.get("/settings", response_class=HTMLResponse)
+async def settings_page(request: Request):
+    """Settings page."""
+    return templates.TemplateResponse("settings.html", {"request": request})
+
+
 @router.get("/chat/{conversation_id}", response_class=HTMLResponse)
 async def chat_page(request: Request, conversation_id: int):
     """Chat page for a specific conversation."""
