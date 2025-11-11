@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - CodeForge{% endblock %}
+
+{% block body %}
+<div x-data="dashboardApp()" x-init="init()" class="h-full flex flex-col">
+    <!-- Top Navigation Bar -->
+    <nav class="bg-gray-800 text-white px-4 py-3 flex items-center justify-between">
+        <div class="flex items-center space-x-4">
+            <h1 class="text-xl font-bold">CodeForge</h1>
+            
+            <!-- Project Selector -->
+            <select x-model="currentProjectId" @change="switchProject()" 
+                class="bg-gray-700 text-white rounded px-3 py-1 text-sm">
+                <option value="">Select Project...</option>
+                <template x-for="project in projects" :key="project.id">
+                    <option :value="project.id" x-text="project.name"></option>
+                </template>
+            </select>
+            
+            <button @click="scanProjects()"
+                class="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-sm">
+                + Add Project
+            </button>
+        </div>
+        
+        <div class="flex items-center space-x-4">
+            <span x-text="'User: ' + username" class="text-sm"></span>
+            <button @click="logout()" class="bg-red-600 hover:bg-red-700 px-3 py-1 rounded text-sm">
+                Logout
+            </button>
+        </div>
+    </nav>
+    
+    <!-- Main Content Area -->
+    <div class="flex-1 flex overflow-hidden">
+        <!-- Left Sidebar - Conversations -->
+        <div class="w-64 bg-gray-100 dark:bg-gray-800 border-r border-gray-300 dark:border-gray-700 flex flex-col">
+            <div class="p-4 border-b border-gray-300 dark:border-gray-700">
+                <button @click="createConversation()" 
+                    class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">
+                    + New Conversation
+                </button>
+            </div>
+            
+            <div class="flex-1 overflow-y-auto">
+                <template x-for="conv in conversations" :key="conv.id">
+                    <div @click="selectConversation(conv.id)" 
+                        :class="{'bg-blue-100 dark:bg-blue-900': currentConversationId === conv.id}"
+                        class="p-3 border-b border-gray-200 dark:border-gray-700 cursor-pointer hover:bg-gray-200 dark:hover:bg-gray-700">
+                        <div class="font-medium text-sm text-gray-900 dark:text-white" x-text="conv.title"></div>
+                        <div class="text-xs text-gray-500 dark:text-gray-400" x-text="conv.message_count + ' messages'"></div>
+                    </div>
+                </template>
+            </div>
+        </div>
+        
+        <!-- Center - Chat Area -->
+        <div class="flex-1 flex flex-col">
+            <!-- Tab Bar -->
+            <div class="bg-gray-200 dark:bg-gray-700 px-4 py-2 flex space-x-2 border-b border-gray-300 dark:border-gray-600">
+                <button @click="currentTab = 'chat'" 
+                    :class="{'bg-white dark:bg-gray-800': currentTab === 'chat'}"
+                    class="px-4 py-2 rounded-t text-sm font-medium">
+                    Chat
+                </button>
+                <button @click="currentTab = 'files'" 
+                    :class="{'bg-white dark:bg-gray-800': currentTab === 'files'}"
+                    class="px-4 py-2 rounded-t text-sm font-medium">
+                    Files
+                </button>
+                <button @click="currentTab = 'git'" 
+                    :class="{'bg-white dark:bg-gray-800': currentTab === 'git'}"
+                    class="px-4 py-2 rounded-t text-sm font-medium">
+                    Git
+                </button>
+            </div>
+            
+            <!-- Chat Tab -->
+            <div x-show="currentTab === 'chat'" class="flex-1 flex flex-col overflow-hidden">
+                <!-- Messages Area -->
+                <div class="flex-1 overflow-y-auto p-4 space-y-4" id="messagesContainer">
+                    <template x-for="message in messages" :key="message.id">
+                        <div :class="message.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
+                            <div :class="message.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white'"
+                                class="max-w-3xl rounded-lg px-4 py-2">
+                                <div class="text-xs font-semibold mb-1" x-text="message.role === 'user' ? 'You' : 'Augment'"></div>
+                                <div class="whitespace-pre-wrap" x-text="message.content"></div>
+                            </div>
+                        </div>
+                    </template>
+                    
+                    <!-- Streaming message -->
+                    <div x-show="isStreaming" class="flex justify-start">
+                        <div class="max-w-3xl bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg px-4 py-2">
+                            <div class="text-xs font-semibold mb-1">Augment</div>
+                            <div class="whitespace-pre-wrap" x-text="streamingContent"></div>
+                            <span class="inline-block w-2 h-4 bg-gray-900 dark:bg-white animate-pulse"></span>
+                        </div>
+                    </div>
+                </div>
+                
+                <!-- Input Area -->
+                <div class="border-t border-gray-300 dark:border-gray-700 p-4">
+                    <form @submit.prevent="sendMessage()" class="flex space-x-2">
+                        <textarea x-model="messageInput" 
+                            @keydown.enter.prevent="if(!$event.shiftKey) sendMessage()"
+                            placeholder="Type your message... (Shift+Enter for new line)"
+                            rows="3"
+                            class="flex-1 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white resize-none"></textarea>
+                        <button type="submit" :disabled="!messageInput.trim() || isStreaming"
+                            class="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-6 py-2 rounded font-medium">
+                            Send
+                        </button>
+                    </form>
+                </div>
+            </div>
+            
+            <!-- Files Tab -->
+            <div x-show="currentTab === 'files'" class="flex-1 flex overflow-hidden">
+                <!-- File Tree -->
+                <div class="w-64 border-r border-gray-300 dark:border-gray-700 overflow-y-auto p-2">
+                    <template x-for="file in fileTree" :key="file.path">
+                        <div @click="if(file.type === 'file') openFile(file.path)" 
+                            class="px-2 py-1 hover:bg-gray-200 dark:hover:bg-gray-700 cursor-pointer text-sm">
+                            <span x-text="file.type === 'directory' ? '📁' : '📄'"></span>
+                            <span x-text="file.name" class="ml-1"></span>
+                        </div>
+                    </template>
+                </div>
+                
+                <!-- File Editor -->
+                <div class="flex-1 flex flex-col">
+                    <div x-show="currentFile" class="flex-1 flex flex-col">
+                        <div class="bg-gray-200 dark:bg-gray-700 px-4 py-2 border-b border-gray-300 dark:border-gray-600">
+                            <span x-text="currentFile" class="text-sm font-medium"></span>
+                        </div>
+                        <textarea x-model="fileContent" 
+                            class="flex-1 p-4 font-mono text-sm border-none focus:outline-none dark:bg-gray-800 dark:text-white resize-none"></textarea>
+                        <div class="p-2 border-t border-gray-300 dark:border-gray-700">
+                            <button @click="saveFile()" 
+                                class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded text-sm">
+                                Save File
+                            </button>
+                        </div>
+                    </div>
+                    <div x-show="!currentFile" class="flex-1 flex items-center justify-center text-gray-500">
+                        Select a file to edit
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Git Tab -->
+            <div x-show="currentTab === 'git'" class="flex-1 overflow-y-auto p-4">
+                <div class="space-y-4">
+                    <div>
+                        <h3 class="text-lg font-bold mb-2">Git Status</h3>
+                        <div x-show="gitStatus" class="bg-gray-100 dark:bg-gray-800 p-4 rounded">
+                            <div><strong>Branch:</strong> <span x-text="gitStatus?.branch"></span></div>
+                            <div><strong>Status:</strong> <span x-text="gitStatus?.is_dirty ? 'Modified' : 'Clean'"></span></div>
+                            <div class="mt-2">
+                                <strong>Modified Files:</strong>
+                                <ul class="list-disc list-inside">
+                                    <template x-for="file in gitStatus?.modified_files || []" :key="file">
+                                        <li x-text="file" class="text-sm"></li>
+                                    </template>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <div>
+                        <h3 class="text-lg font-bold mb-2">Recent Commits</h3>
+                        <div class="space-y-2">
+                            <template x-for="commit in gitLog" :key="commit.sha">
+                                <div class="bg-gray-100 dark:bg-gray-800 p-3 rounded">
+                                    <div class="text-sm font-mono text-gray-600 dark:text-gray-400" x-text="commit.sha.substring(0, 7)"></div>
+                                    <div class="font-medium" x-text="commit.message"></div>
+                                    <div class="text-sm text-gray-600 dark:text-gray-400">
+                                        <span x-text="commit.author"></span> - <span x-text="new Date(commit.date).toLocaleString()"></span>
+                                    </div>
+                                </div>
+                            </template>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Project Scan Modal -->
+    <div x-show="showProjectScan" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+        <div class="bg-white dark:bg-gray-800 rounded-lg p-6 max-w-2xl w-full max-h-96 overflow-y-auto">
+            <h2 class="text-xl font-bold mb-4">Add Project</h2>
+            <div class="space-y-2">
+                <template x-for="project in scannedProjects" :key="project.path">
+                    <div class="flex items-center justify-between p-3 border border-gray-300 dark:border-gray-600 rounded">
+                        <div>
+                            <div class="font-medium" x-text="project.name"></div>
+                            <div class="text-sm text-gray-600 dark:text-gray-400" x-text="project.path"></div>
+                        </div>
+                        <button x-show="!project.exists_in_db" @click="addProject(project)" 
+                            class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-sm">
+                            Add
+                        </button>
+                        <span x-show="project.exists_in_db" class="text-green-600 text-sm">Added</span>
+                    </div>
+                </template>
+            </div>
+            <div class="mt-4 flex justify-end">
+                <button @click="showProjectScan = false" 
+                    class="bg-gray-600 hover:bg-gray-700 text-white px-4 py-2 rounded">
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="/static/js/dashboard.js"></script>
+{% endblock %}
+
