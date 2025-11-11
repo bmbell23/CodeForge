@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, shrink-to-fit=no">
+    <title>Mobile Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .test-container {
+            max-width: 400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .test-section {
+            margin-bottom: 30px;
+            padding: 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+        .test-section h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        textarea {
+            width: 100%;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 10px;
+            font-size: 16px;
+            resize: none;
+            min-height: 60px;
+            max-height: 120px;
+            overflow-y: auto;
+        }
+        .status {
+            margin-top: 10px;
+            padding: 10px;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .success { background: #d4edda; color: #155724; }
+        .warning { background: #fff3cd; color: #856404; }
+    </style>
+</head>
+<body>
+    <div class="test-container">
+        <h1>Mobile UI Test</h1>
+        
+        <div class="test-section">
+            <h3>1. Zoom Prevention Test</h3>
+            <p>Tap in the textarea below. It should NOT zoom in on mobile devices.</p>
+            <textarea placeholder="Type here to test zoom prevention..." 
+                      oninput="autoResize(this)"></textarea>
+            <div class="status success">
+                ✅ Enhanced viewport meta tag with minimum-scale=1.0 and shrink-to-fit=no
+            </div>
+        </div>
+        
+        <div class="test-section">
+            <h3>2. Auto-resize Test</h3>
+            <p>Type multiple lines in the textarea. It should grow from 44px (mobile) to 120px max height.</p>
+            <textarea placeholder="Type multiple lines here..."
+                      oninput="autoResize(this)"
+                      style="min-height: 44px; max-height: 120px; resize: none; overflow-y: auto;"></textarea>
+            <div class="status success">
+                ✅ Auto-resize functionality improved (44px min on mobile)
+            </div>
+        </div>
+        
+        <div class="test-section">
+            <h3>3. Mobile Navigation</h3>
+            <p>On mobile, you should now see:</p>
+            <ul>
+                <li>Bottom tab bar with Chat, Files, Git, Terminal, More</li>
+                <li>Current tab indicator in header</li>
+                <li>Quick actions in sidebar (More button)</li>
+            </ul>
+            <div class="status success">
+                ✅ Mobile bottom tab bar added
+            </div>
+        </div>
+        
+        <div class="test-section">
+            <h3>4. Font Size Fix</h3>
+            <p>All inputs should use 16px font size to prevent zoom on iOS.</p>
+            <input type="text" placeholder="Test input field" style="width: 100%; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+            <div class="status success">
+                ✅ Enhanced CSS rules: 16px font size + webkit-appearance:none + touch-action:manipulation
+            </div>
+        </div>
+
+        <div class="test-section">
+            <h3>5. Double-Tap Zoom Prevention</h3>
+            <p>Double-tap on the button below. It should NOT zoom in.</p>
+            <button style="width: 100%; padding: 15px; font-size: 16px; background: #007bff; color: white; border: none; border-radius: 4px; margin: 10px 0;">
+                Double-tap me (no zoom)
+            </button>
+            <div class="status success">
+                ✅ JavaScript handlers added to prevent double-tap zoom and gesture zoom
+            </div>
+        </div>
+
+        <div class="test-section">
+            <h3>6. Multiple Input Types</h3>
+            <p>Test various input types - none should cause zoom:</p>
+            <div style="display: flex; flex-direction: column; gap: 10px;">
+                <input type="email" placeholder="Email input" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+                <input type="password" placeholder="Password input" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+                <input type="number" placeholder="Number input" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+                <input type="date" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+                <input type="time" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+                <select style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+                    <option>Select option</option>
+                    <option>Option 1</option>
+                    <option>Option 2</option>
+                </select>
+            </div>
+            <div class="status success">
+                ✅ All input types covered with 16px font size and webkit-appearance:none
+            </div>
+        </div>
+
+        <div class="test-section">
+            <h3>7. Real-world Chat Simulation</h3>
+            <p>This simulates the actual CodeForge chat interface:</p>
+            <div style="border: 1px solid #ddd; border-radius: 8px; padding: 15px; background: #f9f9f9;">
+                <div style="margin-bottom: 10px; padding: 10px; background: #e3f2fd; border-radius: 8px;">
+                    <strong>Assistant:</strong> Hello! How can I help you today?
+                </div>
+                <form onsubmit="return false;" style="display: flex; flex-direction: column; gap: 10px;">
+                    <textarea placeholder="Type your message..."
+                              style="font-size: 16px; min-height: 44px; max-height: 120px; padding: 12px; border: 1px solid #ccc; border-radius: 8px; resize: none; overflow-y: auto; -webkit-appearance: none;"
+                              oninput="autoResize(this)"></textarea>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <button type="button" style="background: none; border: none; color: #666; font-size: 16px;">📎 Attach</button>
+                        <button type="submit" style="background: #2563eb; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-size: 16px;">Send</button>
+                    </div>
+                </form>
+            </div>
+            <div class="status success">
+                ✅ Chat interface simulation with proper zoom prevention
+            </div>
+        </div>
+
+        <div class="test-section">
+            <h3>8. Zoom Detection Test</h3>
+            <p>Current zoom level: <span id="zoomLevel">1.0</span></p>
+            <p>Viewport width: <span id="viewportWidth">-</span>px</p>
+            <p>Screen width: <span id="screenWidth">-</span>px</p>
+            <div class="status" id="zoomStatus">
+                📊 Monitoring zoom level...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function autoResize(textarea) {
+            // Reset height to auto to get the correct scrollHeight
+            textarea.style.height = 'auto';
+
+            // Calculate new height (min 44px for mobile touch targets, max 120px)
+            const minHeight = window.innerWidth <= 768 ? 44 : 40;
+            const maxHeight = 120;
+            const newHeight = Math.max(minHeight, Math.min(textarea.scrollHeight, maxHeight));
+
+            textarea.style.height = newHeight + 'px';
+        }
+        
+        // Test viewport settings and monitor zoom
+        window.addEventListener('load', function() {
+            const viewport = document.querySelector('meta[name="viewport"]');
+            console.log('Viewport settings:', viewport.content);
+
+            // Add zoom prevention handlers
+            initZoomPrevention();
+
+            // Start zoom monitoring
+            monitorZoom();
+        });
+
+        function initZoomPrevention() {
+            // Prevent zoom on double tap
+            document.addEventListener('touchend', function(e) {
+                const now = new Date().getTime();
+                const timeSince = now - this.lastTouchEnd;
+                if ((timeSince < 300) && (timeSince > 0)) {
+                    e.preventDefault();
+                }
+                this.lastTouchEnd = now;
+            }, false);
+
+            // Prevent gesture zoom
+            document.addEventListener('gesturestart', function(e) {
+                e.preventDefault();
+            });
+
+            // Ensure all inputs have proper font size
+            const inputs = document.querySelectorAll('input, textarea, select, button');
+            inputs.forEach(input => {
+                input.style.fontSize = '16px';
+                input.style.webkitTextSizeAdjust = '100%';
+                input.style.webkitAppearance = 'none';
+                input.style.touchAction = 'manipulation';
+            });
+        }
+
+        function monitorZoom() {
+            function updateZoomInfo() {
+                const zoomLevel = Math.round((window.outerWidth / window.innerWidth) * 100) / 100;
+                const viewportWidth = window.innerWidth;
+                const screenWidth = window.screen.width;
+
+                document.getElementById('zoomLevel').textContent = zoomLevel.toFixed(2);
+                document.getElementById('viewportWidth').textContent = viewportWidth;
+                document.getElementById('screenWidth').textContent = screenWidth;
+
+                const zoomStatus = document.getElementById('zoomStatus');
+                if (zoomLevel > 1.1) {
+                    zoomStatus.textContent = '⚠️ Zoom detected! This indicates zoom prevention may not be working.';
+                    zoomStatus.className = 'status warning';
+                } else {
+                    zoomStatus.textContent = '✅ No unwanted zoom detected.';
+                    zoomStatus.className = 'status success';
+                }
+            }
+
+            // Update immediately and on resize
+            updateZoomInfo();
+            window.addEventListener('resize', updateZoomInfo);
+            window.addEventListener('orientationchange', updateZoomInfo);
+
+            // Monitor for zoom changes
+            setInterval(updateZoomInfo, 1000);
+        }
+    </script>
+</body>
+</html>
