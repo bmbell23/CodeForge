@@ -2,6 +2,14 @@
 
 {% block title %}Dashboard - CodeForge{% endblock %}
 
+{% block extra_head %}
+<!-- Marked.js for Markdown rendering -->
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<!-- Highlight.js for code syntax highlighting -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+{% endblock %}
+
 {% block body %}
 <div x-data="dashboardApp()" x-init="init()" class="h-full flex flex-col">
     <!-- Top Navigation Bar -->
@@ -104,16 +112,18 @@
                             <div :class="message.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white'"
                                 class="max-w-3xl rounded-lg px-4 py-2">
                                 <div class="text-xs font-semibold mb-1" x-text="message.role === 'user' ? 'You' : 'Augment'"></div>
-                                <div class="whitespace-pre-wrap" x-text="message.content"></div>
+                                <div class="prose prose-sm max-w-none dark:prose-invert"
+                                    :class="message.role === 'user' ? 'prose-invert' : ''"
+                                    x-html="renderMarkdown(message.content)"></div>
                             </div>
                         </div>
                     </template>
-                    
+
                     <!-- Streaming message -->
                     <div x-show="isStreaming" class="flex justify-start">
                         <div class="max-w-3xl bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg px-4 py-2">
                             <div class="text-xs font-semibold mb-1">Augment</div>
-                            <div class="whitespace-pre-wrap" x-text="streamingContent"></div>
+                            <div class="prose prose-sm max-w-none dark:prose-invert" x-html="renderMarkdown(streamingContent)"></div>
                             <span class="inline-block w-2 h-4 bg-gray-900 dark:bg-white animate-pulse"></span>
                         </div>
                     </div>

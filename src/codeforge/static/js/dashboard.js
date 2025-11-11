@@ -37,6 +37,51 @@ function dashboardApp() {
         async init() {
             await this.loadUser();
             await this.loadProjects();
+            this.configureMarked();
+        },
+
+        configureMarked() {
+            // Configure marked.js for better rendering
+            if (typeof marked !== 'undefined') {
+                marked.setOptions({
+                    breaks: true,
+                    gfm: true,
+                    highlight: function(code, lang) {
+                        if (typeof hljs !== 'undefined' && lang && hljs.getLanguage(lang)) {
+                            try {
+                                return hljs.highlight(code, { language: lang }).value;
+                            } catch (err) {}
+                        }
+                        return code;
+                    }
+                });
+            }
+        },
+
+        stripAnsiCodes(text) {
+            // Remove ANSI escape codes (terminal color codes)
+            // Pattern matches: ESC[...m or ESC[...
+            return text.replace(/\x1b\[[0-9;]*m/g, '')
+                      .replace(/\x1b\[[0-9;]*[A-Za-z]/g, '')
+                      .replace(/\[\d+m/g, '');
+        },
+
+        renderMarkdown(content) {
+            if (!content) return '';
+
+            // Strip ANSI codes first
+            content = this.stripAnsiCodes(content);
+
+            if (typeof marked === 'undefined') {
+                // Fallback if marked.js isn't loaded
+                return content.replace(/\n/g, '<br>');
+            }
+            try {
+                return marked.parse(content);
+            } catch (err) {
+                console.error('Markdown rendering error:', err);
+                return content.replace(/\n/g, '<br>');
+            }
         },
         
         async loadUser() {
