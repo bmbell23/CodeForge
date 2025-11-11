@@ -34,6 +34,8 @@ function dashboardApp() {
         fileTree: [],
         currentFile: null,
         fileContent: '',
+        currentPath: '', // Track current directory path
+        loadingFileTree: false,
         
         // Git
         gitStatus: null,
@@ -54,6 +56,14 @@ function dashboardApp() {
                 if (this.currentTerminalProjectId && this.terminals[this.currentTerminalProjectId]) {
                     const terminalData = this.terminals[this.currentTerminalProjectId];
                     terminalData.fitAddon.fit();
+                }
+            });
+
+            // Watch for tab changes to ensure file tree is loaded
+            this.$watch('currentTab', (newTab) => {
+                if (newTab === 'files' && this.currentProjectId && this.fileTree.length === 0) {
+                    console.log('Files tab activated, loading file tree');
+                    this.loadFileTree();
                 }
             });
         },
@@ -356,12 +366,37 @@ function dashboardApp() {
             }
         },
         
-        async loadFileTree() {
-            if (!this.currentProjectId) return;
+        async loadFileTree(path = '') {
+            if (!this.currentProjectId) {
+                console.warn('No current project selected');
+                return;
+            }
 
-            const response = await apiRequest(`${BASE_PATH}/api/files/${this.currentProjectId}/tree`);
-            if (response && response.ok) {
-                this.fileTree = await response.json();
+            this.loadingFileTree = true;
+
+            const url = path
+                ? `${BASE_PATH}/api/files/${this.currentProjectId}/tree?path=${encodeURIComponent(path)}`
+                : `${BASE_PATH}/api/files/${this.currentProjectId}/tree`;
+
+            try {
+                const response = await apiRequest(url);
+                if (response && response.ok) {
+                    this.fileTree = await response.json();
+                    this.currentPath = path;
+                    console.log('File tree loaded successfully for path:', path);
+                } else {
+                    console.error('Failed to load file tree:', response?.status, response?.statusText);
+                    if (response) {
+                        const errorText = await response.text();
+                        console.error('Error details:', errorText);
+                        alert(`Failed to load folder: ${response.status} ${response.statusText}`);
+                    }
+                }
+            } catch (error) {
+                console.error('Error loading file tree:', error);
+                alert(`Error loading folder: ${error.message}`);
+            } finally {
+                this.loadingFileTree = false;
             }
         },
 
@@ -374,6 +409,34 @@ function dashboardApp() {
                 this.currentFile = path;
                 this.fileContent = data.content;
             }
+        },
+
+        async navigateToFolder(folderPath) {
+            if (!this.currentProjectId) {
+                console.warn('No current project selected for folder navigation');
+                return;
+            }
+
+            console.log('Navigating to folder:', folderPath, 'from current path:', this.currentPath);
+
+            // Build the new path
+            const newPath = this.currentPath
+                ? `${this.currentPath}/${folderPath}`
+                : folderPath;
+
+            console.log('New path will be:', newPath);
+            await this.loadFileTree(newPath);
+        },
+
+        async navigateUp() {
+            if (!this.currentPath) return; // Already at root
+
+            // Get parent path
+            const pathParts = this.currentPath.split('/');
+            pathParts.pop(); // Remove last part
+            const parentPath = pathParts.join('/');
+
+            await this.loadFileTree(parentPath);
         },
 
         async saveFile() {
@@ -431,10 +494,26 @@ function dashboardApp() {
                 fontSize: 14,
                 fontFamily: 'Monaco, Menlo, "Ubuntu Mono", Consolas, "source-code-pro", monospace',
                 theme: {
-                    background: '#000000',
-                    foreground: '#ffffff',
+                    background: '#0c0c0c',      // Dark background like your terminal
+                    foreground: '#cccccc',      // Light gray text
                     cursor: '#ffffff',
-                    selection: '#ffffff40'
+                    selection: '#264f78',
+                    black: '#0c0c0c',
+                    red: '#cd3131',             // Red for errors/modified files
+                    green: '#0dbc79',           // Green for branch/success
+                    yellow: '#e5e510',
+                    blue: '#2472c8',
+                    magenta: '#bc3fbc',
+                    cyan: '#11a8cd',            // Cyan for paths
+                    white: '#e5e5e5',
+                    brightBlack: '#666666',
+                    brightRed: '#f14c4c',
+                    brightGreen: '#23d18b',
+                    brightYellow: '#f5f543',
+                    brightBlue: '#3b8eea',
+                    brightMagenta: '#d670d6',
+                    brightCyan: '#29b8db',
+                    brightWhite: '#e5e5e5'
                 }
             });
 
