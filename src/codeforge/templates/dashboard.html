@@ -122,9 +122,9 @@
                 <!-- Input Area -->
                 <div class="border-t border-gray-300 dark:border-gray-700 p-4">
                     <form @submit.prevent="sendMessage()" class="flex space-x-2">
-                        <textarea x-model="messageInput" 
-                            @keydown.enter.prevent="if(!$event.shiftKey) sendMessage()"
-                            placeholder="Type your message... (Shift+Enter for new line)"
+                        <textarea x-model="messageInput"
+                            @keydown.enter="if($event.ctrlKey) { $event.preventDefault(); sendMessage(); }"
+                            placeholder="Type your message... (Ctrl+Enter to send)"
                             rows="3"
                             class="flex-1 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white resize-none"></textarea>
                         <button type="submit" :disabled="!messageInput.trim() || isStreaming"

@@ -122,7 +122,7 @@ The application will be available at `http://localhost:8004`
 ### Chat Interface
 
 - Type your message in the input box at the bottom
-- Press Enter to send (Shift+Enter for new line)
+- Press Ctrl+Enter to send (Enter for new line)
 - Watch as Augment streams its response in real-time
 - All conversations are saved and can be resumed later
 
