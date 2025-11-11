@@ -13,6 +13,8 @@ function dashboardApp() {
         conversations: [],
         currentConversationId: null,
         messages: [],
+        editingConversationId: null,
+        editingConversationTitle: '',
         
         // Chat
         messageInput: '',
@@ -103,17 +105,59 @@ function dashboardApp() {
         
         async selectConversation(conversationId) {
             this.currentConversationId = conversationId;
-            
+
             // Close existing WebSocket
             if (this.ws) {
                 this.ws.close();
             }
-            
+
             // Load messages
             await this.loadMessages();
-            
+
             // Connect WebSocket
             this.connectWebSocket();
+        },
+
+        startEditingConversation(conversationId, currentTitle) {
+            this.editingConversationId = conversationId;
+            this.editingConversationTitle = currentTitle;
+            this.$nextTick(() => {
+                const input = document.querySelector('input[x-model="editingConversationTitle"]');
+                if (input) {
+                    input.focus();
+                    input.select();
+                }
+            });
+        },
+
+        async saveConversationTitle(conversationId) {
+            if (!this.editingConversationTitle.trim()) {
+                this.cancelEditingConversation();
+                return;
+            }
+
+            const response = await apiRequest(`/api/chat/conversations/${conversationId}`, {
+                method: 'PUT',
+                body: {
+                    title: this.editingConversationTitle.trim()
+                }
+            });
+
+            if (response && response.ok) {
+                const updatedConv = await response.json();
+                const index = this.conversations.findIndex(c => c.id === conversationId);
+                if (index !== -1) {
+                    this.conversations[index].title = updatedConv.title;
+                }
+            }
+
+            this.editingConversationId = null;
+            this.editingConversationTitle = '';
+        },
+
+        cancelEditingConversation() {
+            this.editingConversationId = null;
+            this.editingConversationTitle = '';
         },
         
         async loadMessages() {

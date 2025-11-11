@@ -25,6 +25,11 @@ class ConversationCreate(BaseModel):
     project_id: Optional[int] = None
 
 
+class ConversationUpdate(BaseModel):
+    """Conversation update schema."""
+    title: str
+
+
 class ConversationResponse(BaseModel):
     """Conversation response schema."""
     id: int
@@ -126,13 +131,42 @@ def get_conversation(
         Conversation.id == conversation_id,
         Conversation.user_id == current_user.id
     ).first()
-    
+
     if not conversation:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Conversation not found"
         )
-    
+
+    conv_dict = ConversationResponse.model_validate(conversation).model_dump()
+    conv_dict['message_count'] = len(conversation.messages)
+    return ConversationResponse(**conv_dict)
+
+
+@router.put("/conversations/{conversation_id}", response_model=ConversationResponse)
+def update_conversation(
+    conversation_id: int,
+    conversation_data: ConversationUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Update a conversation."""
+    conversation = db.query(Conversation).filter(
+        Conversation.id == conversation_id,
+        Conversation.user_id == current_user.id
+    ).first()
+
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found"
+        )
+
+    conversation.title = conversation_data.title
+    conversation.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(conversation)
+
     conv_dict = ConversationResponse.model_validate(conversation).model_dump()
     conv_dict['message_count'] = len(conversation.messages)
     return ConversationResponse(**conv_dict)
