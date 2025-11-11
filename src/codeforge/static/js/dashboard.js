@@ -33,11 +33,24 @@ function dashboardApp() {
         // Git
         gitStatus: null,
         gitLog: [],
-        
+
+        // Terminal
+        terminal: null,
+        terminalFitAddon: null,
+        terminalWs: null,
+        terminalInitialized: false,
+
         async init() {
             await this.loadUser();
             await this.loadProjects();
             this.configureMarked();
+
+            // Handle window resize for terminal
+            window.addEventListener('resize', () => {
+                if (this.terminal && this.terminalFitAddon) {
+                    this.terminalFitAddon.fit();
+                }
+            });
         },
 
         configureMarked() {
@@ -337,18 +350,112 @@ function dashboardApp() {
         
         async loadGitStatus() {
             if (!this.currentProjectId) return;
-            
+
             const response = await apiRequest(`/api/git/${this.currentProjectId}/status`);
             if (response && response.ok) {
                 this.gitStatus = await response.json();
             }
-            
+
             const logResponse = await apiRequest(`/api/git/${this.currentProjectId}/log?limit=10`);
             if (logResponse && logResponse.ok) {
                 this.gitLog = await logResponse.json();
             }
         },
-        
+
+        initTerminal() {
+            if (!this.currentProjectId) {
+                console.error('No project selected');
+                return;
+            }
+
+            // Only initialize once
+            if (this.terminalInitialized) {
+                return;
+            }
+
+            // Check if xterm is loaded
+            if (typeof Terminal === 'undefined') {
+                console.error('Xterm.js not loaded');
+                return;
+            }
+
+            // Create terminal instance
+            this.terminal = new Terminal({
+                cursorBlink: true,
+                fontSize: 14,
+                fontFamily: 'Monaco, Menlo, "Ubuntu Mono", Consolas, "source-code-pro", monospace',
+                theme: {
+                    background: '#000000',
+                    foreground: '#ffffff',
+                    cursor: '#ffffff',
+                    selection: '#ffffff40'
+                },
+                rows: 30,
+                cols: 100
+            });
+
+            // Create fit addon
+            this.terminalFitAddon = new FitAddon.FitAddon();
+            this.terminal.loadAddon(this.terminalFitAddon);
+
+            // Open terminal in the container
+            const terminalElement = document.getElementById('terminal');
+            if (terminalElement) {
+                this.terminal.open(terminalElement);
+                this.terminalFitAddon.fit();
+
+                // Connect to WebSocket
+                this.connectTerminalWebSocket();
+
+                this.terminalInitialized = true;
+            }
+        },
+
+        connectTerminalWebSocket() {
+            if (!this.currentProjectId) return;
+
+            // Close existing connection
+            if (this.terminalWs) {
+                this.terminalWs.close();
+            }
+
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/api/terminal/ws/${this.currentProjectId}`;
+
+            this.terminalWs = new WebSocket(wsUrl);
+
+            this.terminalWs.onopen = () => {
+                console.log('Terminal WebSocket connected');
+
+                // Send input from terminal to backend
+                this.terminal.onData((data) => {
+                    if (this.terminalWs && this.terminalWs.readyState === WebSocket.OPEN) {
+                        this.terminalWs.send(JSON.stringify({
+                            type: 'input',
+                            data: data
+                        }));
+                    }
+                });
+            };
+
+            this.terminalWs.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                if (message.type === 'output') {
+                    this.terminal.write(message.data);
+                }
+            };
+
+            this.terminalWs.onerror = (error) => {
+                console.error('Terminal WebSocket error:', error);
+                this.terminal.write('\r\n\x1b[31mWebSocket connection error\x1b[0m\r\n');
+            };
+
+            this.terminalWs.onclose = () => {
+                console.log('Terminal WebSocket closed');
+                this.terminal.write('\r\n\x1b[33mConnection closed\x1b[0m\r\n');
+            };
+        },
+
         logout() {
             localStorage.removeItem('token');
             window.location.href = '/login';

@@ -8,6 +8,10 @@
 <!-- Highlight.js for code syntax highlighting -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
 <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<!-- Xterm.js for terminal -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
+<script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 {% endblock %}
 
 {% block body %}
@@ -96,10 +100,15 @@
                     class="px-4 py-2 rounded-t text-sm font-medium">
                     Files
                 </button>
-                <button @click="currentTab = 'git'" 
+                <button @click="currentTab = 'git'"
                     :class="{'bg-white dark:bg-gray-800': currentTab === 'git'}"
                     class="px-4 py-2 rounded-t text-sm font-medium">
                     Git
+                </button>
+                <button @click="currentTab = 'terminal'; initTerminal()"
+                    :class="{'bg-white dark:bg-gray-800': currentTab === 'terminal'}"
+                    class="px-4 py-2 rounded-t text-sm font-medium">
+                    Terminal
                 </button>
             </div>
             
@@ -214,9 +223,14 @@
                     </div>
                 </div>
             </div>
+
+            <!-- Terminal Tab -->
+            <div x-show="currentTab === 'terminal'" class="flex-1 flex flex-col overflow-hidden bg-black">
+                <div id="terminal" class="flex-1"></div>
+            </div>
         </div>
     </div>
-    
+
     <!-- Project Scan Modal -->
     <div x-show="showProjectScan" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
         <div class="bg-white dark:bg-gray-800 rounded-lg p-6 max-w-2xl w-full max-h-96 overflow-y-auto">
