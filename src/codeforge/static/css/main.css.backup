@@ -1,0 +1,319 @@
+/* Custom styles for CodeForge */
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #888;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #555;
+}
+
+/* Dark mode scrollbar */
+.dark ::-webkit-scrollbar-track {
+    background: #2d3748;
+}
+
+.dark ::-webkit-scrollbar-thumb {
+    background: #4a5568;
+}
+
+.dark ::-webkit-scrollbar-thumb:hover {
+    background: #718096;
+}
+
+/* Code editor styling */
+textarea[x-model="fileContent"] {
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', 'source-code-pro', monospace;
+    tab-size: 4;
+}
+
+/* Mobile-specific styles */
+@media (max-width: 768px) {
+    /* Prevent zoom on input focus - CRITICAL: 16px minimum font size */
+    input, textarea, select, button {
+        font-size: 16px !important;
+        transform-origin: left top;
+        transform: scale(1);
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+        -moz-appearance: none;
+        appearance: none;
+    }
+
+    /* More specific selectors to catch all input types */
+    input[type="text"],
+    input[type="password"],
+    input[type="email"],
+    input[type="search"],
+    input[type="tel"],
+    input[type="url"],
+    input[type="number"],
+    input[type="file"] {
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+    }
+
+    /* Ensure chat input doesn't cause zoom and auto-resizes */
+    textarea[x-model="messageInput"] {
+        font-size: 16px !important;
+        min-height: 44px !important;
+        max-height: 120px !important;
+        resize: none !important;
+        overflow-y: auto !important;
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+    }
+
+    /* File editor textarea */
+    textarea[x-model="fileContent"] {
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+    }
+
+    /* Better mobile touch targets */
+    button {
+        min-height: 44px;
+        min-width: 44px;
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+    }
+
+    /* Improve mobile sidebar */
+    .mobile-nav-button {
+        padding: 12px 16px;
+        font-size: 16px;
+    }
+
+    /* Mobile tab bar at bottom */
+    .mobile-tab-bar {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        z-index: 40;
+        background: white;
+        border-top: 1px solid #e5e7eb;
+        padding: 8px 0;
+        display: flex;
+        justify-content: space-around;
+        align-items: center;
+    }
+
+    .dark .mobile-tab-bar {
+        background: #1f2937;
+        border-top-color: #374151;
+    }
+
+    .mobile-tab-button {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 8px 12px;
+        font-size: 12px;
+        color: #6b7280;
+        text-decoration: none;
+        border-radius: 8px;
+        min-width: 60px;
+    }
+
+    .mobile-tab-button.active {
+        color: #2563eb;
+        background: #eff6ff;
+    }
+
+    .dark .mobile-tab-button {
+        color: #9ca3af;
+    }
+
+    .dark .mobile-tab-button.active {
+        color: #60a5fa;
+        background: #1e3a8a;
+    }
+
+    /* Adjust main content to account for bottom tab bar */
+    .mobile-main-content {
+        padding-bottom: 80px;
+    }
+
+    /* Additional zoom prevention measures */
+    * {
+        -webkit-text-size-adjust: 100%;
+        -ms-text-size-adjust: 100%;
+        text-size-adjust: 100%;
+    }
+
+    /* Prevent double-tap zoom */
+    a, button, input, textarea, select {
+        touch-action: manipulation;
+    }
+
+    /* Ensure all form elements have proper font size */
+    .appearance-none,
+    .focus\:outline-none,
+    [class*="border-"],
+    [class*="rounded"],
+    [class*="px-"],
+    [class*="py-"] {
+        font-size: 16px !important;
+    }
+
+    /* Specific overrides for Tailwind classes that might have smaller fonts */
+    .text-xs, .text-sm {
+        font-size: 16px !important;
+    }
+
+    /* Exception for non-interactive text elements */
+    .text-xs:not(input):not(textarea):not(select):not(button),
+    .text-sm:not(input):not(textarea):not(select):not(button) {
+        font-size: 0.75rem !important; /* 12px */
+    }
+}
+
+/* Message animations */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(10px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+.message-enter {
+    animation: fadeIn 0.3s ease-out;
+}
+
+/* Markdown content styling */
+.prose {
+    color: inherit;
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
+    color: inherit;
+    font-weight: 600;
+    margin-top: 1em;
+    margin-bottom: 0.5em;
+}
+
+.prose h1 { font-size: 1.5em; }
+.prose h2 { font-size: 1.3em; }
+.prose h3 { font-size: 1.1em; }
+
+.prose p {
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+}
+
+.prose ul, .prose ol {
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+    padding-left: 1.5em;
+}
+
+.prose li {
+    margin-top: 0.25em;
+    margin-bottom: 0.25em;
+}
+
+.prose code {
+    background-color: rgba(0, 0, 0, 0.1);
+    padding: 0.2em 0.4em;
+    border-radius: 3px;
+    font-size: 0.9em;
+    font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', 'source-code-pro', monospace;
+}
+
+.prose pre {
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+    padding: 1em;
+    border-radius: 6px;
+    overflow-x: auto;
+    margin-top: 0.5em;
+    margin-bottom: 0.5em;
+    max-width: 100%;
+    white-space: pre;
+    word-wrap: normal;
+}
+
+.prose pre code {
+    background-color: transparent;
+    padding: 0;
+    color: inherit;
+    font-size: 0.875em;
+    white-space: pre;
+    word-wrap: normal;
+    display: block;
+}
+
+/* Mobile code block handling */
+@media (max-width: 768px) {
+    .prose pre {
+        font-size: 12px;
+        padding: 0.75em;
+        max-width: calc(85vw - 2rem);
+    }
+
+    .prose pre code {
+        font-size: 12px;
+    }
+
+    .prose code:not(pre code) {
+        font-size: 14px;
+        word-break: break-word;
+    }
+}
+
+.prose strong {
+    font-weight: 600;
+}
+
+.prose em {
+    font-style: italic;
+}
+
+.prose blockquote {
+    border-left: 3px solid currentColor;
+    padding-left: 1em;
+    margin-left: 0;
+    opacity: 0.8;
+}
+
+.prose a {
+    color: #3b82f6;
+    text-decoration: underline;
+}
+
+.prose a:hover {
+    color: #2563eb;
+}
+
+/* Prose invert for user messages (blue background) */
+.prose-invert code {
+    background-color: rgba(255, 255, 255, 0.2);
+}
+
+.prose-invert a {
+    color: #93c5fd;
+}
+
+.prose-invert a:hover {
+    color: #bfdbfe;
+}
+

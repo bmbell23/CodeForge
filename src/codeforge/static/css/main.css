@@ -40,15 +40,15 @@ textarea[x-model="fileContent"] {
 
 /* Mobile-specific styles */
 @media (max-width: 768px) {
-    /* Prevent zoom on input focus - CRITICAL: 16px minimum font size */
-    input, textarea, select, button {
+    /* CRITICAL: Prevent zoom on input focus - 16px minimum font size */
+    input, textarea, select {
         font-size: 16px !important;
+        -webkit-text-size-adjust: 100% !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+        appearance: none !important;
         transform-origin: left top;
         transform: scale(1);
-        -webkit-text-size-adjust: 100%;
-        -webkit-appearance: none;
-        -moz-appearance: none;
-        appearance: none;
     }
 
     /* More specific selectors to catch all input types */
@@ -61,8 +61,10 @@ textarea[x-model="fileContent"] {
     input[type="number"],
     input[type="file"] {
         font-size: 16px !important;
-        -webkit-text-size-adjust: 100%;
-        -webkit-appearance: none;
+        -webkit-text-size-adjust: 100% !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+        appearance: none !important;
     }
 
     /* Ensure chat input doesn't cause zoom and auto-resizes */
@@ -72,24 +74,30 @@ textarea[x-model="fileContent"] {
         max-height: 120px !important;
         resize: none !important;
         overflow-y: auto !important;
-        -webkit-text-size-adjust: 100%;
-        -webkit-appearance: none;
+        -webkit-text-size-adjust: 100% !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+        appearance: none !important;
     }
 
     /* File editor textarea */
     textarea[x-model="fileContent"] {
         font-size: 16px !important;
-        -webkit-text-size-adjust: 100%;
-        -webkit-appearance: none;
+        -webkit-text-size-adjust: 100% !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+        appearance: none !important;
     }
 
-    /* Better mobile touch targets */
+    /* Better mobile touch targets for buttons */
     button {
         min-height: 44px;
         min-width: 44px;
-        font-size: 16px !important;
-        -webkit-text-size-adjust: 100%;
-        -webkit-appearance: none;
+        -webkit-text-size-adjust: 100% !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+        appearance: none !important;
+        /* Note: buttons don't need 16px font size to prevent zoom */
     }
 
     /* Improve mobile sidebar */
@@ -151,35 +159,48 @@ textarea[x-model="fileContent"] {
 
     /* Additional zoom prevention measures */
     * {
-        -webkit-text-size-adjust: 100%;
-        -ms-text-size-adjust: 100%;
-        text-size-adjust: 100%;
+        -webkit-text-size-adjust: 100% !important;
+        -ms-text-size-adjust: 100% !important;
+        text-size-adjust: 100% !important;
     }
 
-    /* Prevent double-tap zoom */
+    /* Prevent double-tap zoom and gesture zoom */
     a, button, input, textarea, select {
-        touch-action: manipulation;
+        touch-action: manipulation !important;
     }
 
-    /* Ensure all form elements have proper font size */
-    .appearance-none,
-    .focus\:outline-none,
-    [class*="border-"],
-    [class*="rounded"],
-    [class*="px-"],
-    [class*="py-"] {
+    /* Override Tailwind classes for interactive elements only */
+    input.text-xs, input.text-sm,
+    textarea.text-xs, textarea.text-sm,
+    select.text-xs, select.text-sm {
         font-size: 16px !important;
     }
 
-    /* Specific overrides for Tailwind classes that might have smaller fonts */
-    .text-xs, .text-sm {
+    /* Ensure form elements with common Tailwind classes have proper font size */
+    input[class*="border-"],
+    input[class*="rounded"],
+    input[class*="px-"],
+    input[class*="py-"],
+    textarea[class*="border-"],
+    textarea[class*="rounded"],
+    textarea[class*="px-"],
+    textarea[class*="py-"],
+    select[class*="border-"],
+    select[class*="rounded"],
+    select[class*="px-"],
+    select[class*="py-"] {
         font-size: 16px !important;
     }
 
-    /* Exception for non-interactive text elements */
-    .text-xs:not(input):not(textarea):not(select):not(button),
-    .text-sm:not(input):not(textarea):not(select):not(button) {
-        font-size: 0.75rem !important; /* 12px */
+    /* Specific targeting for Alpine.js model bindings */
+    input[x-model],
+    textarea[x-model],
+    select[x-model] {
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100% !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+        appearance: none !important;
     }
 }
 
@@ -240,6 +261,9 @@ textarea[x-model="fileContent"] {
 }
 
 .prose pre {
+    tab-size: 2;
+    -moz-tab-size: 2;
+    -o-tab-size: 2;
     background-color: #1e1e1e;
     color: #d4d4d4;
     padding: 1em;
@@ -253,6 +277,9 @@ textarea[x-model="fileContent"] {
 }
 
 .prose pre code {
+    tab-size: 2;
+    -moz-tab-size: 2;
+    -o-tab-size: 2;
     background-color: transparent;
     padding: 0;
     color: inherit;
@@ -315,5 +342,127 @@ textarea[x-model="fileContent"] {
 
 .prose-invert a:hover {
     color: #bfdbfe;
+}
+
+
+/* Additional improvements for code blocks and mobile experience */
+
+/* Ensure consistent tab spacing across all code elements */
+pre, code, .prose pre, .prose code, textarea[x-model="fileContent"] {
+    tab-size: 2 \!important;
+    -moz-tab-size: 2 \!important;
+    -o-tab-size: 2 \!important;
+}
+
+/* Enhanced mobile input handling */
+@media (max-width: 768px) {
+    /* Comprehensive zoom prevention for all form elements */
+    input[type="text"],
+    input[type="password"],
+    input[type="email"],
+    input[type="search"],
+    input[type="tel"],
+    input[type="url"],
+    input[type="number"],
+    input[type="date"],
+    input[type="time"],
+    input[type="datetime-local"],
+    textarea,
+    select {
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100% !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+        appearance: none !important;
+        touch-action: manipulation !important;
+    }
+
+    /* Ensure chat input doesn't zoom on focus */
+    textarea[x-model="messageInput"] {
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100% !important;
+        -webkit-appearance: none !important;
+        -moz-appearance: none !important;
+        appearance: none !important;
+        border-radius: 8px !important;
+        touch-action: manipulation !important;
+    }
+
+    /* Improve code block readability on mobile */
+    .prose pre {
+        tab-size: 2 !important;
+        -moz-tab-size: 2 !important;
+        -o-tab-size: 2 !important;
+        font-size: 13px !important;
+        line-height: 1.4 !important;
+    }
+
+    .prose pre code {
+        tab-size: 2 !important;
+        -moz-tab-size: 2 !important;
+        -o-tab-size: 2 !important;
+        font-size: 13px !important;
+    }
+}
+
+/* Ensure proper tab rendering in all browsers */
+* {
+    -webkit-tab-size: 2;
+    -moz-tab-size: 2;
+    -o-tab-size: 2;
+    tab-size: 2;
+}
+
+/* Additional mobile optimizations */
+@media (max-width: 768px) {
+    /* Prevent iOS Safari from adding rounded corners and shadows to inputs */
+    input, textarea, select {
+        -webkit-border-radius: 0;
+        border-radius: 0;
+        background-clip: padding-box;
+    }
+
+    /* Prevent iOS from styling buttons */
+    button, input[type="submit"], input[type="button"] {
+        -webkit-border-radius: 0;
+        border-radius: 0;
+        -webkit-appearance: none;
+        -moz-appearance: none;
+        appearance: none;
+    }
+
+    /* Improve focus states for better accessibility */
+    input:focus, textarea:focus, select:focus {
+        outline: 2px solid #3b82f6;
+        outline-offset: 2px;
+    }
+
+    /* Prevent text selection on UI elements */
+    .mobile-tab-button, button, .cursor-pointer {
+        -webkit-user-select: none;
+        -moz-user-select: none;
+        -ms-user-select: none;
+        user-select: none;
+    }
+
+    /* Optimize scrolling performance */
+    .overflow-y-auto, .overflow-x-auto {
+        -webkit-overflow-scrolling: touch;
+        scroll-behavior: smooth;
+    }
+
+    /* Prevent horizontal scroll on small screens */
+    body, html {
+        overflow-x: hidden;
+    }
+
+    /* Improve tap targets */
+    a, button, [role="button"], .cursor-pointer {
+        min-height: 44px;
+        min-width: 44px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
 }
 

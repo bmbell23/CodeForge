@@ -50,6 +50,15 @@ function dashboardApp() {
         terminals: {}, // Map of project_id -> {terminal, fitAddon, ws}
         currentTerminalProjectId: null,
 
+        // Password change
+        passwordForm: {
+            current: '',
+            new: '',
+            confirm: ''
+        },
+        passwordError: '',
+        passwordSuccess: '',
+
         async init() {
             await this.loadUser();
             await this.loadProjects();
@@ -110,7 +119,20 @@ function dashboardApp() {
                 return content.replace(/\n/g, '<br>');
             }
             try {
-                return marked.parse(content);
+                // Parse markdown
+                let html = marked.parse(content);
+
+                // Apply syntax highlighting to any code blocks that weren't highlighted
+                if (typeof hljs !== 'undefined') {
+                    const tempDiv = document.createElement('div');
+                    tempDiv.innerHTML = html;
+                    tempDiv.querySelectorAll('pre code:not(.hljs)').forEach((block) => {
+                        hljs.highlightElement(block);
+                    });
+                    html = tempDiv.innerHTML;
+                }
+
+                return html;
             } catch (err) {
                 console.error('Markdown rendering error:', err);
                 return content.replace(/\n/g, '<br>');
@@ -672,6 +694,48 @@ function dashboardApp() {
             };
         },
 
+        async changePassword() {
+            this.passwordError = '';
+            this.passwordSuccess = '';
+
+            // Validate passwords match
+            if (this.passwordForm.new !== this.passwordForm.confirm) {
+                this.passwordError = 'New passwords do not match';
+                return;
+            }
+
+            // Validate password length
+            if (this.passwordForm.new.length < 6) {
+                this.passwordError = 'New password must be at least 6 characters';
+                return;
+            }
+
+            try {
+                const response = await apiRequest(`${BASE_PATH}/api/auth/change-password`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        current_password: this.passwordForm.current,
+                        new_password: this.passwordForm.new
+                    })
+                });
+
+                if (response && response.ok) {
+                    this.passwordSuccess = 'Password changed successfully!';
+                    this.passwordForm.current = '';
+                    this.passwordForm.new = '';
+                    this.passwordForm.confirm = '';
+                    // Clear success message after 5 seconds
+                    setTimeout(() => { this.passwordSuccess = ''; }, 5000);
+                } else {
+                    const error = await response.json();
+                    this.passwordError = error.detail || 'Failed to change password';
+                }
+            } catch (error) {
+                this.passwordError = 'An error occurred. Please try again.';
+            }
+        },
+
         logout() {
             localStorage.removeItem('token');
             window.location.href = '/login';
@@ -712,15 +776,66 @@ function dashboardApp() {
         },
 
         enforceInputFontSizes() {
-            // Ensure all input elements have 16px font size to prevent zoom
-            const inputs = document.querySelectorAll('input, textarea, select, button');
-            inputs.forEach(input => {
-                if (window.innerWidth <= 768) {
-                    input.style.fontSize = '16px';
-                    input.style.webkitTextSizeAdjust = '100%';
-                    input.style.webkitAppearance = 'none';
+            // Comprehensive zoom prevention for mobile devices
+            if (window.innerWidth <= 768) {
+                // Target all form elements that could trigger zoom
+                const formElements = document.querySelectorAll(`
+                    input[type="text"],
+                    input[type="password"],
+                    input[type="email"],
+                    input[type="search"],
+                    input[type="tel"],
+                    input[type="url"],
+                    input[type="number"],
+                    input[type="date"],
+                    input[type="time"],
+                    input[type="datetime-local"],
+                    textarea,
+                    select
+                `);
+
+                formElements.forEach(element => {
+                    // Apply comprehensive zoom prevention styles
+                    element.style.fontSize = '16px';
+                    element.style.webkitTextSizeAdjust = '100%';
+                    element.style.webkitAppearance = 'none';
+                    element.style.mozAppearance = 'none';
+                    element.style.appearance = 'none';
+                    element.style.touchAction = 'manipulation';
+
+                    // Ensure minimum touch target size for better UX
+                    if (element.tagName.toLowerCase() === 'input' || element.tagName.toLowerCase() === 'select') {
+                        element.style.minHeight = '44px';
+                    }
+                });
+
+                // Add additional zoom prevention event listeners
+                this.addZoomPreventionListeners();
+            }
+        },
+
+        addZoomPreventionListeners() {
+            // Prevent double-tap zoom
+            let lastTouchEnd = 0;
+            document.addEventListener('touchend', function(event) {
+                const now = (new Date()).getTime();
+                if (now - lastTouchEnd <= 300) {
+                    event.preventDefault();
                 }
-            });
+                lastTouchEnd = now;
+            }, false);
+
+            // Prevent gesture zoom
+            document.addEventListener('gesturestart', function(event) {
+                event.preventDefault();
+            }, false);
+
+            // Prevent wheel zoom on mobile
+            document.addEventListener('wheel', function(event) {
+                if (event.ctrlKey) {
+                    event.preventDefault();
+                }
+            }, { passive: false });
         },
 
         setupTextareaAutoResize() {

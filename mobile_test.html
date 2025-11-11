@@ -115,6 +115,8 @@
                 <input type="email" placeholder="Email input" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
                 <input type="password" placeholder="Password input" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
                 <input type="number" placeholder="Number input" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+                <input type="date" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
+                <input type="time" style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
                 <select style="padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px;">
                     <option>Select option</option>
                     <option>Option 1</option>
@@ -123,6 +125,38 @@
             </div>
             <div class="status success">
                 ✅ All input types covered with 16px font size and webkit-appearance:none
+            </div>
+        </div>
+
+        <div class="test-section">
+            <h3>7. Real-world Chat Simulation</h3>
+            <p>This simulates the actual CodeForge chat interface:</p>
+            <div style="border: 1px solid #ddd; border-radius: 8px; padding: 15px; background: #f9f9f9;">
+                <div style="margin-bottom: 10px; padding: 10px; background: #e3f2fd; border-radius: 8px;">
+                    <strong>Assistant:</strong> Hello! How can I help you today?
+                </div>
+                <form onsubmit="return false;" style="display: flex; flex-direction: column; gap: 10px;">
+                    <textarea placeholder="Type your message..."
+                              style="font-size: 16px; min-height: 44px; max-height: 120px; padding: 12px; border: 1px solid #ccc; border-radius: 8px; resize: none; overflow-y: auto; -webkit-appearance: none;"
+                              oninput="autoResize(this)"></textarea>
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <button type="button" style="background: none; border: none; color: #666; font-size: 16px;">📎 Attach</button>
+                        <button type="submit" style="background: #2563eb; color: white; border: none; padding: 10px 20px; border-radius: 6px; font-size: 16px;">Send</button>
+                    </div>
+                </form>
+            </div>
+            <div class="status success">
+                ✅ Chat interface simulation with proper zoom prevention
+            </div>
+        </div>
+
+        <div class="test-section">
+            <h3>8. Zoom Detection Test</h3>
+            <p>Current zoom level: <span id="zoomLevel">1.0</span></p>
+            <p>Viewport width: <span id="viewportWidth">-</span>px</p>
+            <p>Screen width: <span id="screenWidth">-</span>px</p>
+            <div class="status" id="zoomStatus">
+                📊 Monitoring zoom level...
             </div>
         </div>
     </div>
@@ -140,13 +174,16 @@
             textarea.style.height = newHeight + 'px';
         }
         
-        // Test viewport settings
+        // Test viewport settings and monitor zoom
         window.addEventListener('load', function() {
             const viewport = document.querySelector('meta[name="viewport"]');
             console.log('Viewport settings:', viewport.content);
 
             // Add zoom prevention handlers
             initZoomPrevention();
+
+            // Start zoom monitoring
+            monitorZoom();
         });
 
         function initZoomPrevention() {
@@ -173,6 +210,35 @@
                 input.style.webkitAppearance = 'none';
                 input.style.touchAction = 'manipulation';
             });
+        }
+
+        function monitorZoom() {
+            function updateZoomInfo() {
+                const zoomLevel = Math.round((window.outerWidth / window.innerWidth) * 100) / 100;
+                const viewportWidth = window.innerWidth;
+                const screenWidth = window.screen.width;
+
+                document.getElementById('zoomLevel').textContent = zoomLevel.toFixed(2);
+                document.getElementById('viewportWidth').textContent = viewportWidth;
+                document.getElementById('screenWidth').textContent = screenWidth;
+
+                const zoomStatus = document.getElementById('zoomStatus');
+                if (zoomLevel > 1.1) {
+                    zoomStatus.textContent = '⚠️ Zoom detected! This indicates zoom prevention may not be working.';
+                    zoomStatus.className = 'status warning';
+                } else {
+                    zoomStatus.textContent = '✅ No unwanted zoom detected.';
+                    zoomStatus.className = 'status success';
+                }
+            }
+
+            // Update immediately and on resize
+            updateZoomInfo();
+            window.addEventListener('resize', updateZoomInfo);
+            window.addEventListener('orientationchange', updateZoomInfo);
+
+            // Monitor for zoom changes
+            setInterval(updateZoomInfo, 1000);
         }
     </script>
 </body>
