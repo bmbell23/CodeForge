@@ -1,7 +1,7 @@
 """Message model."""
 
 from datetime import datetime
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Enum
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Enum, JSON
 from sqlalchemy.orm import relationship
 import enum
 
@@ -24,6 +24,7 @@ class Message(Base):
     conversation_id = Column(Integer, ForeignKey("conversations.id"), nullable=False)
     role = Column(Enum(MessageRole), nullable=False)
     content = Column(Text, nullable=False)
+    attachments = Column(JSON, nullable=True)  # Store image data as JSON array
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships

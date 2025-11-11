@@ -24,6 +24,7 @@ function dashboardApp() {
         isStreaming: false,
         streamingContent: '',
         ws: null,
+        attachedImages: [],
         
         // UI
         currentTab: 'chat',
@@ -270,13 +271,43 @@ function dashboardApp() {
         },
         
         sendMessage() {
-            if (!this.messageInput.trim() || !this.ws || this.isStreaming) return;
-            
+            if ((!this.messageInput.trim() && this.attachedImages.length === 0) || !this.ws || this.isStreaming) return;
+
             this.ws.send(JSON.stringify({
-                message: this.messageInput
+                message: this.messageInput,
+                attachments: this.attachedImages.length > 0 ? this.attachedImages : null
             }));
-            
+
             this.messageInput = '';
+            this.attachedImages = [];
+        },
+
+        handleImageUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            // Check file size (limit to 5MB)
+            if (file.size > 5 * 1024 * 1024) {
+                alert('Image size must be less than 5MB');
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                this.attachedImages.push({
+                    name: file.name,
+                    type: file.type,
+                    data: e.target.result
+                });
+            };
+            reader.readAsDataURL(file);
+
+            // Reset input
+            event.target.value = '';
+        },
+
+        removeImage(index) {
+            this.attachedImages.splice(index, 1);
         },
         
         scrollToBottom() {

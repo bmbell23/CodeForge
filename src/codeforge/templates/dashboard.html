@@ -124,6 +124,14 @@
                             <div :class="message.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white'"
                                 class="max-w-3xl rounded-lg px-4 py-2">
                                 <div class="text-xs font-semibold mb-1" x-text="message.role === 'user' ? 'You' : 'Augment'"></div>
+
+                                <!-- Image attachments -->
+                                <div x-show="message.attachments && message.attachments.length > 0" class="mb-2 flex flex-wrap gap-2">
+                                    <template x-for="(img, idx) in message.attachments" :key="idx">
+                                        <img :src="img.data" :alt="img.name" class="max-w-xs rounded border border-gray-300 dark:border-gray-600">
+                                    </template>
+                                </div>
+
                                 <div class="prose prose-sm max-w-none dark:prose-invert"
                                     :class="message.role === 'user' ? 'prose-invert' : ''"
                                     x-html="renderMarkdown(message.content)"></div>
@@ -143,14 +151,37 @@
                 
                 <!-- Input Area -->
                 <div class="border-t border-gray-300 dark:border-gray-700 p-4">
+                    <!-- Image Previews -->
+                    <div x-show="attachedImages.length > 0" class="mb-2 flex flex-wrap gap-2">
+                        <template x-for="(img, index) in attachedImages" :key="index">
+                            <div class="relative inline-block">
+                                <img :src="img.data" class="h-20 w-20 object-cover rounded border border-gray-300 dark:border-gray-600">
+                                <button @click="removeImage(index)" type="button"
+                                    class="absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs hover:bg-red-600">
+                                    ×
+                                </button>
+                            </div>
+                        </template>
+                    </div>
+
                     <form @submit.prevent="sendMessage()" class="flex space-x-2">
-                        <textarea x-model="messageInput"
-                            @keydown.enter="if($event.ctrlKey) { $event.preventDefault(); sendMessage(); }"
-                            placeholder="Type your message... (Ctrl+Enter to send)"
-                            rows="3"
-                            class="flex-1 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white resize-none"></textarea>
-                        <button type="submit" :disabled="!messageInput.trim() || isStreaming"
-                            class="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-6 py-2 rounded font-medium">
+                        <div class="flex flex-col flex-1 space-y-2">
+                            <textarea x-model="messageInput"
+                                @keydown.enter="if($event.ctrlKey) { $event.preventDefault(); sendMessage(); }"
+                                placeholder="Type your message... (Ctrl+Enter to send)"
+                                rows="3"
+                                class="flex-1 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white resize-none"></textarea>
+                            <div class="flex items-center space-x-2">
+                                <input type="file" id="imageUpload" accept="image/*" @change="handleImageUpload" class="hidden">
+                                <button type="button" @click="document.getElementById('imageUpload').click()"
+                                    class="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white flex items-center space-x-1">
+                                    <span>📎</span>
+                                    <span>Attach Image</span>
+                                </button>
+                            </div>
+                        </div>
+                        <button type="submit" :disabled="(!messageInput.trim() && attachedImages.length === 0) || isStreaming"
+                            class="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-6 py-2 rounded font-medium self-end">
                             Send
                         </button>
                     </form>

@@ -47,6 +47,7 @@ class ConversationResponse(BaseModel):
 class MessageCreate(BaseModel):
     """Message creation schema."""
     content: str
+    attachments: Optional[List[dict]] = None
 
 
 class MessageResponse(BaseModel):
@@ -54,6 +55,7 @@ class MessageResponse(BaseModel):
     id: int
     role: MessageRole
     content: str
+    attachments: Optional[List[dict]] = None
     created_at: datetime
 
     class Config:
@@ -255,19 +257,21 @@ async def websocket_endpoint(
             # Receive message from client
             data = await websocket.receive_json()
             user_message = data.get("message", "")
-            
+            attachments = data.get("attachments", None)
+
             if not user_message:
                 continue
-            
+
             # Save user message
             message = Message(
                 conversation_id=conversation_id,
                 role=MessageRole.USER,
-                content=user_message
+                content=user_message,
+                attachments=attachments
             )
             db.add(message)
             db.commit()
-            
+
             # Send user message confirmation
             await websocket.send_json({
                 "type": "user_message",
@@ -275,6 +279,7 @@ async def websocket_endpoint(
                     "id": message.id,
                     "role": "user",
                     "content": user_message,
+                    "attachments": attachments,
                     "created_at": message.created_at.isoformat()
                 }
             })
