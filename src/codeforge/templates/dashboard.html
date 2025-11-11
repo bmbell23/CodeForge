@@ -18,44 +18,88 @@
 <div x-data="dashboardApp()" x-init="init()" class="h-full flex flex-col">
     <!-- Top Navigation Bar -->
     <nav class="bg-gray-800 text-white px-4 py-3 flex items-center justify-between">
-        <div class="flex items-center space-x-4">
-            <h1 class="text-xl font-bold">CodeForge</h1>
-            
-            <!-- Project Selector -->
-            <select x-model="currentProjectId" @change="switchProject()" 
-                class="bg-gray-700 text-white rounded px-3 py-1 text-sm">
+        <div class="flex items-center space-x-2 md:space-x-4">
+            <!-- Hamburger Menu (Mobile Only) -->
+            <button @click="sidebarOpen = !sidebarOpen" class="md:hidden text-white hover:text-gray-300">
+                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                </svg>
+            </button>
+
+            <h1 class="text-lg md:text-xl font-bold">CodeForge</h1>
+
+            <!-- Project Selector (Desktop) -->
+            <select x-model="currentProjectId" @change="switchProject()"
+                class="hidden md:block bg-gray-700 text-white rounded px-3 py-1 text-sm">
                 <option value="">Select Project...</option>
                 <template x-for="project in projects" :key="project.id">
                     <option :value="project.id" x-text="project.name"></option>
                 </template>
             </select>
-            
+
             <button @click="scanProjects()"
-                class="bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-sm">
+                class="hidden md:block bg-blue-600 hover:bg-blue-700 px-3 py-1 rounded text-sm">
                 + Add Project
             </button>
         </div>
-        
-        <div class="flex items-center space-x-4">
-            <span x-text="'User: ' + username" class="text-sm"></span>
-            <a :href="`${BASE_PATH}/settings`" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm">
+
+        <div class="flex items-center space-x-2 md:space-x-4">
+            <span x-text="'User: ' + username" class="hidden md:inline text-sm"></span>
+            <a :href="`${BASE_PATH}/settings`" class="hidden md:block bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-sm">
                 ⚙️ Settings
             </a>
-            <button @click="logout()" class="bg-red-600 hover:bg-red-700 px-3 py-1 rounded text-sm">
+            <button @click="logout()" class="bg-red-600 hover:bg-red-700 px-2 md:px-3 py-1 rounded text-sm">
                 Logout
             </button>
         </div>
     </nav>
     
     <!-- Main Content Area -->
-    <div class="flex-1 flex overflow-hidden">
+    <div class="flex-1 flex overflow-hidden relative">
+        <!-- Mobile Sidebar Overlay -->
+        <div x-show="sidebarOpen"
+             @click="sidebarOpen = false"
+             x-transition:enter="transition-opacity ease-linear duration-300"
+             x-transition:enter-start="opacity-0"
+             x-transition:enter-end="opacity-100"
+             x-transition:leave="transition-opacity ease-linear duration-300"
+             x-transition:leave-start="opacity-100"
+             x-transition:leave-end="opacity-0"
+             class="fixed inset-0 bg-black bg-opacity-50 z-20 md:hidden"></div>
+
         <!-- Left Sidebar - Conversations -->
-        <div class="w-64 bg-gray-100 dark:bg-gray-800 border-r border-gray-300 dark:border-gray-700 flex flex-col">
+        <div :class="sidebarOpen ? 'translate-x-0' : '-translate-x-full'"
+             class="fixed md:relative md:translate-x-0 z-30 w-64 md:w-64 bg-gray-100 dark:bg-gray-800 border-r border-gray-300 dark:border-gray-700 flex flex-col h-full transition-transform duration-300 ease-in-out">
             <div class="p-4 border-b border-gray-300 dark:border-gray-700">
-                <button @click="createConversation()" 
-                    class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">
+                <button @click="createConversation()"
+                    class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded mb-3">
                     + New Conversation
                 </button>
+
+                <!-- Mobile: Quick Actions -->
+                <div class="md:hidden">
+                    <div class="text-xs font-semibold text-gray-600 dark:text-gray-400 mb-2">QUICK ACTIONS</div>
+                    <div class="space-y-2">
+                        <select x-model="currentProjectId" @change="switchProject(); sidebarOpen = false"
+                            class="w-full bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded px-3 py-2 text-sm">
+                            <option value="">Select Project...</option>
+                            <template x-for="project in projects" :key="project.id">
+                                <option :value="project.id" x-text="project.name"></option>
+                            </template>
+                        </select>
+                        <button @click="scanProjects(); sidebarOpen = false"
+                            class="w-full bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded text-sm">
+                            + Add Project
+                        </button>
+                        <button @click="logout()"
+                            class="w-full bg-red-600 hover:bg-red-700 text-white px-3 py-2 rounded text-sm">
+                            Logout
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Desktop: Conversations Header -->
+                <div class="hidden md:block text-xs font-semibold text-gray-600 dark:text-gray-400 mt-3">CONVERSATIONS</div>
             </div>
             
             <div class="flex-1 overflow-y-auto">
@@ -90,15 +134,32 @@
         </div>
         
         <!-- Center - Chat Area -->
-        <div class="flex-1 flex flex-col">
-            <!-- Tab Bar -->
-            <div class="bg-gray-200 dark:bg-gray-700 px-4 py-2 flex space-x-2 border-b border-gray-300 dark:border-gray-600">
-                <button @click="currentTab = 'chat'" 
+        <div class="flex-1 flex flex-col mobile-main-content">
+            <!-- Mobile Tab Header -->
+            <div class="md:hidden bg-gray-200 dark:bg-gray-700 px-4 py-3 border-b border-gray-300 dark:border-gray-600 flex items-center justify-between">
+                <div class="flex items-center space-x-2">
+                    <span x-show="currentTab === 'chat'">💬</span>
+                    <span x-show="currentTab === 'files'">📁</span>
+                    <span x-show="currentTab === 'git'">🔀</span>
+                    <span x-show="currentTab === 'terminal'">💻</span>
+                    <span x-show="currentTab === 'settings'">⚙️</span>
+                    <span class="font-medium text-gray-900 dark:text-white capitalize" x-text="currentTab"></span>
+                </div>
+                <button @click="sidebarOpen = !sidebarOpen" class="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                    </svg>
+                </button>
+            </div>
+
+            <!-- Desktop Tab Bar -->
+            <div class="hidden md:flex bg-gray-200 dark:bg-gray-700 px-4 py-2 space-x-2 border-b border-gray-300 dark:border-gray-600">
+                <button @click="currentTab = 'chat'"
                     :class="{'bg-white dark:bg-gray-800': currentTab === 'chat'}"
                     class="px-4 py-2 rounded-t text-sm font-medium">
                     Chat
                 </button>
-                <button @click="currentTab = 'files'" 
+                <button @click="currentTab = 'files'"
                     :class="{'bg-white dark:bg-gray-800': currentTab === 'files'}"
                     class="px-4 py-2 rounded-t text-sm font-medium">
                     Files
@@ -118,21 +179,21 @@
             <!-- Chat Tab -->
             <div x-show="currentTab === 'chat'" class="flex-1 flex flex-col overflow-hidden">
                 <!-- Messages Area -->
-                <div class="flex-1 overflow-y-auto p-4 space-y-4" id="messagesContainer">
+                <div class="flex-1 overflow-y-auto p-2 md:p-4 space-y-3 md:space-y-4" id="messagesContainer">
                     <template x-for="message in messages" :key="message.id">
                         <div :class="message.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
                             <div :class="message.role === 'user' ? 'bg-blue-600 text-white' : 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white'"
-                                class="max-w-3xl rounded-lg px-4 py-2">
+                                class="max-w-[85%] md:max-w-3xl rounded-lg px-3 md:px-4 py-2 overflow-hidden">
                                 <div class="text-xs font-semibold mb-1" x-text="message.role === 'user' ? 'You' : 'Augment'"></div>
 
                                 <!-- Image attachments -->
                                 <div x-show="message.attachments && message.attachments.length > 0" class="mb-2 flex flex-wrap gap-2">
                                     <template x-for="(img, idx) in message.attachments" :key="idx">
-                                        <img :src="img.data" :alt="img.name" class="max-w-xs rounded border border-gray-300 dark:border-gray-600">
+                                        <img :src="img.data" :alt="img.name" class="max-w-full md:max-w-xs rounded border border-gray-300 dark:border-gray-600">
                                     </template>
                                 </div>
 
-                                <div class="prose prose-sm max-w-none dark:prose-invert"
+                                <div class="prose prose-sm max-w-none dark:prose-invert text-sm md:text-base break-words overflow-x-auto"
                                     :class="message.role === 'user' ? 'prose-invert' : ''"
                                     x-html="renderMarkdown(message.content)"></div>
                             </div>
@@ -141,21 +202,21 @@
 
                     <!-- Streaming message -->
                     <div x-show="isStreaming" class="flex justify-start">
-                        <div class="max-w-3xl bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg px-4 py-2">
+                        <div class="max-w-[85%] md:max-w-3xl bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg px-3 md:px-4 py-2 overflow-hidden">
                             <div class="text-xs font-semibold mb-1">Augment</div>
-                            <div class="prose prose-sm max-w-none dark:prose-invert" x-html="renderMarkdown(streamingContent)"></div>
+                            <div class="prose prose-sm max-w-none dark:prose-invert text-sm md:text-base break-words overflow-x-auto" x-html="renderMarkdown(streamingContent)"></div>
                             <span class="inline-block w-2 h-4 bg-gray-900 dark:bg-white animate-pulse"></span>
                         </div>
                     </div>
                 </div>
-                
+
                 <!-- Input Area -->
-                <div class="border-t border-gray-300 dark:border-gray-700 p-4">
+                <div class="border-t border-gray-300 dark:border-gray-700 p-3 md:p-4 bg-white dark:bg-gray-800">
                     <!-- Image Previews -->
                     <div x-show="attachedImages.length > 0" class="mb-2 flex flex-wrap gap-2">
                         <template x-for="(img, index) in attachedImages" :key="index">
                             <div class="relative inline-block">
-                                <img :src="img.data" class="h-20 w-20 object-cover rounded border border-gray-300 dark:border-gray-600">
+                                <img :src="img.data" class="h-16 w-16 md:h-20 md:w-20 object-cover rounded border border-gray-300 dark:border-gray-600">
                                 <button @click="removeImage(index)" type="button"
                                     class="absolute -top-2 -right-2 bg-red-500 text-white rounded-full w-5 h-5 flex items-center justify-center text-xs hover:bg-red-600">
                                     ×
@@ -164,24 +225,34 @@
                         </template>
                     </div>
 
-                    <form @submit.prevent="sendMessage()" class="flex space-x-2">
+                    <form @submit.prevent="sendMessage()" class="flex flex-col md:flex-row space-y-2 md:space-y-0 md:space-x-2">
                         <div class="flex flex-col flex-1 space-y-2">
                             <textarea x-model="messageInput"
-                                @keydown.enter="if($event.ctrlKey) { $event.preventDefault(); sendMessage(); }"
-                                placeholder="Type your message... (Ctrl+Enter to send)"
-                                rows="3"
-                                class="flex-1 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white resize-none"></textarea>
-                            <div class="flex items-center space-x-2">
-                                <input type="file" id="imageUpload" accept="image/*" @change="handleImageUpload" class="hidden">
-                                <button type="button" @click="document.getElementById('imageUpload').click()"
-                                    class="text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white flex items-center space-x-1">
-                                    <span>📎</span>
-                                    <span>Attach Image</span>
+                                @keydown.enter="if($event.ctrlKey || ($event.metaKey && !$event.shiftKey)) { $event.preventDefault(); sendMessage(); }"
+                                @input="setupTextareaAutoResize()"
+                                placeholder="Type your message..."
+                                class="border border-gray-300 dark:border-gray-600 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white resize-none"
+                                style="min-height: 44px; max-height: 120px; overflow-y: auto; font-size: 16px;"></textarea>
+                            <div class="flex items-center justify-between">
+                                <div class="flex items-center space-x-2">
+                                    <input type="file" id="imageUpload" accept="image/*" @change="handleImageUpload" class="hidden">
+                                    <button type="button" @click="document.getElementById('imageUpload').click()"
+                                        class="text-xs md:text-sm text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white flex items-center space-x-1">
+                                        <span>📎</span>
+                                        <span class="hidden md:inline">Attach Image</span>
+                                    </button>
+                                    <div class="text-xs text-gray-500 dark:text-gray-400 hidden md:block">
+                                        Ctrl+Enter to send
+                                    </div>
+                                </div>
+                                <button type="submit" :disabled="(!messageInput.trim() && attachedImages.length === 0) || isStreaming"
+                                    class="md:hidden bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-4 py-2 rounded font-medium text-sm">
+                                    Send
                                 </button>
                             </div>
                         </div>
                         <button type="submit" :disabled="(!messageInput.trim() && attachedImages.length === 0) || isStreaming"
-                            class="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-6 py-2 rounded font-medium self-end">
+                            class="hidden md:block bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-6 py-2 rounded font-medium self-end">
                             Send
                         </button>
                     </form>
@@ -262,6 +333,56 @@
             <div x-show="currentTab === 'terminal'" class="flex-1 flex flex-col overflow-hidden bg-black">
                 <div id="terminal" class="w-full h-full"></div>
             </div>
+
+            <!-- Settings Tab -->
+            <div x-show="currentTab === 'settings'" class="flex-1 overflow-y-auto p-4">
+                <div class="max-w-2xl mx-auto space-y-6">
+                    <h2 class="text-2xl font-bold text-gray-900 dark:text-white">Settings</h2>
+
+                    <!-- User Info -->
+                    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 border border-gray-200 dark:border-gray-700">
+                        <h3 class="text-lg font-semibold mb-4 text-gray-900 dark:text-white">User Information</h3>
+                        <div class="space-y-3">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Username</label>
+                                <div class="mt-1 text-sm text-gray-900 dark:text-white" x-text="username"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Project Management -->
+                    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 border border-gray-200 dark:border-gray-700">
+                        <h3 class="text-lg font-semibold mb-4 text-gray-900 dark:text-white">Project Management</h3>
+                        <div class="space-y-4">
+                            <div>
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Current Project</label>
+                                <select x-model="currentProjectId" @change="switchProject()"
+                                    class="w-full bg-gray-50 dark:bg-gray-700 border border-gray-300 dark:border-gray-600 text-gray-900 dark:text-white rounded px-3 py-2">
+                                    <option value="">Select Project...</option>
+                                    <template x-for="project in projects" :key="project.id">
+                                        <option :value="project.id" x-text="project.name"></option>
+                                    </template>
+                                </select>
+                            </div>
+                            <button @click="scanProjects()"
+                                class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium">
+                                + Add New Project
+                            </button>
+                        </div>
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="bg-white dark:bg-gray-800 rounded-lg p-6 border border-gray-200 dark:border-gray-700">
+                        <h3 class="text-lg font-semibold mb-4 text-gray-900 dark:text-white">Actions</h3>
+                        <div class="space-y-3">
+                            <button @click="logout()"
+                                class="w-full bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded font-medium">
+                                Logout
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -291,6 +412,39 @@
                 </button>
             </div>
         </div>
+    </div>
+
+    <!-- Mobile Bottom Tab Bar -->
+    <div class="md:hidden mobile-tab-bar">
+        <button @click="currentTab = 'chat'"
+                :class="{'active': currentTab === 'chat'}"
+                class="mobile-tab-button">
+            <span class="text-lg mb-1">💬</span>
+            <span>Chat</span>
+        </button>
+        <button @click="currentTab = 'files'"
+                :class="{'active': currentTab === 'files'}"
+                class="mobile-tab-button">
+            <span class="text-lg mb-1">📁</span>
+            <span>Files</span>
+        </button>
+        <button @click="currentTab = 'git'"
+                :class="{'active': currentTab === 'git'}"
+                class="mobile-tab-button">
+            <span class="text-lg mb-1">🔀</span>
+            <span>Git</span>
+        </button>
+        <button @click="currentTab = 'terminal'; initTerminal()"
+                :class="{'active': currentTab === 'terminal'}"
+                class="mobile-tab-button">
+            <span class="text-lg mb-1">💻</span>
+            <span>Terminal</span>
+        </button>
+        <button @click="sidebarOpen = !sidebarOpen"
+                class="mobile-tab-button">
+            <span class="text-lg mb-1">⚙️</span>
+            <span>More</span>
+        </button>
     </div>
 </div>
 

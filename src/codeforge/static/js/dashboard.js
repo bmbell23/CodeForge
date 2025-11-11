@@ -28,6 +28,7 @@ function dashboardApp() {
         
         // UI
         currentTab: 'chat',
+        sidebarOpen: false,
         
         // Files
         fileTree: [],
@@ -46,6 +47,7 @@ function dashboardApp() {
             await this.loadUser();
             await this.loadProjects();
             this.configureMarked();
+            this.initMobileHandlers();
 
             // Handle window resize for terminal
             window.addEventListener('resize', () => {
@@ -182,6 +184,9 @@ function dashboardApp() {
 
             // Connect WebSocket
             this.connectWebSocket();
+
+            // Close sidebar on mobile
+            this.sidebarOpen = false;
         },
 
         startEditingConversation(conversationId, currentTitle) {
@@ -539,6 +544,84 @@ function dashboardApp() {
         logout() {
             localStorage.removeItem('token');
             window.location.href = '/login';
+        },
+
+        initMobileHandlers() {
+            // Always set up mobile handlers (responsive design)
+            document.addEventListener('touchstart', function() {}, {passive: true});
+
+            // Prevent zoom on double tap for all interactive elements
+            document.addEventListener('touchend', function(e) {
+                const now = new Date().getTime();
+                const timeSince = now - this.lastTouchEnd;
+                if ((timeSince < 300) && (timeSince > 0)) {
+                    e.preventDefault();
+                }
+                this.lastTouchEnd = now;
+            }, false);
+
+            // Additional zoom prevention
+            document.addEventListener('gesturestart', function(e) {
+                e.preventDefault();
+            });
+
+            // Ensure all input elements have proper font size
+            this.$nextTick(() => {
+                this.enforceInputFontSizes();
+                this.setupTextareaAutoResize();
+            });
+
+            // Re-setup on window resize
+            window.addEventListener('resize', () => {
+                this.$nextTick(() => {
+                    this.enforceInputFontSizes();
+                    this.setupTextareaAutoResize();
+                });
+            });
+        },
+
+        enforceInputFontSizes() {
+            // Ensure all input elements have 16px font size to prevent zoom
+            const inputs = document.querySelectorAll('input, textarea, select, button');
+            inputs.forEach(input => {
+                if (window.innerWidth <= 768) {
+                    input.style.fontSize = '16px';
+                    input.style.webkitTextSizeAdjust = '100%';
+                    input.style.webkitAppearance = 'none';
+                }
+            });
+        },
+
+        setupTextareaAutoResize() {
+            const textarea = document.querySelector('textarea[x-model="messageInput"]');
+            if (textarea) {
+                // Remove existing listeners to prevent duplicates
+                textarea.removeEventListener('input', this.textareaResizeHandler);
+
+                // Create bound handler
+                this.textareaResizeHandler = () => {
+                    // Reset height to auto to get the correct scrollHeight
+                    textarea.style.height = 'auto';
+
+                    // Calculate new height (min 44px for mobile touch targets, max 120px)
+                    const minHeight = window.innerWidth <= 768 ? 44 : 40;
+                    const maxHeight = 120;
+                    const newHeight = Math.max(minHeight, Math.min(textarea.scrollHeight, maxHeight));
+
+                    textarea.style.height = newHeight + 'px';
+                };
+
+                // Set initial height
+                this.textareaResizeHandler();
+
+                // Add input event listener for auto-resize
+                textarea.addEventListener('input', this.textareaResizeHandler);
+
+                // Also resize on paste
+                textarea.addEventListener('paste', () => {
+                    setTimeout(this.textareaResizeHandler, 0);
+                });
+            }
         }
     };
 }

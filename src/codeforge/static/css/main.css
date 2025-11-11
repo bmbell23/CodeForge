@@ -38,6 +38,151 @@ textarea[x-model="fileContent"] {
     tab-size: 4;
 }
 
+/* Mobile-specific styles */
+@media (max-width: 768px) {
+    /* Prevent zoom on input focus - CRITICAL: 16px minimum font size */
+    input, textarea, select, button {
+        font-size: 16px !important;
+        transform-origin: left top;
+        transform: scale(1);
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+        -moz-appearance: none;
+        appearance: none;
+    }
+
+    /* More specific selectors to catch all input types */
+    input[type="text"],
+    input[type="password"],
+    input[type="email"],
+    input[type="search"],
+    input[type="tel"],
+    input[type="url"],
+    input[type="number"],
+    input[type="file"] {
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+    }
+
+    /* Ensure chat input doesn't cause zoom and auto-resizes */
+    textarea[x-model="messageInput"] {
+        font-size: 16px !important;
+        min-height: 44px !important;
+        max-height: 120px !important;
+        resize: none !important;
+        overflow-y: auto !important;
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+    }
+
+    /* File editor textarea */
+    textarea[x-model="fileContent"] {
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+    }
+
+    /* Better mobile touch targets */
+    button {
+        min-height: 44px;
+        min-width: 44px;
+        font-size: 16px !important;
+        -webkit-text-size-adjust: 100%;
+        -webkit-appearance: none;
+    }
+
+    /* Improve mobile sidebar */
+    .mobile-nav-button {
+        padding: 12px 16px;
+        font-size: 16px;
+    }
+
+    /* Mobile tab bar at bottom */
+    .mobile-tab-bar {
+        position: fixed;
+        bottom: 0;
+        left: 0;
+        right: 0;
+        z-index: 40;
+        background: white;
+        border-top: 1px solid #e5e7eb;
+        padding: 8px 0;
+        display: flex;
+        justify-content: space-around;
+        align-items: center;
+    }
+
+    .dark .mobile-tab-bar {
+        background: #1f2937;
+        border-top-color: #374151;
+    }
+
+    .mobile-tab-button {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 8px 12px;
+        font-size: 12px;
+        color: #6b7280;
+        text-decoration: none;
+        border-radius: 8px;
+        min-width: 60px;
+    }
+
+    .mobile-tab-button.active {
+        color: #2563eb;
+        background: #eff6ff;
+    }
+
+    .dark .mobile-tab-button {
+        color: #9ca3af;
+    }
+
+    .dark .mobile-tab-button.active {
+        color: #60a5fa;
+        background: #1e3a8a;
+    }
+
+    /* Adjust main content to account for bottom tab bar */
+    .mobile-main-content {
+        padding-bottom: 80px;
+    }
+
+    /* Additional zoom prevention measures */
+    * {
+        -webkit-text-size-adjust: 100%;
+        -ms-text-size-adjust: 100%;
+        text-size-adjust: 100%;
+    }
+
+    /* Prevent double-tap zoom */
+    a, button, input, textarea, select {
+        touch-action: manipulation;
+    }
+
+    /* Ensure all form elements have proper font size */
+    .appearance-none,
+    .focus\:outline-none,
+    [class*="border-"],
+    [class*="rounded"],
+    [class*="px-"],
+    [class*="py-"] {
+        font-size: 16px !important;
+    }
+
+    /* Specific overrides for Tailwind classes that might have smaller fonts */
+    .text-xs, .text-sm {
+        font-size: 16px !important;
+    }
+
+    /* Exception for non-interactive text elements */
+    .text-xs:not(input):not(textarea):not(select):not(button),
+    .text-sm:not(input):not(textarea):not(select):not(button) {
+        font-size: 0.75rem !important; /* 12px */
+    }
+}
+
 /* Message animations */
 @keyframes fadeIn {
     from {
@@ -102,6 +247,9 @@ textarea[x-model="fileContent"] {
     overflow-x: auto;
     margin-top: 0.5em;
     margin-bottom: 0.5em;
+    max-width: 100%;
+    white-space: pre;
+    word-wrap: normal;
 }
 
 .prose pre code {
@@ -109,6 +257,27 @@ textarea[x-model="fileContent"] {
     padding: 0;
     color: inherit;
     font-size: 0.875em;
+    white-space: pre;
+    word-wrap: normal;
+    display: block;
+}
+
+/* Mobile code block handling */
+@media (max-width: 768px) {
+    .prose pre {
+        font-size: 12px;
+        padding: 0.75em;
+        max-width: calc(85vw - 2rem);
+    }
+
+    .prose pre code {
+        font-size: 12px;
+    }
+
+    .prose code:not(pre code) {
+        font-size: 14px;
+        word-break: break-word;
+    }
 }
 
 .prose strong {
