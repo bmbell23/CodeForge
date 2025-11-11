@@ -34,11 +34,9 @@ function dashboardApp() {
         gitStatus: null,
         gitLog: [],
 
-        // Terminal
-        terminal: null,
-        terminalFitAddon: null,
-        terminalWs: null,
-        terminalInitialized: false,
+        // Terminal - store per project
+        terminals: {}, // Map of project_id -> {terminal, fitAddon, ws}
+        currentTerminalProjectId: null,
 
         async init() {
             await this.loadUser();
@@ -47,8 +45,9 @@ function dashboardApp() {
 
             // Handle window resize for terminal
             window.addEventListener('resize', () => {
-                if (this.terminal && this.terminalFitAddon) {
-                    this.terminalFitAddon.fit();
+                if (this.currentTerminalProjectId && this.terminals[this.currentTerminalProjectId]) {
+                    const terminalData = this.terminals[this.currentTerminalProjectId];
+                    terminalData.fitAddon.fit();
                 }
             });
         },
@@ -118,15 +117,20 @@ function dashboardApp() {
         
         async switchProject() {
             if (!this.currentProjectId) return;
-            
+
             // Load conversations for this project
             await this.loadConversations();
-            
+
             // Load file tree
             await this.loadFileTree();
-            
+
             // Load git status
             await this.loadGitStatus();
+
+            // If terminal tab is active, switch to the terminal for this project
+            if (this.currentTab === 'terminal') {
+                this.initTerminal();
+            }
         },
         
         async loadConversations() {
@@ -363,13 +367,10 @@ function dashboardApp() {
         },
 
         initTerminal() {
+            console.log('Initializing terminal for project:', this.currentProjectId);
+
             if (!this.currentProjectId) {
                 console.error('No project selected');
-                return;
-            }
-
-            // Only initialize once
-            if (this.terminalInitialized) {
                 return;
             }
 
@@ -379,8 +380,14 @@ function dashboardApp() {
                 return;
             }
 
-            // Create terminal instance
-            this.terminal = new Terminal({
+            // If terminal already exists for this project, just show it
+            if (this.terminals[this.currentProjectId]) {
+                this.showTerminalForProject(this.currentProjectId);
+                return;
+            }
+
+            // Create new terminal instance for this project
+            const terminal = new Terminal({
                 cursorBlink: true,
                 fontSize: 14,
                 fontFamily: 'Monaco, Menlo, "Ubuntu Mono", Consolas, "source-code-pro", monospace',
@@ -389,48 +396,87 @@ function dashboardApp() {
                     foreground: '#ffffff',
                     cursor: '#ffffff',
                     selection: '#ffffff40'
-                },
-                rows: 30,
-                cols: 100
+                }
             });
 
             // Create fit addon
-            this.terminalFitAddon = new FitAddon.FitAddon();
-            this.terminal.loadAddon(this.terminalFitAddon);
+            const fitAddon = new FitAddon.FitAddon();
+            terminal.loadAddon(fitAddon);
 
             // Open terminal in the container
             const terminalElement = document.getElementById('terminal');
             if (terminalElement) {
-                this.terminal.open(terminalElement);
-                this.terminalFitAddon.fit();
+                // Clear the container
+                terminalElement.innerHTML = '';
+
+                terminal.open(terminalElement);
+
+                // Fit to container size
+                setTimeout(() => {
+                    fitAddon.fit();
+                }, 100);
+
+                // Store terminal info
+                this.terminals[this.currentProjectId] = {
+                    terminal: terminal,
+                    fitAddon: fitAddon,
+                    ws: null
+                };
+
+                this.currentTerminalProjectId = this.currentProjectId;
 
                 // Connect to WebSocket
                 this.connectTerminalWebSocket();
+            }
+        },
 
-                this.terminalInitialized = true;
+        showTerminalForProject(projectId) {
+            console.log('Showing terminal for project:', projectId);
+
+            const terminalData = this.terminals[projectId];
+            if (!terminalData) return;
+
+            const terminalElement = document.getElementById('terminal');
+            if (terminalElement) {
+                // Clear the container
+                terminalElement.innerHTML = '';
+
+                // Re-open the existing terminal
+                terminalData.terminal.open(terminalElement);
+
+                // Fit to container size
+                setTimeout(() => {
+                    terminalData.fitAddon.fit();
+                }, 100);
+
+                this.currentTerminalProjectId = projectId;
             }
         },
 
         connectTerminalWebSocket() {
             if (!this.currentProjectId) return;
 
-            // Close existing connection
-            if (this.terminalWs) {
-                this.terminalWs.close();
+            const terminalData = this.terminals[this.currentProjectId];
+            if (!terminalData) return;
+
+            // Close existing connection for this terminal
+            if (terminalData.ws) {
+                terminalData.ws.close();
             }
 
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}/api/terminal/ws/${this.currentProjectId}`;
 
-            this.terminalWs = new WebSocket(wsUrl);
+            const ws = new WebSocket(wsUrl);
+            terminalData.ws = ws;
 
-            this.terminalWs.onopen = () => {
-                console.log('Terminal WebSocket connected');
+            ws.onopen = () => {
+                console.log('Terminal WebSocket connected for project:', this.currentProjectId);
 
                 // Send input from terminal to backend
-                this.terminal.onData((data) => {
-                    if (this.terminalWs && this.terminalWs.readyState === WebSocket.OPEN) {
-                        this.terminalWs.send(JSON.stringify({
+                terminalData.terminal.onData((data) => {
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
                             type: 'input',
                             data: data
                         }));
@@ -438,21 +484,21 @@ function dashboardApp() {
                 });
             };
 
-            this.terminalWs.onmessage = (event) => {
+            ws.onmessage = (event) => {
                 const message = JSON.parse(event.data);
                 if (message.type === 'output') {
-                    this.terminal.write(message.data);
+                    terminalData.terminal.write(message.data);
                 }
             };
 
-            this.terminalWs.onerror = (error) => {
+            ws.onerror = (error) => {
                 console.error('Terminal WebSocket error:', error);
-                this.terminal.write('\r\n\x1b[31mWebSocket connection error\x1b[0m\r\n');
+                terminalData.terminal.write('\r\n\x1b[31mWebSocket connection error\x1b[0m\r\n');
             };
 
-            this.terminalWs.onclose = () => {
-                console.log('Terminal WebSocket closed');
-                this.terminal.write('\r\n\x1b[33mConnection closed\x1b[0m\r\n');
+            ws.onclose = () => {
+                console.log('Terminal WebSocket closed for project:', this.currentProjectId);
+                terminalData.terminal.write('\r\n\x1b[33mConnection closed\x1b[0m\r\n');
             };
         },
 
