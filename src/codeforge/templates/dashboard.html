@@ -145,7 +145,9 @@
                     <span x-show="currentTab === 'settings'">⚙️</span>
                     <span class="font-medium text-gray-900 dark:text-white capitalize" x-text="currentTab"></span>
                 </div>
-                <button @click="sidebarOpen = !sidebarOpen" class="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white">
+                <!-- Hamburger button - different behavior based on tab -->
+                <button @click="currentTab === 'files' ? filePickerOpen = !filePickerOpen : sidebarOpen = !sidebarOpen"
+                    class="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white">
                     <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
                     </svg>
@@ -262,7 +264,9 @@
             <!-- Files Tab -->
             <div x-show="currentTab === 'files'" class="flex-1 flex overflow-hidden">
                 <!-- File Tree -->
-                <div class="w-64 border-r border-gray-300 dark:border-gray-700 overflow-y-auto p-2">
+                <div x-show="filePickerOpen"
+                    class="w-64 md:block border-r border-gray-300 dark:border-gray-700 overflow-y-auto p-2"
+                    :class="{'hidden': !filePickerOpen}">
                     <!-- Breadcrumb/Navigation -->
                     <div class="mb-2 pb-2 border-b border-gray-300 dark:border-gray-600">
                         <div class="flex items-center text-xs text-gray-600 dark:text-gray-400">
@@ -356,6 +360,30 @@
                                     </template>
                                 </ul>
                             </div>
+                        </div>
+                    </div>
+
+                    <!-- Quick Commit -->
+                    <div>
+                        <h3 class="text-lg font-bold mb-2 text-gray-900 dark:text-gray-100">⚡ Quick Commit</h3>
+                        <div class="bg-gray-100 dark:bg-gray-800 p-4 rounded">
+                            <div class="flex gap-2">
+                                <input type="text"
+                                    x-model="quickCommitMessage"
+                                    @keydown.enter="quickCommit()"
+                                    placeholder="Commit message (auto-versions & pushes)"
+                                    class="flex-1 border border-gray-300 dark:border-gray-600 rounded px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:bg-gray-700 dark:text-white">
+                                <button @click="quickCommit()"
+                                    :disabled="!quickCommitMessage || quickCommitLoading"
+                                    class="bg-blue-600 hover:bg-blue-700 disabled:bg-gray-400 text-white px-4 py-2 rounded font-medium">
+                                    <span x-show="!quickCommitLoading">🚀 Commit & Push</span>
+                                    <span x-show="quickCommitLoading">⏳ Pushing...</span>
+                                </button>
+                            </div>
+                            <div x-show="quickCommitResult"
+                                class="mt-2 text-sm"
+                                :class="quickCommitSuccess ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'"
+                                x-text="quickCommitResult"></div>
                         </div>
                     </div>
 
@@ -487,14 +515,15 @@
             <span class="text-lg mb-1">💻</span>
             <span>Terminal</span>
         </button>
-        <button @click="sidebarOpen = !sidebarOpen"
+        <button @click="currentTab = 'settings'"
+                :class="{'active': currentTab === 'settings'}"
                 class="mobile-tab-button">
             <span class="text-lg mb-1">⚙️</span>
-            <span>More</span>
+            <span>Settings</span>
         </button>
     </div>
 </div>
 
-<script src="/code/static/js/dashboard.js?v=2"></script>
+<script src="/code/static/js/dashboard.js?v=4"></script>
 {% endblock %}
 

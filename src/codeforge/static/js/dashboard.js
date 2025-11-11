@@ -29,7 +29,8 @@ function dashboardApp() {
         // UI
         currentTab: 'chat',
         sidebarOpen: false,
-        
+        filePickerOpen: true, // File picker visibility on mobile
+
         // Files
         fileTree: [],
         currentFile: null,
@@ -40,6 +41,10 @@ function dashboardApp() {
         // Git
         gitStatus: null,
         gitLog: [],
+        quickCommitMessage: '',
+        quickCommitLoading: false,
+        quickCommitResult: '',
+        quickCommitSuccess: false,
 
         // Terminal - store per project
         terminals: {}, // Map of project_id -> {terminal, fitAddon, ws}
@@ -465,6 +470,53 @@ function dashboardApp() {
             const logResponse = await apiRequest(`${BASE_PATH}/api/git/${this.currentProjectId}/log?limit=10`);
             if (logResponse && logResponse.ok) {
                 this.gitLog = await logResponse.json();
+            }
+        },
+
+        async quickCommit() {
+            if (!this.currentProjectId || !this.quickCommitMessage) return;
+
+            this.quickCommitLoading = true;
+            this.quickCommitResult = '';
+            this.quickCommitSuccess = false;
+
+            try {
+                const response = await apiRequest(
+                    `${BASE_PATH}/api/git/${this.currentProjectId}/quick-commit`,
+                    {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            message: this.quickCommitMessage
+                        })
+                    }
+                );
+
+                if (response && response.ok) {
+                    const result = await response.json();
+                    this.quickCommitSuccess = true;
+                    this.quickCommitResult = `✅ ${result.message}`;
+                    this.quickCommitMessage = '';
+
+                    // Reload git status and log
+                    await this.loadGitStatus();
+                } else {
+                    const error = await response.json();
+                    this.quickCommitSuccess = false;
+                    this.quickCommitResult = `❌ Error: ${error.detail || 'Failed to commit'}`;
+                }
+            } catch (error) {
+                this.quickCommitSuccess = false;
+                this.quickCommitResult = `❌ Error: ${error.message}`;
+            } finally {
+                this.quickCommitLoading = false;
+
+                // Clear result after 5 seconds
+                setTimeout(() => {
+                    this.quickCommitResult = '';
+                }, 5000);
             }
         },
 

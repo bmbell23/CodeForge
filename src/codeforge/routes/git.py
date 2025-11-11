@@ -7,6 +7,8 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 import git
+import re
+import subprocess
 
 from ..database import get_db
 from ..models.user import User
@@ -210,4 +212,121 @@ def get_git_branches(
     # Get branches
     branches = [branch.name for branch in repo.branches]
     return branches
+
+
+class QuickCommitRequest(BaseModel):
+    """Quick commit request schema."""
+    message: str
+
+
+class QuickCommitResponse(BaseModel):
+    """Quick commit response schema."""
+    success: bool
+    version: str
+    message: str
+
+
+@router.post("/{project_id}/quick-commit", response_model=QuickCommitResponse)
+def quick_commit(
+    project_id: int,
+    request: QuickCommitRequest,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Quick commit with auto-versioning (like gvc function)."""
+    # Get project
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.user_id == current_user.id
+    ).first()
+
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found"
+        )
+
+    # Get project path
+    project_path = Path(settings.projects_root) / project.path
+
+    try:
+        repo = git.Repo(project_path)
+    except git.InvalidGitRepositoryError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Not a git repository"
+        )
+
+    # Determine current version
+    current_version = None
+    version_file = project_path / "version.txt"
+    changelog_file = project_path / "CHANGELOG.md"
+    pyproject_file = project_path / "pyproject.toml"
+
+    if version_file.exists():
+        current_version = version_file.read_text().strip()
+    elif changelog_file.exists():
+        content = changelog_file.read_text()
+        match = re.search(r'## \[([^\]]+)\]', content)
+        if match:
+            current_version = match.group(1)
+    elif pyproject_file.exists():
+        content = pyproject_file.read_text()
+        match = re.search(r'version\s*=\s*"([^"]+)"', content)
+        if match:
+            current_version = match.group(1)
+
+    if not current_version:
+        # Default to 0.0.0 if no version found
+        current_version = "0.0.0"
+
+    # Parse and increment version
+    match = re.match(r'(\d+)\.(\d+)\.(\d+)', current_version)
+    if not match:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid version format: {current_version}"
+        )
+
+    major, minor, patch = match.groups()
+    new_version = f"{major}.{minor}.{int(patch) + 1}"
+
+    # Update version in files
+    if version_file.exists():
+        version_file.write_text(new_version + "\n")
+    elif changelog_file.exists():
+        content = changelog_file.read_text()
+        content = re.sub(r'## \[[^\]]+\]', f'## [{new_version}]', content, count=1)
+        changelog_file.write_text(content)
+    elif pyproject_file.exists():
+        content = pyproject_file.read_text()
+        content = re.sub(r'version\s*=\s*"[^"]+"', f'version = "{new_version}"', content, count=1)
+        pyproject_file.write_text(content)
+
+    # Stage all changes
+    repo.git.add('.')
+
+    # Commit
+    commit_message = f"v{new_version}: {request.message}"
+    repo.index.commit(commit_message)
+
+    # Create tag
+    repo.create_tag(f"v{new_version}", message=f"Version {new_version}")
+
+    # Push
+    try:
+        origin = repo.remote('origin')
+        origin.push()
+        origin.push(tags=True)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to push: {str(e)}"
+        )
+
+    return QuickCommitResponse(
+        success=True,
+        version=new_version,
+        message=f"Committed and pushed v{new_version}"
+    )
 
