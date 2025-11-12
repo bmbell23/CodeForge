@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     # Augment CLI
     auggie_path: str = "auggie"
     node_path: str = "/usr/bin/node"
-    use_mock_augment: bool = True  # Set to False when you have auggie installed
+    use_mock_augment: bool = False  # Set to False when you have auggie installed
 
     class Config:
         env_file = ".env"

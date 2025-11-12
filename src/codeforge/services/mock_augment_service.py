@@ -2,18 +2,21 @@
 
 import asyncio
 from typing import AsyncGenerator, Optional
+from .tool_call_parser import ToolCallParser, ToolCallDisplayMode
 
 
 class MockAugmentService:
     """Mock service that simulates Augment CLI responses."""
 
-    def __init__(self, project_path: Optional[str] = None):
+    def __init__(self, project_path: Optional[str] = None, tool_call_mode: ToolCallDisplayMode = ToolCallDisplayMode.MINIMAL):
         """Initialize the mock Augment service.
-        
+
         Args:
             project_path: Relative path to the project (not used in mock)
+            tool_call_mode: How to display tool calls to users (not used in mock)
         """
         self.project_path = project_path
+        self.tool_call_mode = tool_call_mode
 
     async def stream_response(self, prompt: str) -> AsyncGenerator[str, None]:
         """Simulate streaming response from Augment CLI.
