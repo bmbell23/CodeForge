@@ -24,6 +24,12 @@ class ProjectCreate(BaseModel):
     description: str = ""
 
 
+class ProjectUpdate(BaseModel):
+    """Project update schema."""
+    name: str
+    description: str = ""
+
+
 class ProjectResponse(BaseModel):
     """Project response schema."""
     id: int
@@ -156,6 +162,36 @@ def get_project(
     return project
 
 
+@router.put("/{project_id}", response_model=ProjectResponse)
+def update_project(
+    project_id: int,
+    project_data: ProjectUpdate,
+    current_user: User = Depends(get_current_active_user),
+    db: Session = Depends(get_db)
+):
+    """Update a project."""
+    project = db.query(Project).filter(
+        Project.id == project_id,
+        Project.user_id == current_user.id
+    ).first()
+
+    if not project:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found"
+        )
+
+    # Update project fields
+    project.name = project_data.name
+    project.description = project_data.description
+    project.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(project)
+
+    return project
+
+
 @router.delete("/{project_id}")
 def delete_project(
     project_id: int,
@@ -167,15 +203,15 @@ def delete_project(
         Project.id == project_id,
         Project.user_id == current_user.id
     ).first()
-    
+
     if not project:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Project not found"
         )
-    
+
     project.is_active = False
     db.commit()
-    
+
     return {"message": "Project deleted successfully"}
 

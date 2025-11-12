@@ -11,6 +11,8 @@ function dashboardApp() {
         currentProjectId: '',
         scannedProjects: [],
         showProjectScan: false,
+        renamingProjectId: null,
+        renamingProjectName: '',
         
         // Conversations
         conversations: [],
@@ -225,6 +227,7 @@ function dashboardApp() {
             const response = await apiRequest(`${BASE_PATH}/api/projects/`);
             if (response && response.ok) {
                 this.projects = await response.json();
+                console.log('Projects loaded:', this.projects.length, 'projects');
 
                 // Check if we have a project ID from URL
                 const urlParams = new URLSearchParams(window.location.search);
@@ -499,6 +502,49 @@ function dashboardApp() {
                 setTimeout(() => {
                     this.showProjectScan = false;
                 }, 500);
+            }
+        },
+
+        startRenameProject(projectId) {
+            console.log('Starting rename for project:', projectId);
+            const project = this.projects.find(p => p.id === projectId);
+            if (project) {
+                this.renamingProjectId = projectId;
+                this.renamingProjectName = project.name;
+                console.log('Rename mode activated for:', project.name);
+            }
+        },
+
+        cancelRenameProject() {
+            this.renamingProjectId = null;
+            this.renamingProjectName = '';
+        },
+
+        async confirmRenameProject() {
+            if (!this.renamingProjectId || !this.renamingProjectName.trim()) {
+                return;
+            }
+
+            const response = await apiRequest(`${BASE_PATH}/api/projects/${this.renamingProjectId}`, {
+                method: 'PUT',
+                body: {
+                    name: this.renamingProjectName.trim(),
+                    description: ''
+                }
+            });
+
+            if (response && response.ok) {
+                const updatedProject = await response.json();
+                // Update the project in the local array
+                const projectIndex = this.projects.findIndex(p => p.id === this.renamingProjectId);
+                if (projectIndex !== -1) {
+                    this.projects[projectIndex] = updatedProject;
+                }
+                this.cancelRenameProject();
+                return true;
+            } else {
+                alert('Failed to rename project. Please try again.');
+                return false;
             }
         },
         

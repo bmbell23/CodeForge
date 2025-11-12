@@ -478,6 +478,42 @@
                                     </template>
                                 </select>
                             </div>
+
+                            <!-- Project List with Rename -->
+                            <div x-show="projects.length > 0" class="space-y-2">
+                                <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">Manage Projects</label>
+                                <template x-for="project in projects" :key="project.id">
+                                    <div class="flex items-center justify-between p-2 bg-gray-50 dark:bg-gray-700 rounded border">
+                                        <div class="flex-1">
+                                            <div x-show="renamingProjectId !== project.id" class="flex items-center">
+                                                <span x-text="project.name" class="text-sm font-medium text-gray-900 dark:text-white"></span>
+                                                <span x-show="currentProjectId == project.id" class="ml-2 text-xs bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200 px-2 py-1 rounded">Current</span>
+                                            </div>
+                                            <div x-show="renamingProjectId === project.id" class="flex items-center space-x-2">
+                                                <input x-model="renamingProjectName"
+                                                    @keydown.enter="confirmRenameProject()"
+                                                    @keydown.escape="cancelRenameProject()"
+                                                    class="flex-1 text-sm bg-white dark:bg-gray-600 border border-gray-300 dark:border-gray-500 rounded px-2 py-1 text-gray-900 dark:text-white"
+                                                    type="text">
+                                                <button @click="confirmRenameProject()"
+                                                    class="text-green-600 hover:text-green-700 text-xs">
+                                                    ✓
+                                                </button>
+                                                <button @click="cancelRenameProject()"
+                                                    class="text-red-600 hover:text-red-700 text-xs">
+                                                    ✕
+                                                </button>
+                                            </div>
+                                        </div>
+                                        <button x-show="renamingProjectId !== project.id"
+                                            @click="startRenameProject(project.id)"
+                                            class="text-blue-600 hover:text-blue-700 text-xs ml-2">
+                                            Rename
+                                        </button>
+                                    </div>
+                                </template>
+                            </div>
+
                             <button @click="scanProjects()"
                                 class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded font-medium">
                                 + Add New Project
