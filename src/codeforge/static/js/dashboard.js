@@ -64,6 +64,7 @@ function dashboardApp() {
             await this.loadProjects();
             this.configureMarked();
             this.initMobileHandlers();
+            this.initUrlStateManagement();
 
             // Handle window resize for terminal
             window.addEventListener('resize', () => {
@@ -80,6 +81,79 @@ function dashboardApp() {
                     this.loadFileTree();
                 }
             });
+        },
+
+        initUrlStateManagement() {
+            // Parse URL parameters on load
+            this.parseUrlState();
+
+            // Handle browser back/forward navigation
+            window.addEventListener('popstate', (event) => {
+                if (event.state) {
+                    this.restoreStateFromUrl(event.state);
+                } else {
+                    this.parseUrlState();
+                }
+            });
+        },
+
+        parseUrlState() {
+            const urlParams = new URLSearchParams(window.location.search);
+            const projectId = urlParams.get('project');
+            const conversationId = urlParams.get('conversation');
+
+            if (projectId) {
+                this.currentProjectId = parseInt(projectId);
+            }
+
+            if (conversationId) {
+                this.currentConversationId = parseInt(conversationId);
+            }
+        },
+
+        updateUrl(projectId = null, conversationId = null, replaceState = false) {
+            const url = new URL(window.location);
+
+            // Update project parameter
+            if (projectId !== null) {
+                if (projectId) {
+                    url.searchParams.set('project', projectId);
+                } else {
+                    url.searchParams.delete('project');
+                }
+            }
+
+            // Update conversation parameter
+            if (conversationId !== null) {
+                if (conversationId) {
+                    url.searchParams.set('conversation', conversationId);
+                } else {
+                    url.searchParams.delete('conversation');
+                }
+            }
+
+            // Update browser history
+            const state = {
+                projectId: this.currentProjectId,
+                conversationId: this.currentConversationId
+            };
+
+            if (replaceState) {
+                window.history.replaceState(state, '', url.toString());
+            } else {
+                window.history.pushState(state, '', url.toString());
+            }
+        },
+
+        async restoreStateFromUrl(state) {
+            if (state.projectId && state.projectId !== this.currentProjectId) {
+                this.currentProjectId = state.projectId;
+                await this.switchProject();
+            }
+
+            if (state.conversationId && state.conversationId !== this.currentConversationId) {
+                await this.selectConversation(state.conversationId);
+            }
         },
 
         configureMarked() {
@@ -151,6 +225,22 @@ function dashboardApp() {
             const response = await apiRequest(`${BASE_PATH}/api/projects/`);
             if (response && response.ok) {
                 this.projects = await response.json();
+
+                // Check if we have a project ID from URL
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlProjectId = urlParams.get('project');
+
+                if (urlProjectId) {
+                    // Validate that the project exists
+                    const project = this.projects.find(p => p.id === parseInt(urlProjectId));
+                    if (project) {
+                        this.currentProjectId = parseInt(urlProjectId);
+                        await this.switchProject();
+                        return;
+                    }
+                }
+
+                // Fallback: select first project if no valid project from URL
                 if (this.projects.length > 0 && !this.currentProjectId) {
                     this.currentProjectId = this.projects[0].id;
                     await this.switchProject();
@@ -160,6 +250,9 @@ function dashboardApp() {
         
         async switchProject() {
             if (!this.currentProjectId) return;
+
+            // Update URL with new project ID
+            this.updateUrl(this.currentProjectId, null, true);
 
             // Load conversations for this project
             await this.loadConversations();
@@ -184,8 +277,21 @@ function dashboardApp() {
             const response = await apiRequest(url);
             if (response && response.ok) {
                 this.conversations = await response.json();
-                
-                // Select first conversation if available
+
+                // Check if we have a conversation ID from URL
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlConversationId = urlParams.get('conversation');
+
+                if (urlConversationId) {
+                    // Validate that the conversation exists and belongs to current project
+                    const conversation = this.conversations.find(c => c.id === parseInt(urlConversationId));
+                    if (conversation) {
+                        await this.selectConversation(parseInt(urlConversationId));
+                        return;
+                    }
+                }
+
+                // Fallback: select most recent conversation (first in list since they're ordered by updated_at desc)
                 if (this.conversations.length > 0 && !this.currentConversationId) {
                     await this.selectConversation(this.conversations[0].id);
                 }
@@ -210,6 +316,9 @@ function dashboardApp() {
         
         async selectConversation(conversationId) {
             this.currentConversationId = conversationId;
+
+            // Update URL with new conversation ID
+            this.updateUrl(null, conversationId, true);
 
             // Close existing WebSocket
             if (this.ws) {
