@@ -3,51 +3,67 @@
 {% block title %}Register - CodeForge{% endblock %}
 
 {% block body %}
-<div class="min-h-full flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8">
+<div class="min-h-full flex items-center justify-center py-12 px-4 sm:px-6 lg:px-8 bg-gradient-to-br from-gray-900 via-black to-gray-900">
     <div class="max-w-md w-full space-y-8">
-        <div>
-            <h2 class="mt-6 text-center text-3xl font-extrabold text-gray-900 dark:text-white">
-                Create your account
+        <div class="text-center">
+            <div class="flex justify-center mb-4">
+                <div class="w-20 h-20 bg-gradient-to-br from-forge-green-500 to-forge-green-700 rounded-2xl flex items-center justify-center shadow-2xl shadow-forge-green-900/50">
+                    <i class="fas fa-user-plus text-4xl text-white"></i>
+                </div>
+            </div>
+            <h2 class="mt-6 text-center text-4xl font-extrabold">
+                <span class="text-gradient-green">Create your account</span>
             </h2>
+            <p class="mt-2 text-center text-sm text-gray-400 flex items-center justify-center gap-2">
+                <i class="fas fa-rocket text-forge-green-400"></i>
+                Join CodeForge today
+            </p>
         </div>
-        
-        <div class="mt-8 bg-white dark:bg-gray-800 py-8 px-4 shadow sm:rounded-lg sm:px-10">
+
+        <div class="mt-8 bg-gray-900 border border-gray-800 py-8 px-4 shadow-2xl rounded-2xl sm:px-10">
             <form class="space-y-6" id="registerForm">
                 <div>
-                    <label for="username" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                    <label for="username" class="block text-sm font-medium text-gray-300 flex items-center gap-2">
+                        <i class="fas fa-user text-forge-green-400"></i>
                         Username
                     </label>
                     <div class="mt-1">
                         <input id="username" name="username" type="text" required
-                            class="appearance-none block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white sm:text-sm">
+                            class="appearance-none block w-full px-4 py-3 border border-gray-700 rounded-lg shadow-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-forge-green-500 focus:border-forge-green-500 bg-gray-800 text-white sm:text-sm transition-all">
                     </div>
                 </div>
 
                 <div>
-                    <label for="email" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                    <label for="email" class="block text-sm font-medium text-gray-300 flex items-center gap-2">
+                        <i class="fas fa-envelope text-forge-green-400"></i>
                         Email
                     </label>
                     <div class="mt-1">
                         <input id="email" name="email" type="email" required
-                            class="appearance-none block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white sm:text-sm">
+                            class="appearance-none block w-full px-4 py-3 border border-gray-700 rounded-lg shadow-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-forge-green-500 focus:border-forge-green-500 bg-gray-800 text-white sm:text-sm transition-all">
                     </div>
                 </div>
 
                 <div>
-                    <label for="password" class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+                    <label for="password" class="block text-sm font-medium text-gray-300 flex items-center gap-2">
+                        <i class="fas fa-lock text-forge-green-400"></i>
                         Password
                     </label>
                     <div class="mt-1">
                         <input id="password" name="password" type="password" required
-                            class="appearance-none block w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-md shadow-sm placeholder-gray-400 focus:outline-none focus:ring-blue-500 focus:border-blue-500 dark:bg-gray-700 dark:text-white sm:text-sm">
+                            class="appearance-none block w-full px-4 py-3 border border-gray-700 rounded-lg shadow-sm placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-forge-green-500 focus:border-forge-green-500 bg-gray-800 text-white sm:text-sm transition-all">
                     </div>
                 </div>
 
-                <div id="errorMessage" class="hidden text-red-600 dark:text-red-400 text-sm"></div>
+                <div id="errorMessage" class="hidden text-red-400 text-sm bg-red-900/20 border border-red-800 rounded-lg p-3 flex items-center gap-2">
+                    <i class="fas fa-exclamation-circle"></i>
+                    <span></span>
+                </div>
 
                 <div>
                     <button type="submit"
-                        class="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                        class="w-full flex justify-center items-center gap-2 py-3 px-4 border border-transparent rounded-lg shadow-lg text-sm font-medium text-white bg-gradient-to-r from-forge-green-600 to-forge-green-700 hover:from-forge-green-500 hover:to-forge-green-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-forge-green-500 transition-all hover:-translate-y-0.5 shadow-forge-green-900/50">
+                        <i class="fas fa-user-plus"></i>
                         Register
                     </button>
                 </div>
@@ -56,9 +72,9 @@
             <div class="mt-6">
                 <div class="relative">
                     <div class="relative flex justify-center text-sm">
-                        <span class="px-2 text-gray-500 dark:text-gray-400">
+                        <span class="px-2 text-gray-400">
                             Already have an account?
-                            <a href="/code/login" class="font-medium text-blue-600 hover:text-blue-500">
+                            <a href="/code/login" class="font-medium text-forge-green-400 hover:text-forge-green-300 transition-colors">
                                 Sign in
                             </a>
                         </span>
@@ -108,11 +124,11 @@ document.getElementById('registerForm').addEventListener('submit', async (e) => 
             }
         } else {
             const error = await response.json();
-            errorDiv.textContent = error.detail || 'Registration failed';
+            errorDiv.querySelector('span').textContent = error.detail || 'Registration failed';
             errorDiv.classList.remove('hidden');
         }
     } catch (error) {
-        errorDiv.textContent = 'An error occurred. Please try again.';
+        errorDiv.querySelector('span').textContent = 'An error occurred. Please try again.';
         errorDiv.classList.remove('hidden');
     }
 });
