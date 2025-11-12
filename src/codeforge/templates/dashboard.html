@@ -297,7 +297,7 @@
             <div x-show="currentTab === 'files'" class="flex-1 flex overflow-hidden bg-black">
                 <!-- File Tree -->
                 <div x-show="filePickerOpen"
-                    class="w-64 md:block border-r border-gray-800 overflow-y-auto p-2 bg-gray-900"
+                    class="w-full md:w-64 md:block border-r border-gray-800 overflow-y-auto overflow-x-hidden p-2 bg-gray-900 mobile-file-tree"
                     :class="{'hidden': !filePickerOpen}">
                     <!-- Breadcrumb/Navigation -->
                     <div class="mb-2 pb-2 border-b border-gray-800">
