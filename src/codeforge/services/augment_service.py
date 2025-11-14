@@ -38,19 +38,9 @@ class AugmentService:
         Yields:
             Chunks of the response as they arrive (processed through tool call parser)
         """
-        # First, get the complete response
-        full_response = await self.execute_command(prompt)
-
-        # Parse the response to handle tool calls
-        parsed_output = self.tool_call_parser.parse(full_response)
-
-        # Stream the parsed user content
-        words = parsed_output.user_content.split()
-        for i, word in enumerate(words):
-            chunk = word + (" " if i < len(words) - 1 else "")
+        # Stream the response in real-time as it comes from Augment CLI
+        async for chunk in self.stream_response_raw(prompt):
             yield chunk
-            # Small delay to simulate streaming
-            await asyncio.sleep(0.02)
 
     async def stream_response_raw(self, prompt: str) -> AsyncGenerator[str, None]:
         """Stream raw response from Augment CLI without tool call processing.
