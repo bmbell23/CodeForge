@@ -181,7 +181,13 @@ Here's the files and directories up to 2 levels deep in src/codeforge:
    - Conditionally hide sidebar and main content when project selector is shown
    - Made logo clickable to return to dashboard home (works on mobile and desktop)
    - Added Settings tab to desktop tab bar
-   - Removed duplicate Settings link from header
+   - Moved project selector dropdown to sidebar (above "New Conversation" button)
+   - Removed project selector from header
+   - Project selector now visible on both mobile and desktop in sidebar
+
+4. **src/codeforge/templates/settings.html**
+   - Made logo clickable to return to dashboard
+   - Removed "Back to Dashboard" button (logo serves this purpose)
 
 ---
 
