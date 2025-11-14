@@ -173,11 +173,15 @@ Here's the files and directories up to 2 levels deep in src/codeforge:
    - Added `showProjectSelector` state
    - Added `selectProjectFromSelector()` method
    - Modified `selectInitialProject()` to show project selector when no project in URL
+   - Added alphabetical sorting to `loadProjects()` method
 
 3. **src/codeforge/templates/dashboard.html**
    - Added delete button to conversation list items
-   - Added project selector page UI
+   - Added project selector page UI with mobile scrolling support and bottom padding
    - Conditionally hide sidebar and main content when project selector is shown
+   - Made logo clickable to return to dashboard home (works on mobile and desktop)
+   - Added Settings tab to desktop tab bar
+   - Removed duplicate Settings link from header
 
 ---
 
@@ -305,11 +309,11 @@ async selectProjectFromSelector(projectId) {
 
 **File:** `src/codeforge/templates/dashboard.html`
 
-Added project selector UI:
+Added project selector UI with mobile scrolling:
 ```html
 <!-- Project Selector Page (shown when no project is selected) -->
-<div x-show="showProjectSelector" class="flex-1 flex items-center justify-center bg-gray-950 p-8">
-    <div class="max-w-4xl w-full">
+<div x-show="showProjectSelector" class="flex-1 bg-gray-950 overflow-y-auto">
+    <div class="max-w-4xl w-full mx-auto p-4 md:p-8 py-8">
         <div class="text-center mb-8">
             <h2 class="text-3xl font-bold text-white mb-2 flex items-center justify-center gap-3">
                 <i class="fas fa-folder-open text-forge-green-400"></i>
@@ -339,12 +343,22 @@ Added project selector UI:
 </div>
 ```
 
+Made logo clickable to return to dashboard:
+```html
+<a :href="`${BASE_PATH}/dashboard`" class="codeforge-brand text-lg md:text-xl font-bold flex items-center gap-2 hover:opacity-80 transition-opacity cursor-pointer">
+    <i class="fas fa-code"></i>
+    <span class="text-gradient-green">CodeForge</span>
+</a>
+```
+
 ### User Experience
 1. Visit `https://forge-freedom.com/code/dashboard` (no project parameter)
 2. See a beautiful grid of all your projects
-3. Click on a project
-4. Automatically navigate to the most recent conversation for that project
-5. URL updates to include both project and conversation IDs
+3. **Mobile:** Can scroll through the list of projects smoothly
+4. Click on a project
+5. Automatically navigate to the most recent conversation for that project
+6. URL updates to include both project and conversation IDs
+7. **Logo:** Click the CodeForge logo at any time to return to the project selector
 
 ---
 

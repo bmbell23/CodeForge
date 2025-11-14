@@ -447,6 +447,8 @@ function dashboardApp() {
             const response = await apiRequest(`${BASE_PATH}/api/projects/`);
             if (response && response.ok) {
                 this.projects = await response.json();
+                // Sort projects alphabetically by name
+                this.projects.sort((a, b) => a.name.localeCompare(b.name));
                 setCache(CACHE_KEYS.PROJECTS, this.projects);
                 console.log('Projects loaded:', this.projects.length, 'projects');
 
