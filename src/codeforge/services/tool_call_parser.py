@@ -1,7 +1,7 @@
 """Parser for Augment CLI tool calls and output formatting."""
 
 import re
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, AsyncGenerator
 from dataclasses import dataclass
 from enum import Enum
 
@@ -265,5 +265,181 @@ class ToolCallParser:
                 formatted_result = f"📋 **Result:**\n{tool_call.result}"
                 clean_raw_result = self.ANSI_ESCAPE.sub('', tool_call.raw_result)
                 result = result.replace(clean_raw_result, formatted_result)
-        
+
         return result
+
+
+class StreamingToolCallFilter:
+    """Filter tool calls from streaming output in real-time."""
+
+    # Pattern to match ANSI escape codes
+    ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+    # Tool categories with friendly names and icons
+    TOOL_CATEGORIES = {
+        'view': ('🔍', 'Checking files'),
+        'codebase-retrieval': ('🔍', 'Searching codebase'),
+        'git-commit-retrieval': ('🔍', 'Searching git history'),
+        'web-search': ('🔍', 'Searching web'),
+        'web-fetch': ('🔍', 'Fetching page'),
+        'str-replace-editor': ('✏️', 'Editing files'),
+        'save-file': ('✏️', 'Creating file'),
+        'remove-files': ('✏️', 'Removing files'),
+        'launch-process': ('⚙️', 'Running command'),
+        'read-process': ('⚙️', 'Reading output'),
+        'write-process': ('⚙️', 'Writing input'),
+        'kill-process': ('⚙️', 'Stopping process'),
+        'github-api': ('🔗', 'Checking GitHub'),
+        'jira': ('🔗', 'Checking Jira'),
+        'confluence': ('🔗', 'Checking Confluence'),
+        'glean': ('🔗', 'Searching Glean'),
+    }
+
+    def __init__(self, display_mode: ToolCallDisplayMode = ToolCallDisplayMode.MINIMAL):
+        """Initialize the streaming filter.
+
+        Args:
+            display_mode: How to display tool calls to users
+        """
+        self.display_mode = display_mode
+        self.buffer = ""
+        self.in_tool_section = False
+        self.current_tool_name = None
+        self.last_displayed_tool = None  # Track last tool to avoid duplicates
+
+    def _get_tool_display(self, tool_name: str) -> str:
+        """Get friendly display text for a tool.
+
+        Args:
+            tool_name: Name of the tool
+
+        Returns:
+            Formatted display string
+        """
+        if tool_name in self.TOOL_CATEGORIES:
+            icon, description = self.TOOL_CATEGORIES[tool_name]
+            return f"{icon} {description}..."
+        # Default for unknown tools
+        return f"🔧 Using {tool_name}..."
+
+    async def filter_stream(self, chunk_generator: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+        """Filter tool calls from a stream of chunks.
+
+        Args:
+            chunk_generator: Async generator yielding chunks of text
+
+        Yields:
+            Filtered chunks with tool calls processed according to display_mode
+        """
+        async for chunk in chunk_generator:
+            # Add chunk to buffer
+            self.buffer += chunk
+
+            # Process complete lines from buffer
+            while '\n' in self.buffer:
+                line, self.buffer = self.buffer.split('\n', 1)
+
+                # Process the line and yield any output
+                async for output in self._process_line(line + '\n'):
+                    yield output
+
+        # Process any remaining buffer
+        if self.buffer:
+            async for output in self._process_line(self.buffer):
+                yield output
+
+    async def _process_line(self, line: str) -> AsyncGenerator[str, None]:
+        """Process a single line and yield filtered output.
+
+        Args:
+            line: Line to process
+
+        Yields:
+            Filtered output for this line
+        """
+        # Remove ANSI codes for pattern matching
+        clean_line = self.ANSI_ESCAPE.sub('', line)
+        stripped = clean_line.strip()
+
+        # Check for tool call start (with or without emoji)
+        if '🔧 Tool call:' in stripped or stripped.startswith('Tool call:'):
+            self.in_tool_section = True
+            # Extract tool name
+            if ':' in stripped:
+                self.current_tool_name = stripped.split(':', 1)[1].strip()
+
+            if self.display_mode == ToolCallDisplayMode.MINIMAL:
+                # Only show if different from last displayed tool (avoid duplicates)
+                if self.current_tool_name != self.last_displayed_tool:
+                    display_text = self._get_tool_display(self.current_tool_name)
+                    yield f"\n{display_text}\n"
+                    self.last_displayed_tool = self.current_tool_name
+            elif self.display_mode == ToolCallDisplayMode.DETAILED:
+                yield f"\n🔧 **Tool: {self.current_tool_name}**\n"
+            elif self.display_mode == ToolCallDisplayMode.RAW:
+                yield line
+            # HIDE mode: don't yield anything
+            return
+
+        # Check for tool result start (with or without emoji)
+        if '📋 Tool result:' in stripped or stripped.startswith('Tool result:'):
+            self.in_tool_section = True
+            if self.display_mode == ToolCallDisplayMode.RAW:
+                yield line
+            # For other modes, hide the result header
+            return
+
+        # Check for end of tool section (robot emoji)
+        if stripped == '🤖':
+            self.in_tool_section = False
+            self.current_tool_name = None
+            # Don't yield the robot emoji
+            return
+
+        # If we're in a tool section
+        if self.in_tool_section:
+            # Check if this line looks like regular content (not tool output)
+            # Tool output typically has specific patterns, regular content doesn't
+            tool_output_patterns = [
+                'Here\'s the result', 'Successfully edited', 'Result for',
+                'Replacement successful', 'Review the changes', 'Edit the file',
+                'The IDE reports', 'new_str starts', 'Total lines in file:'
+            ]
+
+            is_tool_output = (
+                not stripped or
+                any(stripped.startswith(p) for p in tool_output_patterns) or
+                re.match(r'^\d+$', stripped) or  # Line numbers
+                re.match(r'^\d+\s', stripped) or  # Line numbers with content
+                re.match(r'^L\d', stripped) or  # Linter output like "L44-44:"
+                stripped == '...'
+            )
+
+            # If it looks like regular content, exit tool section
+            if not is_tool_output:
+                tool_markers = ['Tool call:', 'Tool result:']
+                if not any(x in stripped for x in tool_markers):
+                    # Check if this looks like AI response
+                    ai_starts = [
+                        'Perfect!', 'Great!', 'I', 'The', 'This',
+                        'Now', 'Let', 'Here'
+                    ]
+                    if any(stripped.startswith(p) for p in ai_starts):
+                        self.in_tool_section = False
+                        self.current_tool_name = None
+                        # Yield this line as regular content
+                        yield line
+                        return
+
+            # Still in tool section
+            if self.display_mode == ToolCallDisplayMode.RAW:
+                yield line
+            elif self.display_mode == ToolCallDisplayMode.DETAILED:
+                # Show tool output in detailed mode
+                if stripped and not stripped.startswith('//'):
+                    yield f"  {line}"
+            # HIDE and MINIMAL modes: don't yield tool section content
+            return
+
+        # Regular content - always yield
+        yield line

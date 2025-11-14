@@ -66,9 +66,34 @@ async def stream_response(self, prompt: str) -> AsyncGenerator[str, None]:
 
 **Note:** The tool call parser was designed to clean up the output and hide/minimize tool call details. However, it required waiting for the complete response before parsing, which caused the performance issue. If needed, we can implement streaming tool call filtering in the future, but for now, raw output is much better than no output.
 
+## Update: Streaming Tool Call Filter Added
+
+After the initial fix, a **streaming tool call filter** was implemented to clean up the output while maintaining real-time streaming performance.
+
+### New Implementation:
+
+Created `StreamingToolCallFilter` class in `tool_call_parser.py` that:
+- Processes chunks line-by-line as they arrive
+- Detects tool call markers (`🔧 Tool call:`, `📋 Tool result:`, `🤖`)
+- Filters output based on display mode (MINIMAL by default)
+- Maintains real-time streaming - no buffering of complete responses
+
+**Display Modes:**
+- `MINIMAL` (default): Shows `🔧 *Using tool_name...*` instead of verbose tool output
+- `HIDE`: Completely hides tool calls and results
+- `DETAILED`: Shows formatted tool calls with parameters
+- `RAW`: Shows everything unfiltered
+
+### Result:
+✅ Real-time streaming maintained
+✅ Clean, user-friendly output
+✅ Tool call noise removed
+✅ No performance impact
+
 ## Files Changed
 
-- `src/codeforge/services/augment_service.py` - Modified `stream_response()` method
+- `src/codeforge/services/augment_service.py` - Modified `stream_response()` method to use streaming filter
+- `src/codeforge/services/tool_call_parser.py` - Added `StreamingToolCallFilter` class
 
 ## Deployment
 
@@ -87,10 +112,17 @@ To verify the fix:
 3. You should now see the response streaming in real-time as Augment generates it
 4. No more long waits with no feedback
 
-## Future Improvements
+## Configuration
 
-If we want to add back tool call filtering while maintaining streaming performance:
-1. Implement a streaming parser that filters tool calls on-the-fly
-2. Use regex patterns to detect and filter tool call markers as chunks arrive
-3. Buffer only the minimal amount needed to detect tool call boundaries
+To change the display mode, modify the `tool_call_mode` parameter when initializing `AugmentService`:
+
+```python
+# In src/codeforge/routes/chat.py
+augment_service = AugmentService(
+    project_path=project_path,
+    tool_call_mode=ToolCallDisplayMode.MINIMAL  # or HIDE, DETAILED, RAW
+)
+```
+
+Default is `MINIMAL` which provides the best balance of clean output and useful information.
 

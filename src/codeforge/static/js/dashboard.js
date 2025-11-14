@@ -83,6 +83,7 @@ function dashboardApp() {
         currentTab: 'chat',
         sidebarOpen: false,
         filePickerOpen: true, // File picker visibility on mobile
+        showProjectSelector: false, // Show project selection page when no project is selected
 
         // Files
         fileTree: [],
@@ -240,11 +241,105 @@ function dashboardApp() {
                       .replace(/\[\d+m/g, '');
         },
 
+        autoFormatFilePaths(content) {
+            // Auto-wrap file paths in backticks for monospace rendering
+            // Match common file path patterns (but not if already in backticks or code blocks)
+
+            // Don't process if already in code block
+            if (content.includes('```')) {
+                return content;
+            }
+
+            // Pattern 1: Absolute paths (with or without extensions)
+            // Matches: /home/brandon/projects, /home/user/file.txt, /var/log/app.log
+            content = content.replace(/(?<!`)(\b\/[a-zA-Z0-9_\-\/\.]+(?:\.[a-zA-Z0-9]{1,6})?\b)(?!`)/g, '`$1`');
+
+            // Pattern 2: Relative paths with ./ prefix (with or without extensions)
+            // Matches: ./README.md, ./src/file.js, ./config
+            content = content.replace(/(?<!`)(\b\.\/[a-zA-Z0-9_\-\/\.]+(?:\.[a-zA-Z0-9]{1,6})?\b)(?!`)/g, '`$1`');
+
+            // Pattern 3: Common project paths (src/, config/, etc.)
+            // Matches: src/components/App.js, config/settings.json
+            content = content.replace(/(?<!`)(\b(?:src|config|lib|dist|build)\/[a-zA-Z0-9_\-\/\.]+(?:\.[a-zA-Z0-9]{1,6})?\b)(?!`)/g, '`$1`');
+
+            // Pattern 4: Common uppercase files with extensions (README.md, DEPLOYMENT.md, etc.)
+            // Matches: README.md, CAPABILITIES.md, PROJECT_SUMMARY.md
+            content = content.replace(/(?<!`)(\b[A-Z][A-Z0-9_\-]*\.[a-zA-Z0-9]{1,6}\b)(?!`)/g, '`$1`');
+
+            return content;
+        },
+
+        autoFormatCodeSnippets(content) {
+            // Auto-wrap code snippets (numbered lines with code) in code blocks
+            const lines = content.split('\n');
+            let inCodeBlock = false;
+            let codeBlockStart = -1;
+            let result = [];
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const trimmed = line.trim();
+
+                // Check if line starts with a number (line number from tool output)
+                const isNumberedLine = /^\d+\s/.test(trimmed);
+
+                // Check if this looks like code output header
+                const isCodeHeader = trimmed.startsWith('Path:') ||
+                                   trimmed.includes('"""') ||
+                                   trimmed.startsWith('The following code sections were retrieved:');
+
+                if (isNumberedLine && !inCodeBlock) {
+                    // Start of code block
+                    inCodeBlock = true;
+                    codeBlockStart = i;
+                    result.push('```python');
+                    result.push(line);
+                } else if (inCodeBlock && !isNumberedLine && trimmed !== '' && !trimmed.startsWith('...')) {
+                    // End of code block
+                    result.push('```');
+                    result.push(line);
+                    inCodeBlock = false;
+                } else if (inCodeBlock && trimmed === '') {
+                    // Empty line in code block - might be end
+                    // Look ahead to see if more numbered lines follow
+                    let hasMoreCode = false;
+                    for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+                        if (/^\d+\s/.test(lines[j].trim())) {
+                            hasMoreCode = true;
+                            break;
+                        }
+                    }
+                    if (hasMoreCode) {
+                        result.push(line);
+                    } else {
+                        result.push('```');
+                        result.push(line);
+                        inCodeBlock = false;
+                    }
+                } else {
+                    result.push(line);
+                }
+            }
+
+            // Close any open code block
+            if (inCodeBlock) {
+                result.push('```');
+            }
+
+            return result.join('\n');
+        },
+
         renderMarkdown(content) {
             if (!content) return '';
 
             // Strip ANSI codes first
             content = this.stripAnsiCodes(content);
+
+            // Auto-format code snippets (numbered lines)
+            content = this.autoFormatCodeSnippets(content);
+
+            // Auto-format file paths
+            content = this.autoFormatFilePaths(content);
 
             if (typeof marked === 'undefined') {
                 // Fallback if marked.js isn't loaded
@@ -369,14 +464,41 @@ function dashboardApp() {
                 const project = this.projects.find(p => p.id === parseInt(urlProjectId));
                 if (project) {
                     this.currentProjectId = parseInt(urlProjectId);
+                    this.showProjectSelector = false;
                     await this.switchProject();
                     return;
                 }
             }
 
+            // No project specified in URL - show project selector
+            if (!urlProjectId && this.projects.length > 0) {
+                this.showProjectSelector = true;
+                return;
+            }
+
             // Fallback: select first project if no valid project from URL
             if (this.projects.length > 0 && !this.currentProjectId) {
                 this.currentProjectId = this.projects[0].id;
+                this.showProjectSelector = false;
+                await this.switchProject();
+            }
+        },
+
+        async selectProjectFromSelector(projectId) {
+            this.currentProjectId = projectId;
+            this.showProjectSelector = false;
+
+            // Load conversations to find the most recent one
+            await this.loadConversations();
+
+            // Select the most recent conversation (first in the list since they're sorted by updated_at desc)
+            if (this.conversations.length > 0) {
+                const mostRecentConversation = this.conversations[0];
+                this.updateUrl(projectId, mostRecentConversation.id, true);
+                await this.selectConversation(mostRecentConversation.id);
+            } else {
+                // No conversations, just switch to the project
+                this.updateUrl(projectId, null, true);
                 await this.switchProject();
             }
         },
@@ -542,12 +664,37 @@ function dashboardApp() {
             this.editingConversationId = null;
             this.editingConversationTitle = '';
         },
+
+        async deleteConversation(conversationId) {
+            if (!confirm('Are you sure you want to delete this conversation? This cannot be undone.')) {
+                return;
+            }
+
+            const response = await apiRequest(`${BASE_PATH}/api/chat/conversations/${conversationId}`, {
+                method: 'DELETE'
+            });
+
+            if (response && response.ok) {
+                // Remove from conversations list
+                this.conversations = this.conversations.filter(c => c.id !== conversationId);
+
+                // If we deleted the current conversation, select another one
+                if (this.currentConversationId === conversationId) {
+                    if (this.conversations.length > 0) {
+                        await this.selectConversation(this.conversations[0].id);
+                    } else {
+                        // No conversations left, create a new one
+                        await this.createDefaultConversation();
+                    }
+                }
+            }
+        },
         
         async loadMessages() {
             const response = await apiRequest(`${BASE_PATH}/api/chat/conversations/${this.currentConversationId}/messages`);
             if (response && response.ok) {
                 this.messages = await response.json();
-                this.$nextTick(() => this.scrollToBottom());
+                this.$nextTick(() => this.scrollToBottom(true)); // Force scroll when loading messages
             }
         },
 
@@ -559,19 +706,19 @@ function dashboardApp() {
             
             this.ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
-                
+
                 if (data.type === 'user_message') {
                     this.messages.push(data.message);
-                    this.$nextTick(() => this.scrollToBottom());
+                    this.$nextTick(() => this.scrollToBottom(true)); // Force scroll for new user message
                 } else if (data.type === 'assistant_chunk') {
                     this.isStreaming = true;
                     this.streamingContent += data.chunk;
-                    this.$nextTick(() => this.scrollToBottom());
+                    this.$nextTick(() => this.scrollToBottom()); // Auto-scroll only if near bottom
                 } else if (data.type === 'assistant_complete') {
                     this.isStreaming = false;
                     this.messages.push(data.message);
                     this.streamingContent = '';
-                    this.$nextTick(() => this.scrollToBottom());
+                    this.$nextTick(() => this.scrollToBottom()); // Auto-scroll only if near bottom
                 } else if (data.error) {
                     console.error('WebSocket error:', data.error);
                     alert('Error: ' + data.error);
@@ -627,9 +774,15 @@ function dashboardApp() {
             this.attachedImages.splice(index, 1);
         },
         
-        scrollToBottom() {
+        scrollToBottom(force = false) {
             const container = document.getElementById('messagesContainer');
-            if (container) {
+            if (!container) return;
+
+            // Only auto-scroll if user is already near the bottom (within 100px)
+            // or if force is true (e.g., when loading messages or sending a new message)
+            const isNearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
+
+            if (force || isNearBottom) {
                 container.scrollTop = container.scrollHeight;
             }
         },

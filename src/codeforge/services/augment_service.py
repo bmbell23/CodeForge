@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import AsyncGenerator, Optional
 
 from ..config import settings
-from .tool_call_parser import ToolCallParser, ToolCallDisplayMode
+from .tool_call_parser import ToolCallParser, ToolCallDisplayMode, StreamingToolCallFilter
 
 
 class AugmentService:
@@ -36,10 +36,13 @@ class AugmentService:
             prompt: The user's prompt/message
 
         Yields:
-            Chunks of the response as they arrive (processed through tool call parser)
+            Chunks of the response as they arrive (filtered for tool calls)
         """
-        # Stream the response in real-time as it comes from Augment CLI
-        async for chunk in self.stream_response_raw(prompt):
+        # Create a streaming filter to process tool calls in real-time
+        stream_filter = StreamingToolCallFilter(display_mode=self.tool_call_parser.display_mode)
+
+        # Stream the response through the filter
+        async for chunk in stream_filter.filter_stream(self.stream_response_raw(prompt)):
             yield chunk
 
     async def stream_response_raw(self, prompt: str) -> AsyncGenerator[str, None]:
