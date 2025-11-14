@@ -1,6 +1,57 @@
 // Base path for API calls (empty for development, '/code' for production)
 const BASE_PATH = window.location.pathname.startsWith('/code/') ? '/code' : '';
 
+// Cache helper functions
+const CACHE_KEYS = {
+    USER: 'codeforge_user',
+    PROJECTS: 'codeforge_projects',
+    LAST_PROJECT: 'codeforge_last_project',
+    LAST_CONVERSATION: 'codeforge_last_conversation'
+};
+
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+function getCached(key) {
+    try {
+        const cached = localStorage.getItem(key);
+        if (!cached) return null;
+
+        const { data, timestamp } = JSON.parse(cached);
+        if (Date.now() - timestamp > CACHE_DURATION) {
+            localStorage.removeItem(key);
+            return null;
+        }
+        return data;
+    } catch (e) {
+        console.error('Cache read error:', e);
+        return null;
+    }
+}
+
+function setCache(key, data) {
+    try {
+        localStorage.setItem(key, JSON.stringify({
+            data,
+            timestamp: Date.now()
+        }));
+    } catch (e) {
+        console.error('Cache write error:', e);
+    }
+}
+
+function clearCache(key) {
+    try {
+        if (key) {
+            localStorage.removeItem(key);
+        } else {
+            // Clear all CodeForge caches
+            Object.values(CACHE_KEYS).forEach(k => localStorage.removeItem(k));
+        }
+    } catch (e) {
+        console.error('Cache clear error:', e);
+    }
+}
+
 function dashboardApp() {
     return {
         // User data
@@ -62,8 +113,11 @@ function dashboardApp() {
         passwordSuccess: '',
 
         async init() {
+            // Show loading state
+            console.log('Initializing CodeForge...');
+
             await this.loadUser();
-            await this.loadProjects();
+            await this.autoLoadAllProjects(); // Auto-scan and load all projects
             this.configureMarked();
             this.initMobileHandlers();
             this.initUrlStateManagement();
@@ -83,6 +137,8 @@ function dashboardApp() {
                     this.loadFileTree();
                 }
             });
+
+            console.log('CodeForge initialized successfully');
         },
 
         initUrlStateManagement() {
@@ -216,43 +272,119 @@ function dashboardApp() {
         },
         
         async loadUser() {
+            // Try cache first
+            const cached = getCached(CACHE_KEYS.USER);
+            if (cached) {
+                this.username = cached.username;
+                console.log('Loaded user from cache:', this.username);
+                // Still fetch in background to update cache
+                this.loadUserFromAPI();
+                return;
+            }
+
+            await this.loadUserFromAPI();
+        },
+
+        async loadUserFromAPI() {
             const response = await apiRequest(`${BASE_PATH}/api/auth/me`);
             if (response && response.ok) {
                 const user = await response.json();
                 this.username = user.username;
+                setCache(CACHE_KEYS.USER, user);
             }
+        },
+
+        async autoLoadAllProjects() {
+            console.log('Auto-loading all projects...');
+
+            // Try cache first for faster initial load
+            const cached = getCached(CACHE_KEYS.PROJECTS);
+            if (cached) {
+                this.projects = cached;
+                console.log('Loaded projects from cache:', this.projects.length);
+
+                // Select project from URL or last project
+                await this.selectInitialProject();
+
+                // Still scan and update in background
+                this.scanAndUpdateProjects();
+                return;
+            }
+
+            // No cache, do full scan
+            await this.scanAndUpdateProjects();
+        },
+
+        async scanAndUpdateProjects() {
+            // First, scan for all projects in the directory
+            const scanResponse = await apiRequest(`${BASE_PATH}/api/projects/scan`);
+            if (!scanResponse || !scanResponse.ok) {
+                console.error('Failed to scan projects');
+                return;
+            }
+
+            const scannedProjects = await scanResponse.json();
+            console.log('Scanned projects:', scannedProjects.length);
+
+            // Auto-add any projects that don't exist in DB yet
+            for (const project of scannedProjects) {
+                if (!project.exists_in_db) {
+                    console.log('Auto-adding project:', project.name);
+                    const addResponse = await apiRequest(`${BASE_PATH}/api/projects/`, {
+                        method: 'POST',
+                        body: {
+                            name: project.name,
+                            path: project.path,
+                            description: ''
+                        }
+                    });
+                    if (!addResponse || !addResponse.ok) {
+                        console.error('Failed to add project:', project.name);
+                    }
+                }
+            }
+
+            // Now load all projects from DB
+            await this.loadProjects();
         },
 
         async loadProjects() {
             const response = await apiRequest(`${BASE_PATH}/api/projects/`);
             if (response && response.ok) {
                 this.projects = await response.json();
+                setCache(CACHE_KEYS.PROJECTS, this.projects);
                 console.log('Projects loaded:', this.projects.length, 'projects');
 
-                // Check if we have a project ID from URL
-                const urlParams = new URLSearchParams(window.location.search);
-                const urlProjectId = urlParams.get('project');
+                await this.selectInitialProject();
+            }
+        },
 
-                if (urlProjectId) {
-                    // Validate that the project exists
-                    const project = this.projects.find(p => p.id === parseInt(urlProjectId));
-                    if (project) {
-                        this.currentProjectId = parseInt(urlProjectId);
-                        await this.switchProject();
-                        return;
-                    }
-                }
+        async selectInitialProject() {
+            // Check if we have a project ID from URL
+            const urlParams = new URLSearchParams(window.location.search);
+            const urlProjectId = urlParams.get('project');
 
-                // Fallback: select first project if no valid project from URL
-                if (this.projects.length > 0 && !this.currentProjectId) {
-                    this.currentProjectId = this.projects[0].id;
+            if (urlProjectId) {
+                // Validate that the project exists
+                const project = this.projects.find(p => p.id === parseInt(urlProjectId));
+                if (project) {
+                    this.currentProjectId = parseInt(urlProjectId);
                     await this.switchProject();
+                    return;
                 }
+            }
+
+            // Fallback: select first project if no valid project from URL
+            if (this.projects.length > 0 && !this.currentProjectId) {
+                this.currentProjectId = this.projects[0].id;
+                await this.switchProject();
             }
         },
         
         async switchProject() {
             if (!this.currentProjectId) return;
+
+            console.log('Switching to project:', this.currentProjectId);
 
             // Update URL with new project ID
             this.updateUrl(this.currentProjectId, null, true);
@@ -260,16 +392,25 @@ function dashboardApp() {
             // Load conversations for this project
             await this.loadConversations();
 
-            // Load file tree
-            await this.loadFileTree();
+            // If no conversations exist, create a default one
+            if (this.conversations.length === 0) {
+                console.log('No conversations found, creating default conversation');
+                await this.createDefaultConversation();
+            }
 
-            // Load git status
-            await this.loadGitStatus();
+            // Load file tree, git status in parallel for speed
+            await Promise.all([
+                this.loadFileTree(),
+                this.loadGitStatus()
+            ]);
 
             // If terminal tab is active, switch to the terminal for this project
             if (this.currentTab === 'terminal') {
                 this.initTerminal();
             }
+
+            // Switch to chat tab
+            this.currentTab = 'chat';
         },
         
         async loadConversations() {
@@ -280,6 +421,7 @@ function dashboardApp() {
             const response = await apiRequest(url);
             if (response && response.ok) {
                 this.conversations = await response.json();
+                console.log('Loaded conversations:', this.conversations.length);
 
                 // Check if we have a conversation ID from URL
                 const urlParams = new URLSearchParams(window.location.search);
@@ -296,8 +438,29 @@ function dashboardApp() {
 
                 // Fallback: select most recent conversation (first in list since they're ordered by updated_at desc)
                 if (this.conversations.length > 0 && !this.currentConversationId) {
+                    console.log('Auto-selecting first conversation');
                     await this.selectConversation(this.conversations[0].id);
                 }
+            }
+        },
+
+        async createDefaultConversation() {
+            console.log('Creating default conversation for project:', this.currentProjectId);
+            const response = await apiRequest(`${BASE_PATH}/api/chat/conversations`, {
+                method: 'POST',
+                body: {
+                    title: 'New Chat',
+                    project_id: this.currentProjectId
+                }
+            });
+
+            if (response && response.ok) {
+                const newConversation = await response.json();
+                this.conversations.push(newConversation);
+                console.log('Created default conversation:', newConversation.id);
+
+                // Auto-select the new conversation
+                await this.selectConversation(newConversation.id);
             }
         },
         
@@ -893,6 +1056,7 @@ function dashboardApp() {
 
         logout() {
             localStorage.removeItem('token');
+            clearCache(); // Clear all caches on logout
             window.location.href = '/login';
         },
 

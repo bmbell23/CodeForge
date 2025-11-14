@@ -37,12 +37,6 @@
                     <option :value="project.id" x-text="project.name"></option>
                 </template>
             </select>
-
-            <button @click="scanProjects()"
-                class="hidden md:flex items-center gap-2 bg-gradient-to-r from-forge-green-600 to-forge-green-700 hover:from-forge-green-500 hover:to-forge-green-600 px-4 py-2 rounded-lg text-sm font-medium shadow-lg shadow-forge-green-900/50 transition-all hover:shadow-forge-green-900/70 hover:-translate-y-0.5">
-                <i class="fas fa-plus"></i>
-                <span>Add Project</span>
-            </button>
         </div>
 
         <div class="flex items-center space-x-2 md:space-x-4">
@@ -97,11 +91,6 @@
                                 <option :value="project.id" x-text="project.name"></option>
                             </template>
                         </select>
-                        <button @click="scanProjects(); sidebarOpen = false"
-                            class="w-full bg-gradient-to-r from-forge-green-600 to-forge-green-700 hover:from-forge-green-500 hover:to-forge-green-600 text-white px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2">
-                            <i class="fas fa-plus"></i>
-                            <span>Add Project</span>
-                        </button>
                         <button @click="logout()"
                             class="w-full bg-red-600 hover:bg-red-700 text-white px-3 py-2 rounded-lg text-sm font-medium transition-all flex items-center justify-center gap-2">
                             <i class="fas fa-sign-out-alt"></i>
@@ -583,12 +572,6 @@
                                     </div>
                                 </template>
                             </div>
-
-                            <button @click="scanProjects()"
-                                class="w-full bg-gradient-to-r from-forge-green-600 to-forge-green-700 hover:from-forge-green-500 hover:to-forge-green-600 text-white px-4 py-2 rounded-lg font-medium transition-all flex items-center justify-center gap-2">
-                                <i class="fas fa-plus"></i>
-                                Add New Project
-                            </button>
                         </div>
                     </div>
 
@@ -611,44 +594,6 @@
         </div>
     </div>
 
-    <!-- Project Scan Modal -->
-    <div x-show="showProjectScan" class="fixed inset-0 bg-black bg-opacity-70 flex items-center justify-center z-50 backdrop-blur-sm">
-        <div class="bg-gray-900 border border-gray-800 rounded-xl p-6 max-w-2xl w-full max-h-96 overflow-y-auto shadow-2xl">
-            <h2 class="text-xl font-bold mb-4 text-white flex items-center gap-2">
-                <i class="fas fa-folder-plus text-forge-green-400"></i>
-                Add Project
-            </h2>
-            <div class="space-y-2">
-                <template x-for="project in scannedProjects" :key="project.path">
-                    <div class="flex items-center justify-between p-3 border border-gray-800 rounded-lg bg-gray-800/50 hover:bg-gray-800 transition-all">
-                        <div>
-                            <div class="font-medium text-white flex items-center gap-2">
-                                <i class="fas fa-folder text-forge-green-400 text-sm"></i>
-                                <span x-text="project.name"></span>
-                            </div>
-                            <div class="text-sm text-gray-400 ml-6" x-text="project.path"></div>
-                        </div>
-                        <button x-show="!project.exists_in_db" @click="addProject(project)"
-                            class="bg-gradient-to-r from-forge-green-600 to-forge-green-700 hover:from-forge-green-500 hover:to-forge-green-600 text-white px-4 py-2 rounded-lg text-sm font-medium transition-all shadow-lg">
-                            <i class="fas fa-plus mr-1"></i>
-                            Add
-                        </button>
-                        <span x-show="project.exists_in_db" class="text-forge-green-400 text-sm font-medium flex items-center gap-1">
-                            <i class="fas fa-check-circle"></i>
-                            Added
-                        </span>
-                    </div>
-                </template>
-            </div>
-            <div class="mt-4 flex justify-end">
-                <button @click="showProjectScan = false"
-                    class="bg-gray-800 hover:bg-gray-700 text-white px-4 py-2 rounded-lg border border-gray-700 transition-all">
-                    <i class="fas fa-times mr-2"></i>
-                    Close
-                </button>
-            </div>
-        </div>
-    </div>
 
     <!-- Mobile Bottom Tab Bar -->
     <div class="md:hidden mobile-tab-bar">
