@@ -12,6 +12,8 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css" />
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
+<!-- Load dashboard.js synchronously BEFORE Alpine.js initializes -->
+<script src="/static/js/dashboard.js?v={{ range(1, 999999999) | random }}"></script>
 {% endblock %}
 
 {% block body %}
@@ -672,21 +674,6 @@
     </div>
 </div>
 
-<!-- Load dashboard.js after main.js is loaded - BASE_PATH is defined in base.html -->
-<script>
-    // Wait for main.js to load before loading dashboard.js
-    function loadDashboard() {
-        if (typeof apiRequest === 'undefined') {
-            // main.js not loaded yet, wait a bit
-            setTimeout(loadDashboard, 50);
-            return;
-        }
-        // main.js is loaded, now load dashboard.js
-        const dashboardScript = document.createElement('script');
-        dashboardScript.src = BASE_PATH + '/static/js/dashboard.js?v={{ range(1, 999999999) | random }}';
-        document.head.appendChild(dashboardScript);
-    }
-    loadDashboard();
-</script>
+<!-- dashboard.js is now loaded in extra_head block -->
 {% endblock %}
 
