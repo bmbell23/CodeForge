@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .database import engine, Base
 from .routes import auth, chat, projects, files, git, pages, terminal
+from . import __version__
 
 # Create database tables
 Base.metadata.create_all(bind=engine)
@@ -16,7 +17,7 @@ Base.metadata.create_all(bind=engine)
 app = FastAPI(
     title="CodeForge",
     description="Web-based IDE centered around Augment CLI",
-    version="0.1.4",
+    version=__version__,
 )
 
 # Get the package directory
@@ -48,5 +49,5 @@ app.include_router(pages.router, tags=["pages"])
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
-    return {"status": "healthy", "version": "0.1.4"}
+    return {"status": "healthy", "version": __version__}
 
