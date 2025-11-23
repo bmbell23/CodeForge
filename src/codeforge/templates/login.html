@@ -75,15 +75,19 @@
 </div>
 
 <script>
-// Detect if we're running under /code/ prefix
-const BASE_PATH = window.location.pathname.startsWith('/code/') ? '/code' : '';
+// BASE_PATH is already defined in base.html
+console.log('Login BASE_PATH detected:', BASE_PATH);
 
 document.getElementById('loginForm').addEventListener('submit', async (e) => {
     e.preventDefault();
+    console.log('Login form submitted');
 
     const username = document.getElementById('username').value;
     const password = document.getElementById('password').value;
     const errorDiv = document.getElementById('errorMessage');
+
+    console.log('Attempting login for user:', username);
+    console.log('API endpoint:', `${BASE_PATH}/api/auth/login`);
 
     try {
         const formData = new FormData();
@@ -95,16 +99,21 @@ document.getElementById('loginForm').addEventListener('submit', async (e) => {
             body: formData
         });
 
+        console.log('Login response status:', response.status);
+
         if (response.ok) {
             const data = await response.json();
+            console.log('Login successful, token received');
             localStorage.setItem('token', data.access_token);
             window.location.href = `${BASE_PATH}/dashboard`;
         } else {
             const error = await response.json();
+            console.error('Login failed:', error);
             errorDiv.querySelector('span').textContent = error.detail || 'Login failed';
             errorDiv.classList.remove('hidden');
         }
     } catch (error) {
+        console.error('Login error:', error);
         errorDiv.querySelector('span').textContent = 'An error occurred. Please try again.';
         errorDiv.classList.remove('hidden');
     }

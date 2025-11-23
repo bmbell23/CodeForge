@@ -24,7 +24,7 @@
                 <i class="fas fa-bars text-xl"></i>
             </button>
 
-            <a href="/code/dashboard" class="codeforge-brand text-lg md:text-xl font-bold flex items-center gap-2 hover:opacity-80 transition-opacity cursor-pointer">
+            <a href="/dashboard" class="codeforge-brand text-lg md:text-xl font-bold flex items-center gap-2 hover:opacity-80 transition-opacity cursor-pointer">
                 <i class="fas fa-code"></i>
                 <span class="text-gradient-green">CodeForge</span>
             </a>
@@ -40,7 +40,7 @@
             </button>
         </div>
     </nav>
-    
+
     <!-- Main Content Area -->
     <div class="flex-1 flex overflow-hidden relative">
         <!-- Project Selector Page (shown when no project is selected) -->
@@ -177,7 +177,7 @@
                 </template>
             </div>
         </div>
-        
+
         <!-- Center - Chat Area -->
         <div x-show="!showProjectSelector" class="flex-1 flex flex-col mobile-main-content">
             <!-- Mobile Tab Header -->
@@ -238,7 +238,7 @@
                     <i class="fas fa-cog mr-2"></i>Settings
                 </button>
             </div>
-            
+
             <!-- Chat Tab -->
             <div x-show="currentTab === 'chat'" class="flex-1 flex flex-col overflow-hidden bg-black">
                 <!-- Messages Area -->
@@ -323,7 +323,7 @@
                     </form>
                 </div>
             </div>
-            
+
             <!-- Files Tab -->
             <div x-show="currentTab === 'files'" class="flex-1 flex overflow-hidden bg-black">
                 <!-- File Tree -->
@@ -672,6 +672,21 @@
     </div>
 </div>
 
-<script src="/code/static/js/dashboard.js?v=6"></script>
+<!-- Load dashboard.js after main.js is loaded - BASE_PATH is defined in base.html -->
+<script>
+    // Wait for main.js to load before loading dashboard.js
+    function loadDashboard() {
+        if (typeof apiRequest === 'undefined') {
+            // main.js not loaded yet, wait a bit
+            setTimeout(loadDashboard, 50);
+            return;
+        }
+        // main.js is loaded, now load dashboard.js
+        const dashboardScript = document.createElement('script');
+        dashboardScript.src = BASE_PATH + '/static/js/dashboard.js?v={{ range(1, 999999999) | random }}';
+        document.head.appendChild(dashboardScript);
+    }
+    loadDashboard();
+</script>
 {% endblock %}
 

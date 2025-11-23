@@ -1,5 +1,4 @@
-// Base path for API calls (empty for development, '/code' for production)
-const BASE_PATH = window.location.pathname.startsWith('/code/') ? '/code' : '';
+// BASE_PATH is already defined in base.html, so we don't redeclare it here
 
 // Cache helper functions
 const CACHE_KEYS = {
@@ -64,21 +63,21 @@ function dashboardApp() {
         showProjectScan: false,
         renamingProjectId: null,
         renamingProjectName: '',
-        
+
         // Conversations
         conversations: [],
         currentConversationId: null,
         messages: [],
         editingConversationId: null,
         editingConversationTitle: '',
-        
+
         // Chat
         messageInput: '',
         isStreaming: false,
         streamingContent: '',
         ws: null,
         attachedImages: [],
-        
+
         // UI
         currentTab: 'chat',
         sidebarOpen: false,
@@ -91,7 +90,7 @@ function dashboardApp() {
         fileContent: '',
         currentPath: '', // Track current directory path
         loadingFileTree: false,
-        
+
         // Git
         gitStatus: null,
         gitLog: [],
@@ -365,7 +364,7 @@ function dashboardApp() {
                 return content.replace(/\n/g, '<br>');
             }
         },
-        
+
         async loadUser() {
             // Try cache first
             const cached = getCached(CACHE_KEYS.USER);
@@ -504,7 +503,7 @@ function dashboardApp() {
                 await this.switchProject();
             }
         },
-        
+
         async switchProject() {
             if (!this.currentProjectId) return;
 
@@ -536,7 +535,7 @@ function dashboardApp() {
             // Switch to chat tab
             this.currentTab = 'chat';
         },
-        
+
         async loadConversations() {
             const url = this.currentProjectId
                 ? `${BASE_PATH}/api/chat/conversations?project_id=${this.currentProjectId}`
@@ -587,7 +586,7 @@ function dashboardApp() {
                 await this.selectConversation(newConversation.id);
             }
         },
-        
+
         async createConversation() {
             const response = await apiRequest(`${BASE_PATH}/api/chat/conversations`, {
                 method: 'POST',
@@ -596,14 +595,14 @@ function dashboardApp() {
                     project_id: this.currentProjectId || null
                 }
             });
-            
+
             if (response && response.ok) {
                 const conversation = await response.json();
                 this.conversations.unshift(conversation);
                 await this.selectConversation(conversation.id);
             }
         },
-        
+
         async selectConversation(conversationId) {
             this.currentConversationId = conversationId;
 
@@ -691,7 +690,7 @@ function dashboardApp() {
                 }
             }
         },
-        
+
         async loadMessages() {
             const response = await apiRequest(`${BASE_PATH}/api/chat/conversations/${this.currentConversationId}/messages`);
             if (response && response.ok) {
@@ -701,11 +700,21 @@ function dashboardApp() {
         },
 
         connectWebSocket() {
+            if (!this.currentConversationId) {
+                console.warn('Cannot connect WebSocket: no conversation selected');
+                return;
+            }
+
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}${BASE_PATH}/api/chat/ws/${this.currentConversationId}`;
 
+            console.log('Connecting WebSocket to:', wsUrl);
             this.ws = new WebSocket(wsUrl);
-            
+
+            this.ws.onopen = () => {
+                console.log('WebSocket connected successfully');
+            };
+
             this.ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
 
@@ -726,16 +735,16 @@ function dashboardApp() {
                     alert('Error: ' + data.error);
                 }
             };
-            
+
             this.ws.onerror = (error) => {
                 console.error('WebSocket error:', error);
             };
-            
-            this.ws.onclose = () => {
-                console.log('WebSocket closed');
+
+            this.ws.onclose = (event) => {
+                console.log('WebSocket closed', event.code, event.reason);
             };
         },
-        
+
         sendMessage() {
             if ((!this.messageInput.trim() && this.attachedImages.length === 0) || !this.ws || this.isStreaming) return;
 
@@ -775,7 +784,7 @@ function dashboardApp() {
         removeImage(index) {
             this.attachedImages.splice(index, 1);
         },
-        
+
         scrollToBottom(force = false) {
             const container = document.getElementById('messagesContainer');
             if (!container) return;
@@ -788,7 +797,7 @@ function dashboardApp() {
                 container.scrollTop = container.scrollHeight;
             }
         },
-        
+
         async scanProjects() {
             const response = await apiRequest(`${BASE_PATH}/api/projects/scan`);
             if (response && response.ok) {
@@ -865,7 +874,7 @@ function dashboardApp() {
                 return false;
             }
         },
-        
+
         async loadFileTree(path = '') {
             if (!this.currentProjectId) {
                 console.warn('No current project selected');
@@ -948,12 +957,12 @@ function dashboardApp() {
                     content: this.fileContent
                 }
             });
-            
+
             if (response && response.ok) {
                 alert('File saved successfully!');
             }
         },
-        
+
         async loadGitStatus() {
             if (!this.currentProjectId) return;
 
@@ -1212,7 +1221,7 @@ function dashboardApp() {
         logout() {
             localStorage.removeItem('token');
             clearCache(); // Clear all caches on logout
-            window.location.href = '/login';
+            window.location.href = BASE_PATH + '/login';
         },
 
         initMobileHandlers() {

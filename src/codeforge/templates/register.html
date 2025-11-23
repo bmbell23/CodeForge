@@ -86,8 +86,7 @@
 </div>
 
 <script>
-// Detect if we're running under /code/ prefix
-const BASE_PATH = window.location.pathname.startsWith('/code/') ? '/code' : '';
+// BASE_PATH is already defined in base.html
 
 document.getElementById('registerForm').addEventListener('submit', async (e) => {
     e.preventDefault();

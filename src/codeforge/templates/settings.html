@@ -100,8 +100,7 @@
 </div>
 
 <script>
-// Detect if we're running under /code/ prefix
-const BASE_PATH = window.location.pathname.startsWith('/code/') ? '/code' : '';
+// BASE_PATH is already defined in base.html
 
 function logout() {
     localStorage.removeItem('token');
@@ -110,17 +109,17 @@ function logout() {
 
 document.getElementById('changePasswordForm').addEventListener('submit', async (e) => {
     e.preventDefault();
-    
+
     const currentPassword = document.getElementById('currentPassword').value;
     const newPassword = document.getElementById('newPassword').value;
     const confirmPassword = document.getElementById('confirmPassword').value;
     const errorDiv = document.getElementById('errorMessage');
     const successDiv = document.getElementById('successMessage');
-    
+
     // Hide previous messages
     errorDiv.classList.add('hidden');
     successDiv.classList.add('hidden');
-    
+
     // Validate passwords match
     if (newPassword !== confirmPassword) {
         errorDiv.querySelector('span').textContent = 'New passwords do not match';
@@ -134,14 +133,14 @@ document.getElementById('changePasswordForm').addEventListener('submit', async (
         errorDiv.classList.remove('hidden');
         return;
     }
-    
+
     try {
         const token = localStorage.getItem('token');
         if (!token) {
             window.location.href = `${BASE_PATH}/login`;
             return;
         }
-        
+
         const response = await fetch(`${BASE_PATH}/api/auth/change-password`, {
             method: 'POST',
             headers: {

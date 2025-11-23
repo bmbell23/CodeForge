@@ -42,8 +42,16 @@ env/
 
 # Logs
 *.log
+logs/
+
+# Data
+data/
 
 # OS
 .DS_Store
 Thumbs.db
 
+# Temporary files
+debug-*.html
+test_*.html
+*_test.html

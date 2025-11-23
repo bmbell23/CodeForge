@@ -14,33 +14,33 @@ A modern web-based IDE centered around the Augment CLI, providing a beautiful in
 
 ## Prerequisites
 
-- Python 3.8 or higher
-- Node.js 22 or higher (for Augment CLI) - **Optional for development**
-- Augment CLI (`auggie`) installed globally - **Optional for development**
+- Docker and Docker Compose (recommended)
+- OR Python 3.8+ and Node.js 22+ (for manual installation)
+- Augment CLI account (for AI features)
 
-> **Note**: You can develop and test CodeForge without installing Augment CLI by using the built-in mock service. See [DEVELOPMENT_MODE.md](DEVELOPMENT_MODE.md) for details.
+## Quick Start
 
-## Installation
-
-### Option A: Development Mode (No Augment CLI Required)
-
-Perfect for testing and development without external dependencies.
+### Docker Deployment (Recommended)
 
 ```bash
+# Clone the repository
+git clone https://github.com/yourusername/CodeForge.git
 cd CodeForge
 
-# Run automated setup
-./setup.sh
+# Start the container
+docker compose up -d
 
-# .env will have USE_MOCK_AUGMENT=true by default
-# This uses a mock service that simulates Augment responses
+# Create a user
+docker exec -it codeforge_app python scripts/create_user.py <username> <email> <password>
+
+# Access at http://localhost:8005
 ```
 
-See [DEVELOPMENT_MODE.md](DEVELOPMENT_MODE.md) for full details.
+**Note**: You'll need to configure Augment authentication. See [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md) for detailed setup instructions.
 
-### Option B: Production Mode (With Real Augment CLI)
+### Manual Installation
 
-For actual AI-powered coding assistance.
+For development or custom deployments:
 
 #### 1. Install Augment CLI
 
@@ -68,7 +68,7 @@ cp .env.example .env
 nano .env
 ```
 
-### 3. Configure Environment
+#### 3. Configure Environment
 
 Edit `.env` and set:
 
@@ -84,18 +84,16 @@ HOST=0.0.0.0
 PORT=8004
 
 # Augment mode (set to false to use real Augment CLI)
-USE_MOCK_AUGMENT=true
+USE_MOCK_AUGMENT=false
 ```
 
-**Important**: Set `USE_MOCK_AUGMENT=false` if you installed the real Augment CLI.
-
-### 4. Create a User
+#### 4. Create a User
 
 ```bash
 python scripts/create_user.py brandon brandon@example.com yourpassword
 ```
 
-### 5. Run the Server
+#### 5. Run the Server
 
 ```bash
 python scripts/server.py
@@ -153,7 +151,7 @@ CodeForge is built with:
 
 ```
 CodeForge/
-├── src/codeforge/
+├── src/codeforge/       # Main application code
 │   ├── models/          # Database models
 │   ├── routes/          # API routes
 │   ├── services/        # Business logic (Augment integration)
@@ -163,7 +161,13 @@ CodeForge/
 │   ├── config.py        # Configuration
 │   ├── database.py      # Database setup
 │   └── main.py          # FastAPI app
+├── deployment/          # Deployment files
+│   ├── docker/          # Docker configuration
+│   └── scripts/         # Deployment scripts
+├── docs/                # Documentation
 ├── scripts/             # Utility scripts
+├── data/                # Database and uploads
+├── logs/                # Application logs
 ├── pyproject.toml       # Python dependencies
 └── README.md
 ```
@@ -193,7 +197,18 @@ python scripts/create_user.py <username> <email> <password>
 
 ## Deployment
 
-For production deployment:
+### Docker Deployment (Recommended)
+
+See [deployment/README.md](deployment/README.md) for detailed Docker deployment instructions.
+
+Quick start:
+```bash
+docker compose up -d
+```
+
+### Manual Deployment
+
+For production deployment without Docker:
 
 1. Set a strong `SECRET_KEY` in `.env`
 2. Use a production WSGI server (e.g., Gunicorn)
@@ -201,24 +216,7 @@ For production deployment:
 4. Configure SSL/TLS certificates
 5. Set `DATABASE_URL` to use PostgreSQL instead of SQLite
 
-Example systemd service file:
-
-```ini
-[Unit]
-Description=CodeForge
-After=network.target
-
-[Service]
-Type=simple
-User=brandon
-WorkingDirectory=/home/brandon/projects/CodeForge
-Environment="PATH=/home/brandon/projects/CodeForge/venv/bin"
-ExecStart=/home/brandon/projects/CodeForge/venv/bin/codeforge-server
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
+Example systemd service file is provided at `codeforge.service`.
 
 ## Troubleshooting
 
