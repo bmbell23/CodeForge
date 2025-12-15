@@ -63,6 +63,7 @@ function dashboardApp() {
         showProjectScan: false,
         renamingProjectId: null,
         renamingProjectName: '',
+        loadingProjects: false,
 
         // Conversations
         conversations: [],
@@ -114,31 +115,83 @@ function dashboardApp() {
 
         async init() {
             // Show loading state
-            console.log('Initializing CodeForge...');
+            console.log('=== CodeForge Initialization Started ===');
+            console.log('User agent:', navigator.userAgent);
+            console.log('Is mobile:', navigator.userAgent.includes('Mobile'));
+            console.log('BASE_PATH:', window.BASE_PATH || 'undefined');
+            console.log('Window location:', window.location.href);
+            console.log('Local storage token exists:', !!localStorage.getItem('token'));
+            console.log('Alpine.js version:', window.Alpine?.version || 'not loaded');
 
-            await this.loadUser();
-            await this.autoLoadAllProjects(); // Auto-scan and load all projects
-            this.configureMarked();
-            this.initMobileHandlers();
-            this.initUrlStateManagement();
+            try {
+                // Test basic API connectivity
+                await this.testApiConnectivity();
 
-            // Handle window resize for terminal
-            window.addEventListener('resize', () => {
-                if (this.currentTerminalProjectId && this.terminals[this.currentTerminalProjectId]) {
-                    const terminalData = this.terminals[this.currentTerminalProjectId];
-                    terminalData.fitAddon.fit();
+                await this.loadUser();
+                console.log('User loaded, username:', this.username);
+
+                await this.autoLoadAllProjects(); // Auto-scan and load all projects
+                console.log('Projects after loading:', this.projects.length);
+
+                this.configureMarked();
+                this.initMobileHandlers();
+                this.initUrlStateManagement();
+
+                // Handle window resize for terminal
+                window.addEventListener('resize', () => {
+                    if (this.currentTerminalProjectId && this.terminals[this.currentTerminalProjectId]) {
+                        const terminalData = this.terminals[this.currentTerminalProjectId];
+                        terminalData.fitAddon.fit();
+                    }
+                });
+
+                // Watch for tab changes to ensure file tree is loaded
+                this.$watch('currentTab', (newTab) => {
+                    if (newTab === 'files' && this.currentProjectId && this.fileTree.length === 0) {
+                        console.log('Files tab activated, loading file tree');
+                        this.loadFileTree();
+                    }
+                });
+
+                console.log('=== CodeForge Initialization Complete ===');
+                console.log('Final state - projects:', this.projects.length, 'currentProjectId:', this.currentProjectId, 'showProjectSelector:', this.showProjectSelector);
+
+                // Add a global debug function for mobile testing
+                window.debugCodeForge = () => {
+                    console.log('=== Debug Info ===');
+                    console.log('Projects:', this.projects);
+                    console.log('Current Project ID:', this.currentProjectId);
+                    console.log('Show Project Selector:', this.showProjectSelector);
+                    console.log('Username:', this.username);
+                    console.log('Loading Projects:', this.loadingProjects);
+                    console.log('Cache:', {
+                        projects: getCached(CACHE_KEYS.PROJECTS),
+                        user: getCached(CACHE_KEYS.USER),
+                        lastProject: getCached(CACHE_KEYS.LAST_PROJECT)
+                    });
+                };
+
+                // Add a global function to force load test projects (for debugging)
+                window.forceTestProjects = () => {
+                    console.log('Forcing test projects...');
+                    this.projects = [
+                        { id: 1, name: 'Test Project 1', path: 'test1', description: 'Test project 1' },
+                        { id: 2, name: 'Test Project 2', path: 'test2', description: 'Test project 2' },
+                        { id: 3, name: 'CodeForge', path: 'CodeForge', description: 'CodeForge project' }
+                    ];
+                    this.showProjectSelector = true;
+                    console.log('Test projects loaded:', this.projects);
+                };
+
+            } catch (error) {
+                console.error('Error during CodeForge initialization:', error);
+                console.error('Error stack:', error.stack);
+
+                // On mobile, show a more visible error
+                if (navigator.userAgent.includes('Mobile')) {
+                    alert('CodeForge initialization failed. Check console for details.');
                 }
-            });
-
-            // Watch for tab changes to ensure file tree is loaded
-            this.$watch('currentTab', (newTab) => {
-                if (newTab === 'files' && this.currentProjectId && this.fileTree.length === 0) {
-                    console.log('Files tab activated, loading file tree');
-                    this.loadFileTree();
-                }
-            });
-
-            console.log('CodeForge initialized successfully');
+            }
         },
 
         initUrlStateManagement() {
@@ -365,6 +418,36 @@ function dashboardApp() {
             }
         },
 
+        async testApiConnectivity() {
+            try {
+                console.log('Testing API connectivity...');
+                const healthUrl = `${BASE_PATH}/health`;
+                console.log('Health check URL:', healthUrl);
+
+                const response = await fetch(healthUrl);
+                console.log('Health check response:', response.status, response.ok);
+
+                if (response.ok) {
+                    const data = await response.json();
+                    console.log('Health check data:', data);
+
+                    // Test if we can reach the projects API without auth (should fail with 401)
+                    try {
+                        const projectsUrl = `${BASE_PATH}/api/projects/`;
+                        console.log('Testing projects API (should fail with 401):', projectsUrl);
+                        const projectsResponse = await fetch(projectsUrl);
+                        console.log('Projects API response (no auth):', projectsResponse.status, projectsResponse.statusText);
+                    } catch (projectsError) {
+                        console.log('Projects API error (expected):', projectsError);
+                    }
+                } else {
+                    console.error('Health check failed:', response.status, response.statusText);
+                }
+            } catch (error) {
+                console.error('Health check error:', error);
+            }
+        },
+
         async loadUser() {
             // Try cache first
             const cached = getCached(CACHE_KEYS.USER);
@@ -380,78 +463,175 @@ function dashboardApp() {
         },
 
         async loadUserFromAPI() {
-            const response = await apiRequest(`${BASE_PATH}/api/auth/me`);
-            if (response && response.ok) {
-                const user = await response.json();
-                this.username = user.username;
-                setCache(CACHE_KEYS.USER, user);
+            try {
+                const response = await apiRequest(`${BASE_PATH}/api/auth/me`);
+                console.log('User API response:', response?.status, response?.ok);
+                if (response && response.ok) {
+                    const user = await response.json();
+                    console.log('User data received:', user);
+                    this.username = user.username;
+                    setCache(CACHE_KEYS.USER, user);
+                } else {
+                    console.error('Failed to load user:', response?.status, response?.statusText);
+                    if (response) {
+                        const errorText = await response.text();
+                        console.error('User API error details:', errorText);
+                    }
+                }
+            } catch (error) {
+                console.error('Error loading user:', error);
             }
         },
 
         async autoLoadAllProjects() {
             console.log('Auto-loading all projects...');
+            this.loadingProjects = true;
 
-            // Try cache first for faster initial load
-            const cached = getCached(CACHE_KEYS.PROJECTS);
-            if (cached) {
-                this.projects = cached;
-                console.log('Loaded projects from cache:', this.projects.length);
+            try {
+                // Try cache first for faster initial load
+                const cached = getCached(CACHE_KEYS.PROJECTS);
+                if (cached && cached.length > 0) {
+                    this.projects = cached;
+                    console.log('Loaded projects from cache:', this.projects.length);
 
-                // Select project from URL or last project
-                await this.selectInitialProject();
+                    // Select project from URL or last project
+                    await this.selectInitialProject();
 
-                // Still scan and update in background
-                this.scanAndUpdateProjects();
-                return;
+                    // Still scan and update in background
+                    this.scanAndUpdateProjects();
+                    return;
+                }
+
+                // No cache, do full scan with retry
+                await this.scanAndUpdateProjectsWithRetry();
+            } finally {
+                this.loadingProjects = false;
             }
-
-            // No cache, do full scan
-            await this.scanAndUpdateProjects();
         },
 
-        async scanAndUpdateProjects() {
-            // First, scan for all projects in the directory
-            const scanResponse = await apiRequest(`${BASE_PATH}/api/projects/scan`);
-            if (!scanResponse || !scanResponse.ok) {
-                console.error('Failed to scan projects');
-                return;
-            }
-
-            const scannedProjects = await scanResponse.json();
-            console.log('Scanned projects:', scannedProjects.length);
-
-            // Auto-add any projects that don't exist in DB yet
-            for (const project of scannedProjects) {
-                if (!project.exists_in_db) {
-                    console.log('Auto-adding project:', project.name);
-                    const addResponse = await apiRequest(`${BASE_PATH}/api/projects/`, {
-                        method: 'POST',
-                        body: {
-                            name: project.name,
-                            path: project.path,
-                            description: ''
-                        }
-                    });
-                    if (!addResponse || !addResponse.ok) {
-                        console.error('Failed to add project:', project.name);
+        async scanAndUpdateProjectsWithRetry(maxRetries = 3) {
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    await this.scanAndUpdateProjects();
+                    // If we get here, it succeeded
+                    return;
+                } catch (error) {
+                    console.error(`Project loading attempt ${attempt} failed:`, error);
+                    if (attempt === maxRetries) {
+                        console.error('All project loading attempts failed, showing project selector');
+                        this.showProjectSelector = true;
+                    } else {
+                        // Wait before retrying (exponential backoff)
+                        const delay = Math.pow(2, attempt - 1) * 1000; // 1s, 2s, 4s
+                        console.log(`Retrying in ${delay}ms...`);
+                        await new Promise(resolve => setTimeout(resolve, delay));
                     }
                 }
             }
+        },
 
-            // Now load all projects from DB
-            await this.loadProjects();
+        async scanAndUpdateProjects() {
+            try {
+                // First, scan for all projects in the directory
+                const scanResponse = await apiRequest(`${BASE_PATH}/api/projects/scan`);
+                if (!scanResponse || !scanResponse.ok) {
+                    console.error('Failed to scan projects, falling back to loading existing projects');
+                    // Fallback to just loading existing projects from DB
+                    await this.loadProjects();
+                    return;
+                }
+
+                const scannedProjects = await scanResponse.json();
+                console.log('Scanned projects:', scannedProjects.length);
+
+                // Auto-add any projects that don't exist in DB yet
+                for (const project of scannedProjects) {
+                    if (!project.exists_in_db) {
+                        console.log('Auto-adding project:', project.name);
+                        try {
+                            const addResponse = await apiRequest(`${BASE_PATH}/api/projects/`, {
+                                method: 'POST',
+                                body: {
+                                    name: project.name,
+                                    path: project.path,
+                                    description: ''
+                                }
+                            });
+                            if (!addResponse || !addResponse.ok) {
+                                console.error('Failed to add project:', project.name);
+                            }
+                        } catch (error) {
+                            console.error('Error adding project:', project.name, error);
+                        }
+                    }
+                }
+
+                // Now load all projects from DB
+                await this.loadProjects();
+            } catch (error) {
+                console.error('Error in scanAndUpdateProjects:', error);
+                // Fallback to loading existing projects
+                await this.loadProjects();
+            }
         },
 
         async loadProjects() {
-            const response = await apiRequest(`${BASE_PATH}/api/projects/`);
-            if (response && response.ok) {
-                this.projects = await response.json();
-                // Sort projects alphabetically by name
-                this.projects.sort((a, b) => a.name.localeCompare(b.name));
-                setCache(CACHE_KEYS.PROJECTS, this.projects);
-                console.log('Projects loaded:', this.projects.length, 'projects');
+            console.log('loadProjects() called');
+            try {
+                const url = `${BASE_PATH}/api/projects/`;
+                console.log('Making API request to:', url);
+                const response = await apiRequest(url);
+                console.log('API response:', response?.status, response?.ok);
 
-                await this.selectInitialProject();
+                if (response && response.ok) {
+                    this.projects = await response.json();
+                    console.log('Raw projects from API:', this.projects);
+                    // Sort projects alphabetically by name
+                    this.projects.sort((a, b) => a.name.localeCompare(b.name));
+                    setCache(CACHE_KEYS.PROJECTS, this.projects);
+                    console.log('Projects loaded and sorted:', this.projects.length, 'projects');
+
+                    await this.selectInitialProject();
+                } else {
+                    console.error('Failed to load projects from API:', response?.status, response?.statusText);
+                    if (response) {
+                        const errorText = await response.text();
+                        console.error('API error details:', errorText);
+                    }
+                    // If we have cached projects, use them as fallback
+                    const cached = getCached(CACHE_KEYS.PROJECTS);
+                    if (cached && cached.length > 0) {
+                        console.log('Using cached projects as fallback:', cached.length);
+                        this.projects = cached;
+                        await this.selectInitialProject();
+                    } else {
+                        console.warn('No projects available and no cache found');
+                        this.showProjectSelector = true;
+                    }
+                }
+            } catch (error) {
+                console.error('Error loading projects:', error);
+                console.error('Error stack:', error.stack);
+                // Try to use cached projects as fallback
+                const cached = getCached(CACHE_KEYS.PROJECTS);
+                if (cached && cached.length > 0) {
+                    console.log('Using cached projects due to error:', cached.length);
+                    this.projects = cached;
+                    await this.selectInitialProject();
+                } else {
+                    console.warn('No projects available due to error and no cache found');
+                    // Add a test project for debugging on mobile
+                    if (navigator.userAgent.includes('Mobile')) {
+                        console.log('Mobile detected, adding test project for debugging');
+                        this.projects = [{
+                            id: 999,
+                            name: 'Test Project (Mobile Debug)',
+                            path: '/test',
+                            description: 'Debug project for mobile testing'
+                        }];
+                    }
+                    this.showProjectSelector = true;
+                }
             }
         },
 
@@ -471,7 +651,19 @@ function dashboardApp() {
                 }
             }
 
-            // No project specified in URL - show project selector
+            // Check if we have a cached last project to restore
+            const cachedLastProject = getCached(CACHE_KEYS.LAST_PROJECT);
+            if (cachedLastProject && this.projects.length > 0) {
+                const lastProject = this.projects.find(p => p.id === cachedLastProject.id);
+                if (lastProject) {
+                    this.currentProjectId = lastProject.id;
+                    this.showProjectSelector = false;
+                    await this.switchProject();
+                    return;
+                }
+            }
+
+            // No project specified in URL and no cached project - show project selector
             if (!urlProjectId && this.projects.length > 0) {
                 this.showProjectSelector = true;
                 return;
@@ -488,6 +680,12 @@ function dashboardApp() {
         async selectProjectFromSelector(projectId) {
             this.currentProjectId = projectId;
             this.showProjectSelector = false;
+
+            // Cache the selected project for future sessions
+            const selectedProject = this.projects.find(p => p.id === projectId);
+            if (selectedProject) {
+                setCache(CACHE_KEYS.LAST_PROJECT, selectedProject);
+            }
 
             // Load conversations to find the most recent one
             await this.loadConversations();
@@ -508,6 +706,12 @@ function dashboardApp() {
             if (!this.currentProjectId) return;
 
             console.log('Switching to project:', this.currentProjectId);
+
+            // Cache the selected project for future sessions
+            const currentProject = this.projects.find(p => p.id === this.currentProjectId);
+            if (currentProject) {
+                setCache(CACHE_KEYS.LAST_PROJECT, currentProject);
+            }
 
             // Update URL with new project ID
             this.updateUrl(this.currentProjectId, null, true);

@@ -11,9 +11,16 @@
     <!-- Favicon -->
     <link rel="icon" type="image/png" href="/static/favicon.png" id="favicon">
 
+    <!-- PWA Manifest -->
+    <link rel="manifest" href="/static/manifest.json" id="manifest">
+    <meta name="theme-color" content="#10b981">
+
     <!-- Apple Touch Icon (for iOS home screen) -->
     <link rel="apple-touch-icon" href="/static/app_icon.png" id="apple-icon">
     <link rel="apple-touch-icon" sizes="180x180" href="/static/app_icon.png" id="apple-icon-180">
+    <link rel="apple-touch-icon" sizes="152x152" href="/static/app_icon.png">
+    <link rel="apple-touch-icon" sizes="120x120" href="/static/app_icon.png">
+    <link rel="apple-touch-icon-precomposed" href="/static/app_icon.png">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
     <meta name="apple-mobile-web-app-title" content="CodeForge">
@@ -64,11 +71,13 @@
         function updateStaticPaths() {
             // Update favicon and icons
             const favicon = document.getElementById('favicon');
+            const manifest = document.getElementById('manifest');
             const appleIcon = document.getElementById('apple-icon');
             const appleIcon180 = document.getElementById('apple-icon-180');
             const mainCss = document.getElementById('main-css');
 
             if (favicon) favicon.href = BASE_PATH + '/static/favicon.png';
+            if (manifest) manifest.href = BASE_PATH + '/static/manifest.json';
             if (appleIcon) appleIcon.href = BASE_PATH + '/static/app_icon.png';
             if (appleIcon180) appleIcon180.href = BASE_PATH + '/static/app_icon.png';
             if (mainCss) mainCss.href = BASE_PATH + '/static/css/main.css';

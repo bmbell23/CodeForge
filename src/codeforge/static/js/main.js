@@ -3,6 +3,8 @@
 // API helper function
 async function apiRequest(url, options = {}) {
     const token = localStorage.getItem('token');
+    console.log('apiRequest called with URL:', url, 'options:', options);
+    console.log('Token available:', !!token);
 
     const headers = {
         ...options.headers,
@@ -17,19 +19,29 @@ async function apiRequest(url, options = {}) {
         options.body = JSON.stringify(options.body);
     }
 
-    const response = await fetch(url, {
-        ...options,
-        headers
-    });
+    console.log('Making fetch request with headers:', headers);
 
-    if (response.status === 401) {
-        // Unauthorized - redirect to login
-        localStorage.removeItem('token');
-        window.location.href = '/login';
-        return null;
+    try {
+        const response = await fetch(url, {
+            ...options,
+            headers
+        });
+
+        console.log('Fetch response:', response.status, response.statusText, response.ok);
+
+        if (response.status === 401) {
+            // Unauthorized - redirect to login
+            console.log('Unauthorized, redirecting to login');
+            localStorage.removeItem('token');
+            window.location.href = '/login';
+            return null;
+        }
+
+        return response;
+    } catch (error) {
+        console.error('Fetch error:', error);
+        throw error;
     }
-
-    return response;
 }
 
 // Check if user is authenticated

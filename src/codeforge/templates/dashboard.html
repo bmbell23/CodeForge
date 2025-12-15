@@ -13,7 +13,10 @@
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js"></script>
 <!-- Load dashboard.js synchronously BEFORE Alpine.js initializes -->
-<script src="/static/js/dashboard.js?v={{ range(1, 999999999) | random }}"></script>
+<script>
+    // Use BASE_PATH for dashboard.js
+    document.write('<script src="' + (window.BASE_PATH || '') + '/static/js/dashboard.js?v={{ range(1, 999999999) | random }}"><\/script>');
+</script>
 {% endblock %}
 
 {% block body %}
@@ -21,9 +24,14 @@
     <!-- Top Navigation Bar - Modern Black & Green Theme -->
     <nav class="codeforge-header text-white px-4 py-3 flex items-center justify-between shadow-lg">
         <div class="flex items-center space-x-2 md:space-x-4">
-            <!-- Hamburger Menu (Mobile Only) -->
-            <button @click="sidebarOpen = !sidebarOpen" class="md:hidden text-white hover:text-forge-green-400 transition-colors">
+            <!-- Hamburger Menu (Mobile Only) - Show when not on project selector or when sidebar should be accessible -->
+            <button x-show="!showProjectSelector" @click="sidebarOpen = !sidebarOpen" class="md:hidden text-white hover:text-forge-green-400 transition-colors">
                 <i class="fas fa-bars text-xl"></i>
+            </button>
+
+            <!-- Projects Button (Mobile Only) - Show when project is selected to go back to project selector -->
+            <button x-show="!showProjectSelector && currentProjectId" @click="showProjectSelector = true" class="md:hidden text-white hover:text-forge-green-400 transition-colors mr-2">
+                <i class="fas fa-folder text-xl"></i>
             </button>
 
             <a href="/dashboard" class="codeforge-brand text-lg md:text-xl font-bold flex items-center gap-2 hover:opacity-80 transition-opacity cursor-pointer">
@@ -74,7 +82,14 @@
                     </template>
                 </div>
 
-                <div x-show="projects.length === 0" class="text-center text-gray-500 mt-8">
+                <!-- Loading indicator -->
+                <div x-show="loadingProjects" class="text-center text-gray-500 mt-8">
+                    <i class="fas fa-spinner fa-spin text-4xl mb-4 text-forge-green-400"></i>
+                    <p>Loading projects...</p>
+                </div>
+
+                <!-- No projects found -->
+                <div x-show="projects.length === 0 && !loadingProjects" class="text-center text-gray-500 mt-8">
                     <i class="fas fa-folder-open text-4xl mb-4"></i>
                     <p>No projects found. Projects will be automatically discovered from your projects directory.</p>
                 </div>
@@ -105,7 +120,7 @@
                     </label>
                     <select x-model="currentProjectId" @change="switchProject(); sidebarOpen = false"
                         class="w-full bg-gray-900 text-white rounded-lg px-3 py-2 text-sm border border-gray-700 focus:border-forge-green-500 focus:ring-2 focus:ring-forge-green-500/20">
-                        <option value="">Select Project...</option>
+                        <option value="" x-text="loadingProjects ? 'Loading projects...' : 'Select Project...'"></option>
                         <template x-for="project in projects" :key="project.id">
                             <option :value="project.id" x-text="project.name"></option>
                         </template>
@@ -641,31 +656,38 @@
 
     <!-- Mobile Bottom Tab Bar -->
     <div class="md:hidden mobile-tab-bar">
-        <button @click="currentTab = 'chat'"
+        <!-- Projects tab - only show when not on project selector -->
+        <button x-show="!showProjectSelector" @click="showProjectSelector = true"
+                :class="{'active': showProjectSelector}"
+                class="mobile-tab-button">
+            <i class="fas fa-folder-open text-lg mb-1"></i>
+            <span>Projects</span>
+        </button>
+        <button x-show="!showProjectSelector" @click="currentTab = 'chat'"
                 :class="{'active': currentTab === 'chat'}"
                 class="mobile-tab-button">
             <i class="fas fa-comments text-lg mb-1"></i>
             <span>Chat</span>
         </button>
-        <button @click="currentTab = 'files'"
+        <button x-show="!showProjectSelector" @click="currentTab = 'files'"
                 :class="{'active': currentTab === 'files'}"
                 class="mobile-tab-button">
             <i class="fas fa-folder text-lg mb-1"></i>
             <span>Files</span>
         </button>
-        <button @click="currentTab = 'git'"
+        <button x-show="!showProjectSelector" @click="currentTab = 'git'"
                 :class="{'active': currentTab === 'git'}"
                 class="mobile-tab-button">
             <i class="fas fa-code-branch text-lg mb-1"></i>
             <span>Git</span>
         </button>
-        <button @click="currentTab = 'terminal'; initTerminal()"
+        <button x-show="!showProjectSelector" @click="currentTab = 'terminal'; initTerminal()"
                 :class="{'active': currentTab === 'terminal'}"
                 class="mobile-tab-button">
             <i class="fas fa-terminal text-lg mb-1"></i>
             <span>Terminal</span>
         </button>
-        <button @click="currentTab = 'settings'"
+        <button x-show="!showProjectSelector" @click="currentTab = 'settings'"
                 :class="{'active': currentTab === 'settings'}"
                 class="mobile-tab-button">
             <i class="fas fa-cog text-lg mb-1"></i>

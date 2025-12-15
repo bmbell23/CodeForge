@@ -6,7 +6,7 @@ services:
     container_name: codeforge_app
     restart: unless-stopped
     ports:
-      - "8005:8000"  # Map container port 8000 to host port 8005
+      - "8009:8000"  # Map container port 8000 to host port 8009
     volumes:
       # Mount projects directory (read-only for security)
       - /home/brandon/projects:/app/projects:ro
