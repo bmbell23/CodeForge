@@ -1,0 +1,109 @@
+# Augment AI Guidelines for CodeForge Project
+
+## CRITICAL: SYSTEM OPERATIONS - READ THIS FIRST
+
+### ⛔ ABSOLUTELY FORBIDDEN OPERATIONS ⛔
+
+**NEVER, UNDER ANY CIRCUMSTANCES:**
+
+1. **NEVER restart the entire system/server with `sudo reboot`, `systemctl reboot`, or any reboot command**
+2. **NEVER use `shutdown`, `poweroff`, or any system-level restart commands**
+3. **NEVER use `pg_resetwal` or any PostgreSQL recovery tools without explicit user permission and backup verification**
+4. **NEVER use `docker-compose down` on production services without explicit permission**
+5. **NEVER stop all containers at once**
+6. **NEVER perform destructive database operations without verified backups**
+
+### ✅ CORRECT APPROACH FOR CONTAINER/SERVICE ISSUES
+
+**When a container or service has issues:**
+
+1. **First, diagnose the actual problem:**
+   - Check logs: `docker logs <container_name>`
+   - Check disk space: `df -h`
+   - Check memory: `free -h`
+   - Check container status: `docker ps -a`
+
+2. **For individual container restarts:**
+   ```bash
+   # Restart a single container (PREFERRED)
+   docker restart <container_name>
+
+   # If restart doesn't work, stop and start
+   docker stop <container_name>
+   docker start <container_name>
+   ```
+
+3. **For docker-compose managed services:**
+   ```bash
+   # Restart a single service (PREFERRED)
+   docker-compose restart <service_name>
+
+   # Only if absolutely necessary and user approves:
+   docker-compose down <service_name>
+   docker-compose up -d <service_name>
+   ```
+
+4. **For process issues:**
+   ```bash
+   # Find the process
+   ps aux | grep <process_name>
+
+   # Kill gracefully
+   kill <pid>
+
+   # Only if necessary
+   kill -9 <pid>
+   ```
+
+### 🚨 ESCALATION PROTOCOL
+
+**If you think a system reboot is needed:**
+1. **STOP** - Do not proceed
+2. **ASK** the user explicitly: "I think a reboot might help, but this is risky. Can I explore other options first?"
+3. **WAIT** for explicit permission
+4. **DOCUMENT** why you think it's needed
+5. **VERIFY** all services have proper shutdown procedures
+6. **CONFIRM** backups exist for all critical data
+
+### 📋 COMMON ISSUES AND SOLUTIONS
+
+**Issue: Container won't start**
+- Solution: Check logs, check disk space, restart container only
+- NOT: Reboot system
+
+**Issue: Database corruption**
+- Solution: Restore from backup, check disk space, check logs
+- NOT: Use pg_resetwal without backup verification
+
+**Issue: Service unresponsive**
+- Solution: Restart the specific service, check resources
+- NOT: Restart entire system
+
+**Issue: Disk space full**
+- Solution: Clean logs, remove old files, check docker volumes
+- NOT: Reboot (it won't help)
+
+## Project-Specific Guidelines
+
+### Technology Stack
+- FastAPI backend
+- SQLite database
+- Docker containerized
+- Python 3.8+
+
+### Code Style
+- Follow PEP 8
+- Use type hints
+- Write docstrings for functions
+- Keep functions focused and small
+
+### Testing
+- Write tests for new features
+- Run tests before committing
+- Use pytest for testing
+
+### Deployment
+- Use docker-compose for deployment
+- Never manually edit production database
+- Always backup before migrations
+
