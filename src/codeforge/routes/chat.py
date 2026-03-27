@@ -1,5 +1,6 @@
 """Chat and conversation routes."""
 
+import asyncio
 from typing import List, Optional
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, WebSocket, WebSocketDisconnect
@@ -13,8 +14,7 @@ from ..models.message import Message, MessageRole
 from ..models.project import Project
 from ..auth import get_current_active_user
 from ..config import settings
-from ..services.augment_service import AugmentService
-from ..services.mock_augment_service import MockAugmentService
+from ..services.task_manager import task_manager
 
 router = APIRouter()
 
@@ -225,20 +225,26 @@ async def websocket_endpoint(
     conversation_id: int,
     db: Session = Depends(get_db)
 ):
-    """WebSocket endpoint for real-time chat."""
+    """WebSocket endpoint for real-time chat.
+
+    Auggie runs as a background task that persists even if the client disconnects.
+    The WebSocket just subscribes to updates and can reconnect at any time.
+    """
     await websocket.accept()
-    
+
+    subscription_queue = None
+
     try:
         # Get conversation
         conversation = db.query(Conversation).filter(
             Conversation.id == conversation_id
         ).first()
-        
+
         if not conversation:
             await websocket.send_json({"error": "Conversation not found"})
             await websocket.close()
             return
-        
+
         # Get project path if exists
         project_path = None
         if conversation.project_id:
@@ -246,13 +252,23 @@ async def websocket_endpoint(
                 Project.id == conversation.project_id
             ).first()
             if project:
-                from pathlib import Path
-                project_path = str(Path(settings.projects_root) / project.path)
-        
-        # Initialize Augment service (use mock or real based on config)
-        ServiceClass = MockAugmentService if settings.use_mock_augment else AugmentService
-        augment_service = ServiceClass(project_path=project_path)
-        
+                project_path = project.path
+
+        # Check if there's an active task for this conversation (reconnect scenario)
+        active_task = task_manager.get_active_task(conversation_id)
+        if active_task and not active_task.is_complete:
+            # Subscribe to the existing task and stream catch-up chunks
+            subscription_queue = await task_manager.subscribe(conversation_id)
+            if subscription_queue:
+                await websocket.send_json({
+                    "type": "streaming_resumed",
+                    "content_so_far": active_task.content
+                })
+                # Start forwarding chunks in background
+                asyncio.create_task(
+                    _forward_chunks(websocket, subscription_queue, conversation_id)
+                )
+
         while True:
             # Receive message from client
             data = await websocket.receive_json()
@@ -283,41 +299,66 @@ async def websocket_endpoint(
                     "created_at": message.created_at.isoformat()
                 }
             })
-            
-            # Stream response from Augment
-            assistant_content = ""
-            async for chunk in augment_service.stream_response(user_message):
-                assistant_content += chunk
-                await websocket.send_json({
-                    "type": "assistant_chunk",
-                    "chunk": chunk
-                })
-            
-            # Save assistant message
-            assistant_message = Message(
-                conversation_id=conversation_id,
-                role=MessageRole.ASSISTANT,
-                content=assistant_content
+
+            # Unsubscribe from any previous task
+            if subscription_queue:
+                task_manager.unsubscribe(conversation_id, subscription_queue)
+
+            # Start auggie in the background (persists even if WS disconnects)
+            asyncio.create_task(
+                task_manager.run_auggie(conversation_id, project_path, user_message)
             )
-            db.add(assistant_message)
-            conversation.updated_at = datetime.utcnow()
-            db.commit()
-            
-            # Send completion
-            await websocket.send_json({
-                "type": "assistant_complete",
-                "message": {
-                    "id": assistant_message.id,
-                    "role": "assistant",
-                    "content": assistant_content,
-                    "created_at": assistant_message.created_at.isoformat()
-                }
-            })
-    
+
+            # Give the task a moment to start, then subscribe
+            await asyncio.sleep(0.1)
+            subscription_queue = await task_manager.subscribe(conversation_id)
+            if subscription_queue:
+                asyncio.create_task(
+                    _forward_chunks(websocket, subscription_queue, conversation_id)
+                )
+
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        await websocket.send_json({"error": str(e)})
+        try:
+            await websocket.send_json({"error": str(e)})
+        except Exception:
+            pass
     finally:
-        await websocket.close()
+        # Unsubscribe but DON'T kill the auggie task - it keeps running
+        if subscription_queue:
+            task_manager.unsubscribe(conversation_id, subscription_queue)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+async def _forward_chunks(websocket: WebSocket, queue: asyncio.Queue, conversation_id: int):
+    """Forward chunks from the task manager queue to the WebSocket client."""
+    try:
+        while True:
+            msg_type, data = await queue.get()
+
+            if msg_type == "chunk":
+                await websocket.send_json({
+                    "type": "assistant_chunk",
+                    "chunk": data
+                })
+            elif msg_type == "complete":
+                await websocket.send_json({
+                    "type": "assistant_complete",
+                    "message": {
+                        "id": data.get("id"),
+                        "role": "assistant",
+                        "content": data.get("content", ""),
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                })
+                break
+            elif msg_type == "cancelled":
+                break
+    except (WebSocketDisconnect, Exception):
+        # Client disconnected - that's fine, the task keeps running
+        task_manager.unsubscribe(conversation_id, queue)
 

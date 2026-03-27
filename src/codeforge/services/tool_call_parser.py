@@ -304,6 +304,7 @@ class StreamingToolCallFilter:
         self.display_mode = display_mode
         self.buffer = ""
         self.in_tool_section = False
+        self.in_thinking_section = False
         self.current_tool_name = None
         self.last_displayed_tool = None  # Track last tool to avoid duplicates
 
@@ -360,6 +361,21 @@ class StreamingToolCallFilter:
         # Remove ANSI codes for pattern matching
         clean_line = self.ANSI_ESCAPE.sub('', line)
         stripped = clean_line.strip()
+
+        # Filter out "Thinking:" blocks (auggie's chain-of-thought)
+        if stripped.startswith('Thinking:') or stripped.startswith('thinking:'):
+            self.in_thinking_section = True
+            return
+        if self.in_thinking_section:
+            # End thinking section on empty line or when we hit regular content markers
+            if not stripped or stripped.startswith('🔧') or stripped.startswith('📋') or stripped == '🤖':
+                self.in_thinking_section = False
+                if not stripped:
+                    return
+                # Fall through to process this line normally
+            else:
+                # Still in thinking section, suppress
+                return
 
         # Check for tool call start (with or without emoji)
         if '🔧 Tool call:' in stripped or stripped.startswith('Tool call:'):

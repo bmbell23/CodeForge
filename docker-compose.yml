@@ -5,11 +5,14 @@ services:
     build: .
     container_name: codeforge_app
     restart: unless-stopped
-    ports:
-      - "8009:8000"  # Map container port 8000 to host port 8009
+    network_mode: host
     volumes:
-      # Mount projects directory (read-only for security)
-      - /home/brandon/projects:/app/projects:ro
+      # Mount projects directory
+      - /home/brandon/projects:/app/projects
+      # Mount augment config so auggie uses host's auth session
+      - /home/brandon/.augment:/home/codeforge/.augment
+      # Mount Docker socket so auggie can run docker commands
+      - /var/run/docker.sock:/var/run/docker.sock
       # Mount data directory for database and uploads
       - ./data:/app/data
       # Mount logs directory
@@ -17,7 +20,7 @@ services:
     environment:
       # Application settings
       - HOST=0.0.0.0
-      - PORT=8000
+      - PORT=8005
       - PROJECTS_ROOT=/app/projects
 
       # Database (SQLite in data directory)
@@ -32,14 +35,11 @@ services:
       - AUGGIE_PATH=/usr/bin/auggie
       - NODE_PATH=/usr/bin/node
       - USE_MOCK_AUGMENT=${USE_MOCK_AUGMENT:-false}
-      - AUGMENT_SESSION_AUTH={"accessToken":"bd12f874d550c08b23bc444f7143a9ce988f1cd1e8ed07c731f031ea99d1cbf1","tenantURL":"https://e2.api.augmentcode.com/","scopes":["read","write"]}
-
-    networks:
-      - codeforge_network
+      # AUGMENT_SESSION_AUTH is read from mounted ~/.augment/session.json
 
     # Health check
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -49,15 +49,11 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.0'
-          memory: 512M
+          cpus: '2.0'
+          memory: 1G
         reservations:
           cpus: '0.25'
           memory: 128M
-
-networks:
-  codeforge_network:
-    driver: bridge
 
 volumes:
   codeforge_data:

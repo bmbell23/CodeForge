@@ -91,6 +91,19 @@ docker image prune
 sudo reboot  # This doesn't free disk space!
 ```
 
+
+### iptables: Stale DNAT Rules After Container Redeploy
+
+**Recurring issue**: When Docker containers are recreated, stale DNAT rules remain in
+iptables and hijack traffic before the correct rule fires. The service will work on
+`127.0.0.1` but be **unreachable externally** (e.g., via Tailscale `100.69.184.113`).
+
+**Always check after a redeploy if a service is externally unreachable:**
+```bash
+sudo iptables-save | grep "DNAT.*<port>"
+# If two rules exist for the same port — remove the stale one:
+sudo iptables -t nat -D DOCKER ! -i <old-bridge> -p tcp -m tcp --dport <port> -j DNAT --to-destination <old-ip>:<port>
+```
 ### 🔍 Diagnostic Steps Before Any Action
 
 1. **Check logs**: `docker logs <container>`

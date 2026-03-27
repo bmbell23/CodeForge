@@ -813,8 +813,13 @@ function dashboardApp() {
             // Update URL with new conversation ID
             this.updateUrl(null, conversationId, true);
 
-            // Close existing WebSocket
+            // Close existing WebSocket (disable auto-reconnect first)
+            if (this._wsReconnectTimer) {
+                clearTimeout(this._wsReconnectTimer);
+                this._wsReconnectTimer = null;
+            }
             if (this.ws) {
+                this._wsIntentionalClose = true;
                 this.ws.close();
             }
 
@@ -909,31 +914,50 @@ function dashboardApp() {
                 return;
             }
 
+            // Clear any existing reconnect timer
+            if (this._wsReconnectTimer) {
+                clearTimeout(this._wsReconnectTimer);
+                this._wsReconnectTimer = null;
+            }
+
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
             const wsUrl = `${protocol}//${window.location.host}${BASE_PATH}/api/chat/ws/${this.currentConversationId}`;
 
             console.log('Connecting WebSocket to:', wsUrl);
+            this._wsReconnectAttempts = 0;
             this.ws = new WebSocket(wsUrl);
 
             this.ws.onopen = () => {
                 console.log('WebSocket connected successfully');
+                this._wsReconnectAttempts = 0;
             };
 
             this.ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
 
                 if (data.type === 'user_message') {
-                    this.messages.push(data.message);
-                    this.$nextTick(() => this.scrollToBottom(true)); // Force scroll for new user message
+                    // Avoid duplicate if we already have this message
+                    if (!this.messages.find(m => m.id === data.message.id)) {
+                        this.messages.push(data.message);
+                    }
+                    this.$nextTick(() => this.scrollToBottom(true));
+                } else if (data.type === 'streaming_resumed') {
+                    // Reconnected to an in-progress response - show what we have so far
+                    console.log('Resumed streaming, content so far:', data.content_so_far?.length, 'chars');
+                    this.isStreaming = true;
+                    this.streamingContent = data.content_so_far || '';
+                    this.$nextTick(() => this.scrollToBottom());
                 } else if (data.type === 'assistant_chunk') {
                     this.isStreaming = true;
                     this.streamingContent += data.chunk;
-                    this.$nextTick(() => this.scrollToBottom()); // Auto-scroll only if near bottom
+                    this.$nextTick(() => this.scrollToBottom());
                 } else if (data.type === 'assistant_complete') {
                     this.isStreaming = false;
-                    this.messages.push(data.message);
+                    if (data.message && !this.messages.find(m => m.id === data.message.id)) {
+                        this.messages.push(data.message);
+                    }
                     this.streamingContent = '';
-                    this.$nextTick(() => this.scrollToBottom()); // Auto-scroll only if near bottom
+                    this.$nextTick(() => this.scrollToBottom());
                 } else if (data.error) {
                     console.error('WebSocket error:', data.error);
                     alert('Error: ' + data.error);
@@ -946,11 +970,35 @@ function dashboardApp() {
 
             this.ws.onclose = (event) => {
                 console.log('WebSocket closed', event.code, event.reason);
+                // Don't auto-reconnect if we intentionally closed (e.g. switching conversations)
+                if (this._wsIntentionalClose) {
+                    this._wsIntentionalClose = false;
+                    return;
+                }
+                // Auto-reconnect with exponential backoff
+                if (this.currentConversationId) {
+                    this._wsReconnectAttempts = (this._wsReconnectAttempts || 0) + 1;
+                    const delay = Math.min(1000 * Math.pow(2, this._wsReconnectAttempts - 1), 30000);
+                    console.log(`WebSocket reconnecting in ${delay}ms (attempt ${this._wsReconnectAttempts})`);
+                    this._wsReconnectTimer = setTimeout(() => {
+                        if (this.currentConversationId) {
+                            // Reload messages first to pick up anything saved while disconnected
+                            this.loadMessages().then(() => {
+                                this.connectWebSocket();
+                            });
+                        }
+                    }, delay);
+                }
             };
         },
 
         sendMessage() {
             if ((!this.messageInput.trim() && this.attachedImages.length === 0) || !this.ws || this.isStreaming) return;
+            if (this.ws.readyState !== WebSocket.OPEN) {
+                console.warn('WebSocket not open, reconnecting...');
+                this.connectWebSocket();
+                return;
+            }
 
             this.ws.send(JSON.stringify({
                 message: this.messageInput,

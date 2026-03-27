@@ -4,9 +4,11 @@ from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
+from sqlalchemy.orm import Session
 
-from ..auth import get_current_active_user
+from ..auth import get_current_user_from_cookie
 from ..models.user import User
+from ..database import get_db
 
 router = APIRouter()
 
@@ -16,11 +18,12 @@ templates = Jinja2Templates(directory=str(templates_dir))
 
 
 @router.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    """Landing page - redirects to login or dashboard."""
+async def index(request: Request, db: Session = Depends(get_db)):
+    """Landing page - redirects to dashboard."""
+    current_user = get_current_user_from_cookie(request, db)
     # Check if we're behind a proxy with /code/ prefix
     prefix = "/code" if request.headers.get("x-forwarded-prefix") == "/code" else ""
-    return RedirectResponse(url=f"{prefix}/login")
+    return RedirectResponse(url=f"{prefix}/dashboard")
 
 
 @router.get("/login", response_class=HTMLResponse)
@@ -36,22 +39,32 @@ async def register_page(request: Request):
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request):
+async def dashboard(request: Request, db: Session = Depends(get_db)):
     """Main dashboard page."""
-    return templates.TemplateResponse("dashboard.html", {"request": request})
+    current_user = get_current_user_from_cookie(request, db)
+    return templates.TemplateResponse("dashboard.html", {
+        "request": request,
+        "current_user": current_user
+    })
 
 
 @router.get("/settings", response_class=HTMLResponse)
-async def settings_page(request: Request):
+async def settings_page(request: Request, db: Session = Depends(get_db)):
     """Settings page."""
-    return templates.TemplateResponse("settings.html", {"request": request})
+    current_user = get_current_user_from_cookie(request, db)
+    return templates.TemplateResponse("settings.html", {
+        "request": request,
+        "current_user": current_user
+    })
 
 
 @router.get("/chat/{conversation_id}", response_class=HTMLResponse)
-async def chat_page(request: Request, conversation_id: int):
+async def chat_page(request: Request, conversation_id: int, db: Session = Depends(get_db)):
     """Chat page for a specific conversation."""
+    current_user = get_current_user_from_cookie(request, db)
     return templates.TemplateResponse("chat.html", {
         "request": request,
-        "conversation_id": conversation_id
+        "conversation_id": conversation_id,
+        "current_user": current_user
     })
 
