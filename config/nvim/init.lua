@@ -111,9 +111,13 @@ require("lazy").setup({
   -- LSP: go-to-definition, references (find callers), rename, etc.
   {
     "neovim/nvim-lspconfig",
+    -- v2+ requires Neovim 0.11 and warns on 0.10; pin the last 0.10-friendly
+    -- release. Drop this pin once on Neovim 0.11+.
+    version = "v1.8.0",
     dependencies = {
       "williamboman/mason.nvim",
-      "williamboman/mason-lspconfig.nvim",
+      -- Pin to 1.x to match nvim-lspconfig v1 (2.x rewrote the API).
+      { "williamboman/mason-lspconfig.nvim", version = "v1.32.0" },
     },
     config = function()
       require("mason").setup()
