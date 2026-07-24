@@ -1,82 +1,51 @@
-# Claude AI Assistant Guidelines
+# CodeForge — AI Assistant Guidelines
 
-## ⚠️ CRITICAL SAFETY RULES ⚠️
+## What this project is
 
-### NEVER DO THESE OPERATIONS
+CodeForge is a **terminal-native IDE**: a single-binary multiplexer written in
+Rust that hosts Neovim, a shell, and the Claude CLI in managed panes. Editing
+features come from Neovim running inside CodeForge; CodeForge provides the
+workbench (pane/tab management, layouts, launcher, later session persistence).
 
-**System Operations:**
-- ❌ `sudo reboot` or any system restart command
-- ❌ `shutdown`, `poweroff`, `systemctl reboot`
-- ❌ Any operation that restarts the entire server
+The Claude CLI is *invoked as a subprocess*, never embedded as a headless API
+client — the IDE must not burn API tokens on its own.
 
-**Database Operations:**
-- ❌ `pg_resetwal` without verified backups
-- ❌ `DROP DATABASE` without explicit permission
-- ❌ Direct deletion of database files
-- ❌ `TRUNCATE` on production tables
+Work is tracked on the GitHub Project board:
+https://github.com/users/bmbell23/projects/8/views/1 — use `gh` to read/write it.
 
-**Container Operations:**
-- ❌ `docker-compose down` on production
-- ❌ Stopping all containers at once
-- ❌ `docker system prune -a` without permission
-- ❌ Deleting volumes without backups
+## Architecture (v0.1)
 
-### ALWAYS DO THIS INSTEAD
+- `src/main.rs` — the event loop. Spawns a child in a PTY (`portable-pty`),
+  parses its output with a vt100 emulator (`vt100`), renders the screen with
+  `crossterm`, and forwards raw stdin. `Ctrl-a` is the command prefix.
+- Producer threads funnel `Msg`s (child output, user input, resize, quit) into a
+  single-threaded event loop over an `mpsc` channel. Keep that single-consumer
+  model — it's what makes the render path race-free.
 
-**NOTE: This server has Docker permission issues. `docker restart` and `docker-compose restart` WILL FAIL with "permission denied".**
+## Conventions
 
-**For Service Issues:**
+- `cargo fmt` + `cargo clippy` before committing; keep the build warning-clean.
+- Prefer `anyhow::Result` with `.context(...)` at call sites for error trails.
+- Terminal state (raw mode, alt screen) must always be restored on every exit
+  path — the `TerminalGuard` Drop is the single source of truth; don't bypass it.
+- Match surrounding comment density and naming. Explain *why*, not *what*.
+
+## Build / run / test
+
 ```bash
-# 1. Diagnose first
-docker logs <container>
-df -h
-free -h
-
-# 2. Restart individual service (WORKING METHOD)
-PID=$(docker inspect <container> --format '{{.State.Pid}}')
-kill $PID
-cd /path/to/project
-docker-compose up -d
+cargo build            # debug
+cargo run              # launch the IDE (needs a real TTY)
+cargo build --release  # optimized `forge` binary
+cargo clippy --all-targets
 ```
 
-**For Database Issues:**
-```bash
-# 1. Check logs
-docker logs <db_container>
+Note: the TUI needs a real terminal — it can't be driven from a non-TTY harness.
+Verify interactive changes by running `cargo run` in a real terminal.
 
-# 2. Restart container
-docker restart <db_container>
+## Safety (host machine)
 
-# 3. Restore from backup if needed
-# (with user permission)
-```
-
-**For Disk Space:**
-```bash
-# Clean logs
-find /var/log -name "*.log" -mtime +30 -delete
-
-# Clean docker images
-docker image prune
-
-# NOT: sudo reboot (doesn't help!)
-```
-
-## Why These Rules Exist
-
-On January 7, 2026, an AI agent caused catastrophic data loss by:
-1. Running `sudo reboot` to fix a container issue (actual issue: disk space)
-2. Improper shutdown corrupted PostgreSQL database
-3. Using `pg_resetwal` which wiped all data
-4. 117,909 photos metadata lost (recovered from backup)
-
-**The fix was simple**: Delete log files to free disk space. No reboot needed.
-
-## General Guidelines
-
-- Always ask before destructive operations
-- Diagnose root cause before acting
-- Restart individual services, not systems
-- Verify backups before database operations
-- When in doubt, ask the user
-
+This runs on bbell's homelab server. General rules still apply:
+- Never `sudo reboot` / `shutdown` / `systemctl reboot` to "fix" something —
+  diagnose the real cause first (disk space, a single service).
+- No destructive DB/container ops without explicit permission and a verified backup.
+- When in doubt, ask.

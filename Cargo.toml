@@ -1,0 +1,22 @@
+[package]
+name = "codeforge"
+version = "0.1.0"
+edition = "2021"
+description = "A terminal-native IDE: a single-binary multiplexer that hosts nvim, a shell, and the Claude CLI in managed panes."
+license = "MIT"
+repository = "https://github.com/bmbell23/CodeForge"
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+portable-pty = "0.8"
+vt100 = "0.15"
+signal-hook = "0.3"
+
+[profile.release]
+lto = true
+strip = true
