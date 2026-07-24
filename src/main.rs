@@ -20,6 +20,7 @@
 //! Click a pane to focus it; mouse events pass through to the child (nvim mouse
 //! works). Every other key is forwarded to the focused pane's child unchanged.
 
+mod config;
 mod layout;
 mod pane;
 mod picker;
@@ -42,12 +43,10 @@ use portable_pty::CommandBuilder;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
+use config::{Config, Keys};
 use layout::{Dir, FocusDir, Layout, Rect};
 use pane::Pane;
 use picker::{Picker, PickerAction};
-
-/// The tmux-style prefix. Ctrl-a (0x01) begins a CodeForge command.
-const PREFIX: u8 = 0x01;
 
 /// Messages funneled into the single-threaded event loop from producer threads.
 pub enum Msg {
@@ -81,21 +80,21 @@ pub enum Msg {
     Quit,
 }
 
-/// Spawn the default IDE layout (nvim + shell + claude) in `project_dir`, with
+/// Spawn the configured IDE layout (editor + shell + AI) in `project_dir`, with
 /// pane ids starting at `base`. Returns the panes and the layout tree; the
-/// focused pane is `base` (nvim).
+/// focused pane is `base` (the editor).
 fn spawn_ide(
     project_dir: &Path,
+    cfg: &Config,
     shell: &str,
     base: usize,
     tx: &Sender<Msg>,
 ) -> Result<(Vec<Pane>, Layout)> {
-    let mut nvim = command("nvim", project_dir);
-    nvim.arg(".");
-    nvim.env("NVIM_APPNAME", "codeforge");
+    let (editor, editor_title) = command_line(&cfg.editor, project_dir);
+    let (ai, ai_title) = command_line(&cfg.ai, project_dir);
 
     let panes = vec![
-        Pane::spawn(nvim, "nvim".into(), 1, 1, base, tx.clone())?,
+        Pane::spawn(editor, editor_title, 1, 1, base, tx.clone())?,
         Pane::spawn(
             command(shell, project_dir),
             "shell".into(),
@@ -104,23 +103,16 @@ fn spawn_ide(
             base + 1,
             tx.clone(),
         )?,
-        Pane::spawn(
-            command("claude", project_dir),
-            "claude".into(),
-            1,
-            1,
-            base + 2,
-            tx.clone(),
-        )?,
+        Pane::spawn(ai, ai_title, 1, 1, base + 2, tx.clone())?,
     ];
 
     let layout = Layout::Split {
         dir: Dir::Row,
-        ratio: 0.5,
+        ratio: cfg.editor_ratio,
         a: Box::new(Layout::Leaf(base)),
         b: Box::new(Layout::Split {
             dir: Dir::Col,
-            ratio: 0.55,
+            ratio: cfg.right_ratio,
             a: Box::new(Layout::Leaf(base + 1)),
             b: Box::new(Layout::Leaf(base + 2)),
         }),
@@ -135,6 +127,22 @@ fn command(program: &str, cwd: &Path) -> CommandBuilder {
     c.cwd(cwd);
     c.env("TERM", "xterm-256color");
     c
+}
+
+/// Build a command from a whitespace-separated command line (program + args),
+/// running in `cwd`. Returns the builder and a short title (the program name).
+/// nvim gets NVIM_APPNAME so it loads CodeForge's isolated config.
+fn command_line(cmdline: &str, cwd: &Path) -> (CommandBuilder, String) {
+    let mut parts = cmdline.split_whitespace();
+    let program = parts.next().unwrap_or("bash");
+    let mut c = command(program, cwd);
+    for arg in parts {
+        c.arg(arg);
+    }
+    if program.ends_with("nvim") {
+        c.env("NVIM_APPNAME", "codeforge");
+    }
+    (c, program.rsplit('/').next().unwrap_or(program).to_string())
 }
 
 /// The user's projects root: `$DDN_PROJECTS` if set (see the DDN bashrc), else
@@ -156,13 +164,13 @@ fn projects_root() -> PathBuf {
 }
 
 /// Resolve a CLI project argument: an absolute/relative path, or a bare name
-/// resolved under the projects root.
-fn resolve_arg_dir(arg: &str) -> PathBuf {
+/// resolved under `root`.
+fn resolve_arg_dir(arg: &str, root: &Path) -> PathBuf {
     let p = PathBuf::from(arg);
     if p.is_dir() {
         return p.canonicalize().unwrap_or(p);
     }
-    let under = projects_root().join(arg);
+    let under = root.join(arg);
     if under.is_dir() {
         return under;
     }
@@ -170,7 +178,23 @@ fn resolve_arg_dir(arg: &str) -> PathBuf {
 }
 
 fn main() -> Result<()> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    // Load config before touching the terminal, so a parse warning can print.
+    let (cfg, cfg_warning) = Config::load();
+    if let Some(w) = &cfg_warning {
+        eprintln!("codeforge: {w}");
+    }
+    let prefix = cfg.prefix_byte();
+    let keys = cfg.keys;
+    let shell = cfg
+        .shell
+        .clone()
+        .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string()));
+    let proot = cfg
+        .projects_root
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(projects_root);
+
     let (cols, rows) = terminal::size().context("querying terminal size")?;
 
     let (tx, rx) = mpsc::channel::<Msg>();
@@ -198,19 +222,19 @@ fn main() -> Result<()> {
 
     // Choose the project: a CLI arg, or the startup picker (bare `forge`).
     let project_dir = match std::env::args().nth(1) {
-        Some(arg) => resolve_arg_dir(&arg),
-        None => Picker::new(projects_root())
+        Some(arg) => resolve_arg_dir(&arg, &proot),
+        None => Picker::new(proot.clone())
             .run_blocking(&mut out)?
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
     };
 
     // Producer: raw stdin. Started AFTER the startup picker so they don't both
     // try to read stdin at once.
-    spawn_stdin(tx.clone());
+    spawn_stdin(tx.clone(), prefix, keys);
 
-    // Default IDE layout: nvim (left) + shell and Claude (stacked, right). Real
-    // sizes are set by `relayout`; children reflow via SIGWINCH.
-    let (mut panes, mut layout) = spawn_ide(&project_dir, &shell, 0, &tx)?;
+    // The configured IDE layout (editor + shell + AI). Real sizes are set by
+    // `relayout`; children reflow via SIGWINCH.
+    let (mut panes, mut layout) = spawn_ide(&project_dir, &cfg, &shell, 0, &tx)?;
     let mut focus_id: usize = 0;
     let mut next_id: usize = 3;
     let mut project_dir = project_dir;
@@ -272,7 +296,7 @@ fn main() -> Result<()> {
                                 }
                                 project_dir = dir;
                                 let base = next_id;
-                                let (np, nl) = spawn_ide(&project_dir, &shell, base, &tx)?;
+                                let (np, nl) = spawn_ide(&project_dir, &cfg, &shell, base, &tx)?;
                                 panes = np;
                                 layout = nl;
                                 focus_id = base;
@@ -427,7 +451,7 @@ fn main() -> Result<()> {
                     picker = if picker.is_some() {
                         None
                     } else {
-                        Some(Picker::new(projects_root()))
+                        Some(Picker::new(proot.clone()))
                     };
                     dirty = true;
                     needs_clear = true;
@@ -550,7 +574,7 @@ enum InState {
 /// (press/drag) or `... m` (release). We pull them out so clicks can focus a
 /// pane; the main loop re-forwards them, remapped, into the target child. Non-
 /// mouse escape sequences (arrow keys, etc.) pass straight through.
-fn spawn_stdin(tx: Sender<Msg>) {
+fn spawn_stdin(tx: Sender<Msg>, prefix: u8, keys: Keys) {
     thread::spawn(move || {
         let mut stdin = io::stdin();
         let mut buf = [0u8; 4096];
@@ -574,30 +598,41 @@ fn spawn_stdin(tx: Sender<Msg>) {
             for &b in &buf[..n] {
                 match state {
                     InState::Normal => match b {
-                        PREFIX => state = InState::Prefix,
+                        _ if b == prefix => state = InState::Prefix,
                         0x1b => state = InState::Esc,
                         _ => passthrough.push(b),
                     },
                     InState::Prefix => {
                         state = InState::Normal;
-                        let cmd = match b {
-                            b'q' => Some(Msg::Quit),
-                            b'|' => Some(Msg::Split(Dir::Row)),
-                            b'-' => Some(Msg::Split(Dir::Col)),
-                            b'o' => Some(Msg::FocusNext),
-                            b'h' => Some(Msg::Focus(FocusDir::Left)),
-                            b'j' => Some(Msg::Focus(FocusDir::Down)),
-                            b'k' => Some(Msg::Focus(FocusDir::Up)),
-                            b'l' => Some(Msg::Focus(FocusDir::Right)),
-                            b'x' => Some(Msg::ClosePane),
-                            b'?' => Some(Msg::ToggleHelp),
-                            b'p' => Some(Msg::OpenPicker),
-                            // Ctrl-a a -> literal Ctrl-a to the child.
-                            b'a' | PREFIX => {
-                                passthrough.push(PREFIX);
-                                None
-                            }
-                            _ => None,
+                        let c = b as char;
+                        let cmd = if c == keys.quit {
+                            Some(Msg::Quit)
+                        } else if c == keys.split_row {
+                            Some(Msg::Split(Dir::Row))
+                        } else if c == keys.split_col {
+                            Some(Msg::Split(Dir::Col))
+                        } else if c == keys.cycle {
+                            Some(Msg::FocusNext)
+                        } else if c == keys.focus_left {
+                            Some(Msg::Focus(FocusDir::Left))
+                        } else if c == keys.focus_down {
+                            Some(Msg::Focus(FocusDir::Down))
+                        } else if c == keys.focus_up {
+                            Some(Msg::Focus(FocusDir::Up))
+                        } else if c == keys.focus_right {
+                            Some(Msg::Focus(FocusDir::Right))
+                        } else if c == keys.close {
+                            Some(Msg::ClosePane)
+                        } else if c == keys.help {
+                            Some(Msg::ToggleHelp)
+                        } else if c == keys.picker {
+                            Some(Msg::OpenPicker)
+                        } else if b == b'a' || b == prefix {
+                            // prefix a / prefix prefix -> a literal prefix byte.
+                            passthrough.push(prefix);
+                            None
+                        } else {
+                            None
                         };
                         if let Some(m) = cmd {
                             if !flush(&mut passthrough) || tx.send(m).is_err() {
@@ -610,13 +645,13 @@ fn spawn_stdin(tx: Sender<Msg>) {
                         // Not a CSI: forward the ESC and reinterpret this byte.
                         _ => {
                             passthrough.push(0x1b);
-                            match b {
-                                PREFIX => state = InState::Prefix,
-                                0x1b => state = InState::Esc,
-                                _ => {
-                                    passthrough.push(b);
-                                    state = InState::Normal;
-                                }
+                            if b == prefix {
+                                state = InState::Prefix;
+                            } else if b == 0x1b {
+                                state = InState::Esc;
+                            } else {
+                                passthrough.push(b);
+                                state = InState::Normal;
                             }
                         }
                     },

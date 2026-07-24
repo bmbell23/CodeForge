@@ -14,15 +14,18 @@ echo "==> Linking $BIN_DIR/forge"
 mkdir -p "$BIN_DIR"
 ln -sfn "$REPO/target/release/forge" "$BIN_DIR/forge"
 
-echo "==> Installing Neovim config -> $NVIM_CFG"
-if [ -e "$NVIM_CFG" ] && [ ! -L "$NVIM_CFG" ]; then
-  echo "    !! $NVIM_CFG exists and is not a symlink; leaving it untouched." >&2
-  echo "    !! Remove it yourself if you want CodeForge's config there." >&2
-else
-  ln -sfn "$REPO/config/nvim" "$NVIM_CFG"
+echo "==> Installing config -> $NVIM_CFG"
+# The config dir is a real directory: forge writes its own config.toml there,
+# and we symlink just init.lua so editing the repo updates Neovim live.
+if [ -L "$NVIM_CFG" ]; then
+  # Migrate an older whole-dir symlink.
+  rm -f "$NVIM_CFG"
 fi
+mkdir -p "$NVIM_CFG"
+ln -sfn "$REPO/config/nvim/init.lua" "$NVIM_CFG/init.lua"
 
 echo
 echo "Done. Make sure $BIN_DIR is on your PATH, then run: forge"
-echo "First launch installs Neovim plugins automatically (needs network)."
-echo "Recommended tools for full IDE features: ripgrep (rg), fd; LSP via :Mason."
+echo "  - forge config:  $NVIM_CFG/config.toml   (written on first run)"
+echo "  - first launch installs Neovim plugins automatically (needs network)."
+echo "  - recommended: ripgrep (rg), fd; LSP servers via :Mason."

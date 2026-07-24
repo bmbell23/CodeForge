@@ -15,7 +15,7 @@ vim.g.maplocalleader = " "
 -- Sensible baseline.
 local opt = vim.opt
 opt.number = true
-opt.relativenumber = true
+opt.relativenumber = false -- show real (absolute) line numbers on every line
 opt.mouse = "a"
 opt.clipboard = "unnamedplus"
 opt.ignorecase = true
