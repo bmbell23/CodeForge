@@ -6,9 +6,26 @@ CodeForge hosts your editor (Neovim), a shell, and the [Claude CLI](https://gith
 
 > **Why not just tmux?** You can absolutely run `nvim` + `claude` in tmux panes today — that's the current workflow. CodeForge is the opinionated, IDE-shaped version of that: one binary that drops you straight into editor + terminal + AI, with a curated Neovim config. The Claude CLI is *invoked*, not embedded — no headless API tokens are burned by the IDE itself.
 
+## Persistence
+
+CodeForge is a **client/server** app, like tmux. A detached background **server**
+owns your windows, panes, and scrollback; the `forge` you run is a thin **client**.
+Detach with `Ctrl-a d` (or just close the terminal / drop the SSH connection) and
+the session keeps running. Reattach by running `forge` again — everything is where
+you left it. `Ctrl-a q` ends the session for good.
+
+```bash
+forge            # start or attach to your session
+# ... Ctrl-a d to detach, or disconnect ...
+forge            # reattach — same windows, same state
+forge attach     # attach only (error if nothing is running)
+```
+
+The server socket lives at `$XDG_RUNTIME_DIR/codeforge-<user>.sock`.
+
 ## Status
 
-**v0.2 — it's an IDE.** Launching `forge` opens the default layout:
+**v0.3 — persistent.** Launching `forge` opens the default layout:
 
 ```
 ┌────────────────────┬────────────┐
@@ -71,8 +88,9 @@ the first of `~/projects` or `~/work/projects` that exists.
 | `Ctrl-a c`  | New window (pick its project)        |
 | `Ctrl-a n`  | Next window                          |
 | `Ctrl-a 1`–`9` | Jump to window                    |
+| `Ctrl-a d`  | Detach (server keeps running)        |
 | `Ctrl-a ?`  | Toggle keybinding help               |
-| `Ctrl-a q`  | Quit CodeForge                       |
+| `Ctrl-a q`  | Quit CodeForge (ends session)        |
 | `Ctrl-a a`  | Send a literal `Ctrl-a` to the child |
 | **Click a pane** | Focus it (clicks reach nvim too) |
 

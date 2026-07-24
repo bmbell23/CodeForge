@@ -1,11 +1,16 @@
 //! CodeForge — terminal-native IDE.
 //!
-//! Default IDE layout (#4). On start CodeForge opens Neovim (left), a shell and
-//! the Claude CLI (stacked, right) — each a child in its own PTY + vt100 emulator
-//! (`pane.rs`), arranged by a binary split tree (`layout.rs`) and blitted into
-//! bordered rectangles of the real terminal. Input is routed to the focused pane;
-//! its border is highlighted. The editor's IDE features (fuzzy find, grep, LSP)
-//! come from the Neovim config in `config/nvim/`, loaded via NVIM_APPNAME=codeforge.
+//! Client/server. A detached **server** (`forge --server`) owns all state —
+//! windows, panes (each a child in its own PTY + vt100 emulator, `pane.rs`),
+//! layout (`layout.rs`) — and outlives any client, so a disconnect/SSH drop
+//! never loses the session. A thin **client** (`forge`) owns the real terminal:
+//! it forwards keystrokes/resizes over a unix socket (`protocol.rs`) and paints
+//! the bytes the server sends back. Bare `forge` starts a server (picking a
+//! project) then attaches; a second `forge` attaches to the running one.
+//!
+//! Each window is an editor (Neovim, left) + shell + Claude CLI (stacked, right).
+//! The editor's IDE features (fuzzy find, grep, LSP) come from the Neovim config
+//! in `config/nvim/`, loaded via NVIM_APPNAME=codeforge.
 //!
 //! Controls (Ctrl-a is the prefix):
 //!   Ctrl-a |     split the focused pane side by side (new $SHELL)
@@ -16,8 +21,9 @@
 //!   Ctrl-a p     open the project picker (re-home the current window)
 //!   Ctrl-a c     new window (its own editor/shell/AI for another project)
 //!   Ctrl-a n     next window   ·   Ctrl-a 1..9  jump to window
+//!   Ctrl-a d     detach (server keeps running; reattach with `forge`)
 //!   Ctrl-a ?     toggle the keybinding help overlay
-//!   Ctrl-a q     quit CodeForge
+//!   Ctrl-a q     quit CodeForge (ends the session)
 //!   Ctrl-a a     send a literal Ctrl-a to the child
 //! Click a pane to focus it; mouse events pass through to the child (nvim mouse
 //! works). Every other key is forwarded to the focused pane's child unchanged.
@@ -26,13 +32,18 @@ mod config;
 mod layout;
 mod pane;
 mod picker;
+mod protocol;
 
 use std::io::{self, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
@@ -56,8 +67,12 @@ pub enum Msg {
     Output(usize, Vec<u8>),
     /// Bytes typed by the user, already stripped of prefix sequences.
     Input(Vec<u8>),
-    /// The real terminal was resized.
-    Resize,
+    /// A client attached: its write half + terminal size (rows, cols).
+    Attach(UnixStream, u16, u16),
+    /// The client detached (server keeps running).
+    Detach,
+    /// The client's terminal was resized (rows, cols).
+    Resize(u16, u16),
     /// Split the focused pane along `Dir`.
     Split(Dir),
     /// Move focus to the next pane (cycle order).
@@ -223,11 +238,103 @@ fn resolve_arg_dir(arg: &str, root: &Path) -> PathBuf {
 }
 
 fn main() -> Result<()> {
-    // Load config before touching the terminal, so a parse warning can print.
-    let (cfg, cfg_warning) = Config::load();
-    if let Some(w) = &cfg_warning {
+    let args: Vec<String> = std::env::args().collect();
+    let sock = socket_path();
+
+    // Server mode (spawned detached): `forge --server <project>`.
+    if args.get(1).map(|s| s == "--server").unwrap_or(false) {
+        return run_server(&sock, args.get(2).cloned());
+    }
+
+    // A session already running? Attach to it.
+    if UnixStream::connect(&sock).is_ok() {
+        return run_client(&sock);
+    }
+    if args.get(1).map(|s| s == "attach").unwrap_or(false) {
+        eprintln!("codeforge: no session running");
+        return Ok(());
+    }
+
+    // No server yet: pick a project (CLI arg or startup picker), start a detached
+    // server, then attach to it.
+    let (cfg, warn) = Config::load();
+    if let Some(w) = warn {
         eprintln!("codeforge: {w}");
     }
+    let proot = cfg
+        .projects_root
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(projects_root);
+    let project = match args.get(1) {
+        Some(arg) => resolve_arg_dir(arg, &proot),
+        None => choose_project_interactive(&proot)?,
+    };
+
+    spawn_server(&project)?;
+    wait_for_socket(&sock, Duration::from_secs(5))?;
+    run_client(&sock)
+}
+
+/// Unix socket for the per-user server: `$XDG_RUNTIME_DIR/codeforge-<user>.sock`.
+fn socket_path() -> PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+    base.join(format!("codeforge-{user}.sock"))
+}
+
+/// Spawn the server detached from the controlling terminal (via `setsid`) so it
+/// survives the client exiting / the SSH connection dropping.
+fn spawn_server(project: &Path) -> Result<()> {
+    let exe = std::env::current_exe().context("finding own executable")?;
+    Command::new("setsid")
+        .arg(exe)
+        .arg("--server")
+        .arg(project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawning detached server via setsid")?;
+    Ok(())
+}
+
+/// Wait for the server's socket to become connectable.
+fn wait_for_socket(sock: &Path, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        if UnixStream::connect(sock).is_ok() {
+            return Ok(());
+        }
+        if start.elapsed() > timeout {
+            bail!("timed out waiting for the server to start");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Client-side startup project picker (bare `forge`).
+fn choose_project_interactive(proot: &Path) -> Result<PathBuf> {
+    let mut out = io::stdout();
+    enable_raw_mode().context("enabling raw mode")?;
+    queue!(out, EnterAlternateScreen, cursor::Hide)?;
+    out.flush()?;
+    let guard = TerminalGuard;
+    let chosen = Picker::new(proot.to_path_buf()).run_blocking(&mut out)?;
+    drop(guard);
+    Ok(chosen.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))))
+}
+
+/// The persistent server: owns all windows/PTYs, renders to whatever client is
+/// attached, and keeps running across detaches/disconnects.
+fn run_server(sock: &Path, project: Option<String>) -> Result<()> {
+    let _ = std::fs::remove_file(sock); // clear any stale socket
+    let listener = UnixListener::bind(sock).context("binding server socket")?;
+
+    let (cfg, _) = Config::load();
     let prefix = cfg.prefix_byte();
     let keys = cfg.keys;
     let shell = cfg
@@ -239,74 +346,85 @@ fn main() -> Result<()> {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(projects_root);
-
-    let (cols, rows) = terminal::size().context("querying terminal size")?;
+    let project_dir = project
+        .map(|p| resolve_arg_dir(&p, &proot))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
-    // Producer: SIGWINCH -> Resize.
-    let mut signals = Signals::new([SIGWINCH]).context("installing SIGWINCH handler")?;
+    // Accept clients. Each connection gets a reader thread that turns its frames
+    // into messages (input is parsed for prefix commands / mouse).
     {
         let tx = tx.clone();
         thread::spawn(move || {
-            for _ in signals.forever() {
-                if tx.send(Msg::Resize).is_err() {
-                    break;
-                }
+            for conn in listener.incoming() {
+                let stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let tx = tx.clone();
+                thread::spawn(move || {
+                    let mut rd = match stream.try_clone() {
+                        Ok(r) => r,
+                        Err(_) => return,
+                    };
+                    let mut parser = InputParser::new(prefix, keys);
+                    loop {
+                        match protocol::read_frame(&mut rd) {
+                            Ok((protocol::ATTACH, p)) => {
+                                if let (Some((r, c)), Ok(wr)) =
+                                    (protocol::parse_size(&p), stream.try_clone())
+                                {
+                                    if tx.send(Msg::Attach(wr, r, c)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok((protocol::INPUT, p)) => {
+                                let mut msgs = Vec::new();
+                                parser.feed(&p, &mut msgs);
+                                for m in msgs {
+                                    if tx.send(m).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok((protocol::RESIZE, p)) => {
+                                if let Some((r, c)) = protocol::parse_size(&p) {
+                                    if tx.send(Msg::Resize(r, c)).is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            Ok((protocol::DETACH, _)) | Err(_) => {
+                                let _ = tx.send(Msg::Detach);
+                                return;
+                            }
+                            Ok(_) => {}
+                        }
+                    }
+                });
             }
         });
     }
 
-    // Enter the alternate screen in raw mode; restore on any exit path. Done
-    // before the startup picker, which draws to the alternate screen.
-    let mut out = io::stdout();
-    enable_raw_mode().context("enabling raw mode")?;
-    queue!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
-    out.flush()?;
-    let _guard = TerminalGuard;
-
-    // Choose the project: a CLI arg, or the startup picker (bare `forge`).
-    let project_dir = match std::env::args().nth(1) {
-        Some(arg) => resolve_arg_dir(&arg, &proot),
-        None => Picker::new(proot.clone())
-            .run_blocking(&mut out)?
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-    };
-
-    // Producer: raw stdin. Started AFTER the startup picker so they don't both
-    // try to read stdin at once.
-    spawn_stdin(tx.clone(), prefix, keys);
-
-    // Windows: independent editor+shell+AI workspaces. Only `cur` is drawn; the
-    // last terminal row is a status bar, so the layout area is `rows - 1`.
     let mut windows = vec![new_window(project_dir, &cfg, &shell, 0, &tx)?];
     let mut cur = 0usize;
     let mut next_id: usize = 3;
     let mut show_help = false;
     let mut picker: Option<Picker> = None;
-    // Whether a pending picker choice opens a new window vs re-homes the current.
     let mut picker_new_window = false;
+    // (cols, rows) of the attached client; updated on attach/resize.
+    let mut size = (80u16, 24u16);
+    let mut client: Option<UnixStream> = None;
+    let mut framebuf: Vec<u8> = Vec::new();
 
-    let area = rows.saturating_sub(1);
     {
         let w = &mut windows[cur];
-        relayout(&mut w.panes, &w.layout, cols, area)?;
+        relayout(&mut w.panes, &w.layout, size.0, size.1.saturating_sub(1))?;
     }
-    render(
-        &mut out,
-        &windows,
-        cur,
-        cols,
-        rows,
-        true,
-        show_help,
-        picker.as_ref(),
-    )?;
 
     while let Ok(first) = rx.recv() {
-        // Drain everything currently queued and handle it as one batch, so a
-        // single redraw covers a burst of output/commands. Every message is
-        // handled — none is discarded (an eaten Quit would hang the app).
         let mut batch = vec![first];
         while let Ok(m) = rx.try_recv() {
             batch.push(m);
@@ -314,14 +432,10 @@ fn main() -> Result<()> {
 
         let mut dirty = false;
         let mut quit = false;
-        // Geometry changes (resize/split/close/window-switch) can leave stale
-        // cells, so the next paint must clear first. Plain output/focus must not.
         let mut needs_clear = false;
         for msg in batch {
             match msg {
                 Msg::Output(id, bytes) => {
-                    // Route to whichever window owns the pane; only redraw if it
-                    // is the current (visible) window.
                     for (wi, w) in windows.iter_mut().enumerate() {
                         if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
                             p.feed(&bytes);
@@ -334,7 +448,6 @@ fn main() -> Result<()> {
                 }
                 Msg::Input(bytes) => {
                     if let Some(pk) = picker.as_mut() {
-                        // Picker open: keystrokes drive it, not the panes.
                         match pk.feed_bytes(&bytes) {
                             PickerAction::None => {}
                             PickerAction::Cancel => {
@@ -344,7 +457,7 @@ fn main() -> Result<()> {
                             PickerAction::Chosen(dir) => {
                                 picker = None;
                                 needs_clear = true;
-                                let (c, r) = terminal::size()?;
+                                let (c, r) = size;
                                 let area = r.saturating_sub(1);
                                 let base = next_id;
                                 next_id = base + 3;
@@ -352,7 +465,6 @@ fn main() -> Result<()> {
                                     windows.push(new_window(dir, &cfg, &shell, base, &tx)?);
                                     cur = windows.len() - 1;
                                 } else {
-                                    // Re-home the current window in the new dir.
                                     for p in &mut windows[cur].panes {
                                         p.kill();
                                     }
@@ -371,17 +483,32 @@ fn main() -> Result<()> {
                         }
                     }
                 }
-                Msg::Resize => {
-                    let (c, r) = terminal::size()?;
-                    let area = r.saturating_sub(1);
+                Msg::Attach(stream, r, c) => {
+                    size = (c, r);
+                    let area = size.1.saturating_sub(1);
                     for w in &mut windows {
-                        relayout(&mut w.panes, &w.layout, c, area)?;
+                        relayout(&mut w.panes, &w.layout, size.0, area)?;
+                    }
+                    client = Some(stream);
+                    dirty = true;
+                    needs_clear = true;
+                }
+                Msg::Detach => {
+                    if let Some(mut cl) = client.take() {
+                        let _ = protocol::write_frame(&mut cl, protocol::DETACH, &[]);
+                    }
+                }
+                Msg::Resize(r, c) => {
+                    size = (c, r);
+                    let area = size.1.saturating_sub(1);
+                    for w in &mut windows {
+                        relayout(&mut w.panes, &w.layout, size.0, area)?;
                     }
                     dirty = true;
                     needs_clear = true;
                 }
                 Msg::Split(dir) => {
-                    let (c, r) = terminal::size()?;
+                    let (c, r) = size;
                     let area = r.saturating_sub(1);
                     let new_id = next_id;
                     next_id += 1;
@@ -411,7 +538,7 @@ fn main() -> Result<()> {
                     dirty = true;
                 }
                 Msg::Mouse { x, y, cb, press } => {
-                    let (c, r) = terminal::size()?;
+                    let (c, r) = size;
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
                     let mut rects = Vec::new();
@@ -472,7 +599,7 @@ fn main() -> Result<()> {
                     }
                 }
                 Msg::Focus(dir) => {
-                    let (c, r) = terminal::size()?;
+                    let (c, r) = size;
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
                     let mut rects = Vec::new();
@@ -491,7 +618,7 @@ fn main() -> Result<()> {
                     dirty = true;
                 }
                 Msg::ClosePane => {
-                    let (c, r) = terminal::size()?;
+                    let (c, r) = size;
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
                     close_leaf(&mut w.panes, &mut w.layout, w.focus_id);
@@ -501,7 +628,6 @@ fn main() -> Result<()> {
                         }
                         relayout(&mut w.panes, &w.layout, c, area)?;
                     }
-                    // An emptied window is dropped by the reap pass below.
                     dirty = true;
                     needs_clear = true;
                 }
@@ -548,6 +674,9 @@ fn main() -> Result<()> {
         }
 
         if quit {
+            if let Some(mut cl) = client.take() {
+                let _ = protocol::write_frame(&mut cl, protocol::DETACH, &[]);
+            }
             break;
         }
 
@@ -586,6 +715,9 @@ fn main() -> Result<()> {
             }
         }
         if windows.is_empty() {
+            if let Some(mut cl) = client.take() {
+                let _ = protocol::write_frame(&mut cl, protocol::DETACH, &[]);
+            }
             break;
         }
         if cur >= windows.len() {
@@ -593,23 +725,110 @@ fn main() -> Result<()> {
         }
 
         if dirty {
-            let (c, r) = terminal::size()?;
-            render(
-                &mut out,
-                &windows,
-                cur,
-                c,
-                r,
-                needs_clear,
-                show_help,
-                picker.as_ref(),
-            )?;
+            if let Some(cl) = client.as_mut() {
+                framebuf.clear();
+                render(
+                    &mut framebuf,
+                    &windows,
+                    cur,
+                    size.0,
+                    size.1,
+                    needs_clear,
+                    show_help,
+                    picker.as_ref(),
+                )?;
+                if protocol::write_frame(cl, protocol::OUTPUT, &framebuf).is_err() {
+                    client = None;
+                }
+            }
         }
     }
 
     for w in &mut windows {
         for p in &mut w.panes {
             p.kill();
+        }
+    }
+    let _ = std::fs::remove_file(sock);
+    Ok(())
+}
+
+/// The thin client: owns the real terminal, forwards keystrokes and resizes to
+/// the server, and writes whatever the server sends back to stdout.
+fn run_client(sock: &Path) -> Result<()> {
+    let stream = UnixStream::connect(sock).context("connecting to server")?;
+    let (cols, rows) = terminal::size().context("querying terminal size")?;
+
+    let mut out = io::stdout();
+    enable_raw_mode().context("enabling raw mode")?;
+    queue!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
+    out.flush()?;
+    let _guard = TerminalGuard;
+
+    // Shared write half: stdin and SIGWINCH threads both send frames.
+    let write = Arc::new(Mutex::new(stream.try_clone().context("cloning socket")?));
+    {
+        let mut w = write.lock().unwrap();
+        protocol::write_frame(
+            &mut *w,
+            protocol::ATTACH,
+            &protocol::size_payload(rows, cols),
+        )?;
+    }
+
+    // stdin -> server (raw bytes).
+    {
+        let write = write.clone();
+        thread::spawn(move || {
+            let mut stdin = io::stdin();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut w = write.lock().unwrap();
+                        if protocol::write_frame(&mut *w, protocol::INPUT, &buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // SIGWINCH -> resize frame.
+    {
+        let write = write.clone();
+        let mut signals = Signals::new([SIGWINCH]).context("installing SIGWINCH handler")?;
+        thread::spawn(move || {
+            for _ in signals.forever() {
+                if let Ok((c, r)) = terminal::size() {
+                    let mut w = write.lock().unwrap();
+                    if protocol::write_frame(
+                        &mut *w,
+                        protocol::RESIZE,
+                        &protocol::size_payload(r, c),
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // server -> stdout (main thread). Ends on detach or server exit.
+    let mut rd = stream;
+    loop {
+        match protocol::read_frame(&mut rd) {
+            Ok((protocol::OUTPUT, p)) => {
+                out.write_all(&p)?;
+                out.flush()?;
+            }
+            Ok((protocol::DETACH, _)) => break,
+            Ok(_) => {}
+            Err(_) => break,
         }
     }
     Ok(())
@@ -666,131 +885,131 @@ enum InState {
     Mouse,
 }
 
-/// Read raw stdin bytes: intercept `Ctrl-a` prefix commands and SGR mouse
-/// events, and forward everything else to the focused pane unchanged.
+/// Parses the client's raw byte stream into `Msg`s: intercepts prefix commands
+/// and SGR mouse events, and passes everything else through as `Msg::Input`.
 ///
-/// Mouse events (enabled via `EnableMouseCapture`) arrive as `ESC [ < cb;x;y M`
-/// (press/drag) or `... m` (release). We pull them out so clicks can focus a
-/// pane; the main loop re-forwards them, remapped, into the target child. Non-
-/// mouse escape sequences (arrow keys, etc.) pass straight through.
-fn spawn_stdin(tx: Sender<Msg>, prefix: u8, keys: Keys) {
-    thread::spawn(move || {
-        let mut stdin = io::stdin();
-        let mut buf = [0u8; 4096];
-        let mut state = InState::Normal;
-        let mut mouse: Vec<u8> = Vec::new();
-        let mut passthrough: Vec<u8> = Vec::new();
+/// Mouse events arrive as `ESC [ < cb;x;y M` (press/drag) or `... m` (release);
+/// non-mouse escape sequences (arrows, etc.) pass straight through.
+struct InputParser {
+    state: InState,
+    mouse: Vec<u8>,
+    passthrough: Vec<u8>,
+    prefix: u8,
+    keys: Keys,
+}
 
-        // Send any buffered passthrough, preserving order before a command.
-        let flush = |pt: &mut Vec<u8>| -> bool {
-            if pt.is_empty() {
-                return true;
-            }
-            tx.send(Msg::Input(std::mem::take(pt))).is_ok()
-        };
+impl InputParser {
+    fn new(prefix: u8, keys: Keys) -> InputParser {
+        InputParser {
+            state: InState::Normal,
+            mouse: Vec::new(),
+            passthrough: Vec::new(),
+            prefix: prefix.max(1),
+            keys,
+        }
+    }
 
-        loop {
-            let n = match stdin.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => n,
-            };
-            for &b in &buf[..n] {
-                match state {
-                    InState::Normal => match b {
-                        _ if b == prefix => state = InState::Prefix,
-                        0x1b => state = InState::Esc,
-                        _ => passthrough.push(b),
-                    },
-                    InState::Prefix => {
-                        state = InState::Normal;
-                        let c = b as char;
-                        let cmd = if c == keys.quit {
-                            Some(Msg::Quit)
-                        } else if c == keys.split_row {
-                            Some(Msg::Split(Dir::Row))
-                        } else if c == keys.split_col {
-                            Some(Msg::Split(Dir::Col))
-                        } else if c == keys.cycle {
-                            Some(Msg::FocusNext)
-                        } else if c == keys.focus_left {
-                            Some(Msg::Focus(FocusDir::Left))
-                        } else if c == keys.focus_down {
-                            Some(Msg::Focus(FocusDir::Down))
-                        } else if c == keys.focus_up {
-                            Some(Msg::Focus(FocusDir::Up))
-                        } else if c == keys.focus_right {
-                            Some(Msg::Focus(FocusDir::Right))
-                        } else if c == keys.close {
-                            Some(Msg::ClosePane)
-                        } else if c == keys.help {
-                            Some(Msg::ToggleHelp)
-                        } else if c == keys.picker {
-                            Some(Msg::OpenPicker)
-                        } else if c == keys.win_new {
-                            Some(Msg::NewWindow)
-                        } else if c == keys.win_next {
-                            Some(Msg::NextWindow)
-                        } else if b.is_ascii_digit() && b != b'0' {
-                            // prefix 1..9 -> jump to that window.
-                            Some(Msg::SelectWindow((b - b'1') as usize))
-                        } else if b == b'a' || b == prefix {
-                            // prefix a / prefix prefix -> a literal prefix byte.
-                            passthrough.push(prefix);
-                            None
+    /// Flush buffered passthrough as a `Msg::Input` into `out`.
+    fn flush(&mut self, out: &mut Vec<Msg>) {
+        if !self.passthrough.is_empty() {
+            out.push(Msg::Input(std::mem::take(&mut self.passthrough)));
+        }
+    }
+
+    /// Feed a chunk of input bytes, appending resulting messages to `out`.
+    fn feed(&mut self, bytes: &[u8], out: &mut Vec<Msg>) {
+        for &b in bytes {
+            match self.state {
+                InState::Normal => match b {
+                    _ if b == self.prefix => self.state = InState::Prefix,
+                    0x1b => self.state = InState::Esc,
+                    _ => self.passthrough.push(b),
+                },
+                InState::Prefix => {
+                    self.state = InState::Normal;
+                    let k = self.keys;
+                    let c = b as char;
+                    let cmd = if c == k.quit {
+                        Some(Msg::Quit)
+                    } else if c == k.split_row {
+                        Some(Msg::Split(Dir::Row))
+                    } else if c == k.split_col {
+                        Some(Msg::Split(Dir::Col))
+                    } else if c == k.cycle {
+                        Some(Msg::FocusNext)
+                    } else if c == k.focus_left {
+                        Some(Msg::Focus(FocusDir::Left))
+                    } else if c == k.focus_down {
+                        Some(Msg::Focus(FocusDir::Down))
+                    } else if c == k.focus_up {
+                        Some(Msg::Focus(FocusDir::Up))
+                    } else if c == k.focus_right {
+                        Some(Msg::Focus(FocusDir::Right))
+                    } else if c == k.close {
+                        Some(Msg::ClosePane)
+                    } else if c == k.help {
+                        Some(Msg::ToggleHelp)
+                    } else if c == k.picker {
+                        Some(Msg::OpenPicker)
+                    } else if c == k.win_new {
+                        Some(Msg::NewWindow)
+                    } else if c == k.win_next {
+                        Some(Msg::NextWindow)
+                    } else if c == k.detach {
+                        Some(Msg::Detach)
+                    } else if b.is_ascii_digit() && b != b'0' {
+                        Some(Msg::SelectWindow((b - b'1') as usize))
+                    } else if b == b'a' || b == self.prefix {
+                        self.passthrough.push(self.prefix);
+                        None
+                    } else {
+                        None
+                    };
+                    if let Some(m) = cmd {
+                        self.flush(out);
+                        out.push(m);
+                    }
+                }
+                InState::Esc => match b {
+                    b'[' => self.state = InState::Csi,
+                    _ => {
+                        self.passthrough.push(0x1b);
+                        if b == self.prefix {
+                            self.state = InState::Prefix;
+                        } else if b == 0x1b {
+                            self.state = InState::Esc;
                         } else {
-                            None
-                        };
-                        if let Some(m) = cmd {
-                            if !flush(&mut passthrough) || tx.send(m).is_err() {
-                                return;
-                            }
+                            self.passthrough.push(b);
+                            self.state = InState::Normal;
                         }
                     }
-                    InState::Esc => match b {
-                        b'[' => state = InState::Csi,
-                        // Not a CSI: forward the ESC and reinterpret this byte.
-                        _ => {
-                            passthrough.push(0x1b);
-                            if b == prefix {
-                                state = InState::Prefix;
-                            } else if b == 0x1b {
-                                state = InState::Esc;
-                            } else {
-                                passthrough.push(b);
-                                state = InState::Normal;
-                            }
-                        }
-                    },
-                    InState::Csi => {
-                        if b == b'<' {
-                            state = InState::Mouse;
-                            mouse.clear();
-                        } else {
-                            // Ordinary CSI (arrows, etc.): forward ESC [ then b.
-                            passthrough.extend_from_slice(b"\x1b[");
-                            passthrough.push(b);
-                            state = InState::Normal;
-                        }
+                },
+                InState::Csi => {
+                    if b == b'<' {
+                        self.state = InState::Mouse;
+                        self.mouse.clear();
+                    } else {
+                        self.passthrough.extend_from_slice(b"\x1b[");
+                        self.passthrough.push(b);
+                        self.state = InState::Normal;
                     }
-                    InState::Mouse => {
-                        if b == b'M' || b == b'm' {
-                            state = InState::Normal;
-                            if let Some(ev) = parse_mouse(&mouse, b == b'M') {
-                                if !flush(&mut passthrough) || tx.send(ev).is_err() {
-                                    return;
-                                }
-                            }
-                        } else {
-                            mouse.push(b);
+                }
+                InState::Mouse => {
+                    if b == b'M' || b == b'm' {
+                        self.state = InState::Normal;
+                        if let Some(ev) = parse_mouse(&self.mouse, b == b'M') {
+                            self.flush(out);
+                            out.push(ev);
                         }
+                    } else {
+                        self.mouse.push(b);
                     }
                 }
             }
-            if !flush(&mut passthrough) {
-                break;
-            }
         }
-    });
+        // Trailing passthrough (no command pending) goes out too.
+        self.flush(out);
+    }
 }
 
 /// Parse the `cb;x;y` body of an SGR mouse sequence into a `Msg::Mouse`.
@@ -808,7 +1027,7 @@ fn parse_mouse(body: &[u8], press: bool) -> Option<Msg> {
 /// The layout occupies `rows - 1`; the last row is the status bar.
 #[allow(clippy::too_many_arguments)]
 fn render(
-    out: &mut io::Stdout,
+    out: &mut Vec<u8>,
     windows: &[Window],
     cur: usize,
     cols: u16,
@@ -877,7 +1096,7 @@ fn render(
 /// Draw the bottom status bar: window tabs (1:name …) with the current one
 /// highlighted, plus a hint.
 fn draw_status(
-    out: &mut io::Stdout,
+    out: &mut Vec<u8>,
     cols: u16,
     rows: u16,
     windows: &[Window],
@@ -921,7 +1140,7 @@ fn draw_status(
 }
 
 /// Draw a centered overlay listing the CodeForge keybindings.
-fn draw_help(out: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
+fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
     let lines = [
         "  CodeForge — keys (prefix Ctrl-a)  ",
         "",
@@ -934,7 +1153,8 @@ fn draw_help(out: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
         "  Ctrl-a c      new window           ",
         "  Ctrl-a n      next window          ",
         "  Ctrl-a 1..9   jump to window       ",
-        "  Ctrl-a q      quit                 ",
+        "  Ctrl-a d      detach (stays alive) ",
+        "  Ctrl-a q      quit (ends session)  ",
         "  Ctrl-a ?      toggle this help     ",
         "  click / wheel  focus / scroll      ",
         "",
@@ -978,7 +1198,7 @@ fn draw_help(out: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
 }
 
 /// Blit one emulator screen into `inner`, cell by cell, preserving attributes.
-fn blit_pane(out: &mut io::Stdout, screen: &vt100::Screen, inner: Rect) -> Result<()> {
+fn blit_pane(out: &mut Vec<u8>, screen: &vt100::Screen, inner: Rect) -> Result<()> {
     for row in 0..inner.h {
         queue!(out, cursor::MoveTo(inner.x, inner.y + row))?;
         for col in 0..inner.w {
@@ -1020,7 +1240,7 @@ fn blit_pane(out: &mut io::Stdout, screen: &vt100::Screen, inner: Rect) -> Resul
 
 /// Draw a box border around `rect`, with `title` on the top edge. The focused
 /// pane's border is bright; others are dim.
-fn draw_border(out: &mut io::Stdout, rect: &Rect, title: &str, focused: bool) -> Result<()> {
+fn draw_border(out: &mut Vec<u8>, rect: &Rect, title: &str, focused: bool) -> Result<()> {
     if rect.w < 2 || rect.h < 2 {
         return Ok(());
     }

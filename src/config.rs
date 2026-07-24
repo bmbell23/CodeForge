@@ -50,6 +50,8 @@ pub struct Keys {
     pub win_new: char,
     /// Switch to the next window.
     pub win_next: char,
+    /// Detach the client (leaves the server running in the background).
+    pub detach: char,
 }
 
 impl Default for Config {
@@ -83,6 +85,7 @@ impl Default for Keys {
             quit: 'q',
             win_new: 'c',
             win_next: 'n',
+            detach: 'd',
         }
     }
 }
@@ -177,5 +180,6 @@ help = "?"
 quit = "q"
 win_new = "c"    # new window (choose its project)
 win_next = "n"   # switch to next window
+detach = "d"     # detach client; server keeps running (reattach: forge)
 # also: prefix + 1..9 jumps to that window
 "#;

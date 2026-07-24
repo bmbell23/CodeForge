@@ -126,8 +126,10 @@ impl Picker {
     pub fn run_blocking(&mut self, out: &mut io::Stdout) -> Result<Option<PathBuf>> {
         loop {
             let (cols, rows) = terminal::size()?;
-            queue!(out, terminal::Clear(terminal::ClearType::All))?;
-            self.render(out, cols, rows)?;
+            let mut buf = Vec::new();
+            queue!(buf, terminal::Clear(terminal::ClearType::All))?;
+            self.render(&mut buf, cols, rows)?;
+            out.write_all(&buf)?;
             out.flush()?;
             match event::read()? {
                 Event::Key(k) => match k.code {
@@ -152,8 +154,8 @@ impl Picker {
         }
     }
 
-    /// Draw the picker box centered on the screen.
-    pub fn render(&self, out: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
+    /// Draw the picker box centered on the screen into `out`.
+    pub fn render(&self, out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
         let w: u16 = 44.min(cols.saturating_sub(2)).max(12);
         let inner_w = (w - 2) as usize;
         let visible = self.matches.len().min(MAX_ROWS);
@@ -181,7 +183,7 @@ impl Picker {
         )?;
 
         let mut row = y + 1;
-        let line = |out: &mut io::Stdout, ry: u16, text: String| -> Result<()> {
+        let line = |out: &mut Vec<u8>, ry: u16, text: String| -> Result<()> {
             let t: String = text.chars().take(inner_w).collect();
             let pad = inner_w.saturating_sub(t.chars().count());
             queue!(
