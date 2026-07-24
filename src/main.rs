@@ -4,17 +4,17 @@
 //! the Claude CLI (stacked, right) — each a child in its own PTY + vt100 emulator
 //! (`pane.rs`), arranged by a binary split tree (`layout.rs`) and blitted into
 //! bordered rectangles of the real terminal. Input is routed to the focused pane;
-//! its border is highlighted. Directional focus movement is #3; for now `Ctrl-a o`
-//! cycles. The editor's IDE features (fuzzy find, grep, LSP) come from the Neovim
-//! config in `config/nvim/`, loaded via NVIM_APPNAME=codeforge.
+//! its border is highlighted. The editor's IDE features (fuzzy find, grep, LSP)
+//! come from the Neovim config in `config/nvim/`, loaded via NVIM_APPNAME=codeforge.
 //!
 //! Controls (Ctrl-a is the prefix):
-//!   Ctrl-a |   split the focused pane side by side (new $SHELL)
-//!   Ctrl-a -   split the focused pane top/bottom (new $SHELL)
-//!   Ctrl-a o   cycle focus to the next pane        [directional focus is #3]
-//!   Ctrl-a x   close the focused pane
-//!   Ctrl-a q   quit CodeForge
-//!   Ctrl-a a   send a literal Ctrl-a to the child
+//!   Ctrl-a |     split the focused pane side by side (new $SHELL)
+//!   Ctrl-a -     split the focused pane top/bottom (new $SHELL)
+//!   Ctrl-a hjkl  move focus left/down/up/right
+//!   Ctrl-a o     cycle focus to the next pane
+//!   Ctrl-a x     close the focused pane
+//!   Ctrl-a q     quit CodeForge
+//!   Ctrl-a a     send a literal Ctrl-a to the child
 //! Every other key is forwarded to the focused pane's child unchanged.
 
 mod layout;
@@ -36,7 +36,7 @@ use portable_pty::CommandBuilder;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
-use layout::{Dir, Layout, Rect};
+use layout::{Dir, FocusDir, Layout, Rect};
 use pane::Pane;
 
 /// The tmux-style prefix. Ctrl-a (0x01) begins a CodeForge command.
@@ -52,8 +52,10 @@ pub enum Msg {
     Resize,
     /// Split the focused pane along `Dir`.
     Split(Dir),
-    /// Move focus to the next pane.
+    /// Move focus to the next pane (cycle order).
     FocusNext,
+    /// Move focus to the neighbouring pane in a direction.
+    Focus(FocusDir),
     /// Close the focused pane.
     ClosePane,
     /// User asked to quit.
@@ -205,6 +207,23 @@ fn main() -> Result<()> {
                     }
                     dirty = true;
                 }
+                Msg::Focus(dir) => {
+                    let (c, r) = terminal::size()?;
+                    let mut rects = Vec::new();
+                    layout.rects(
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: c,
+                            h: r,
+                        },
+                        &mut rects,
+                    );
+                    if let Some(id) = layout::neighbor(&rects, focus_id, dir) {
+                        focus_id = id;
+                    }
+                    dirty = true;
+                }
                 Msg::ClosePane => {
                     close_leaf(&mut panes, &mut layout, focus_id);
                     match layout.first_leaf() {
@@ -326,6 +345,10 @@ fn spawn_stdin(tx: Sender<Msg>) {
                         b'|' => Some(Msg::Split(Dir::Row)),
                         b'-' => Some(Msg::Split(Dir::Col)),
                         b'o' => Some(Msg::FocusNext),
+                        b'h' => Some(Msg::Focus(FocusDir::Left)),
+                        b'j' => Some(Msg::Focus(FocusDir::Down)),
+                        b'k' => Some(Msg::Focus(FocusDir::Up)),
+                        b'l' => Some(Msg::Focus(FocusDir::Right)),
                         b'x' => Some(Msg::ClosePane),
                         // Ctrl-a a -> literal Ctrl-a to the child.
                         b'a' | PREFIX => {

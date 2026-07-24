@@ -51,6 +51,7 @@ cargo build --release && ./target/release/forge
 |-------------|--------------------------------------|
 | `Ctrl-a \|` | Split focused pane side by side      |
 | `Ctrl-a -`  | Split focused pane top/bottom        |
+| `Ctrl-a h/j/k/l` | Move focus left/down/up/right   |
 | `Ctrl-a o`  | Cycle focus                          |
 | `Ctrl-a x`  | Close focused pane                   |
 | `Ctrl-a q`  | Quit CodeForge                       |
@@ -74,7 +75,6 @@ Every other key goes to the focused pane's process.
 
 ## Roadmap (near-term)
 
-- Directional focus movement (`Ctrl-a` + arrows/hjkl)
 - Config file (TOML) for keybinds and startup layout
 - Diff-based rendering (kill full-screen redraw flicker)
 - Status bar; tabs / multiple projects
