@@ -13,7 +13,9 @@
 //!   Ctrl-a hjkl  move focus left/down/up/right
 //!   Ctrl-a o     cycle focus to the next pane
 //!   Ctrl-a x     close the focused pane
-//!   Ctrl-a p     open the project picker (switch project live)
+//!   Ctrl-a p     open the project picker (re-home the current window)
+//!   Ctrl-a c     new window (its own editor/shell/AI for another project)
+//!   Ctrl-a n     next window   ·   Ctrl-a 1..9  jump to window
 //!   Ctrl-a ?     toggle the keybinding help overlay
 //!   Ctrl-a q     quit CodeForge
 //!   Ctrl-a a     send a literal Ctrl-a to the child
@@ -74,10 +76,53 @@ pub enum Msg {
     ClosePane,
     /// Toggle the keybinding help overlay.
     ToggleHelp,
-    /// Toggle the project picker.
+    /// Toggle the project picker (re-homes the current window).
     OpenPicker,
+    /// Open the picker to create a new window.
+    NewWindow,
+    /// Switch to the next window.
+    NextWindow,
+    /// Switch to window `n` (0-based).
+    SelectWindow(usize),
     /// User asked to quit.
     Quit,
+}
+
+/// One workspace: an editor + shell + AI layout for a single directory. The app
+/// holds a list of these (tabs / "windows"); only the current one is drawn.
+struct Window {
+    panes: Vec<Pane>,
+    layout: Layout,
+    focus_id: usize,
+    dir: PathBuf,
+    title: String,
+}
+
+/// The last path component, for the window's status-bar label.
+fn dir_title(dir: &Path) -> String {
+    dir.file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("~")
+        .to_string()
+}
+
+/// Build a new window: the configured IDE layout in `dir`, ids from `base`.
+fn new_window(
+    dir: PathBuf,
+    cfg: &Config,
+    shell: &str,
+    base: usize,
+    tx: &Sender<Msg>,
+) -> Result<Window> {
+    let (panes, layout) = spawn_ide(&dir, cfg, shell, base, tx)?;
+    let title = dir_title(&dir);
+    Ok(Window {
+        panes,
+        layout,
+        focus_id: base,
+        dir,
+        title,
+    })
 }
 
 /// Spawn the configured IDE layout (editor + shell + AI) in `project_dir`, with
@@ -232,21 +277,25 @@ fn main() -> Result<()> {
     // try to read stdin at once.
     spawn_stdin(tx.clone(), prefix, keys);
 
-    // The configured IDE layout (editor + shell + AI). Real sizes are set by
-    // `relayout`; children reflow via SIGWINCH.
-    let (mut panes, mut layout) = spawn_ide(&project_dir, &cfg, &shell, 0, &tx)?;
-    let mut focus_id: usize = 0;
+    // Windows: independent editor+shell+AI workspaces. Only `cur` is drawn; the
+    // last terminal row is a status bar, so the layout area is `rows - 1`.
+    let mut windows = vec![new_window(project_dir, &cfg, &shell, 0, &tx)?];
+    let mut cur = 0usize;
     let mut next_id: usize = 3;
-    let mut project_dir = project_dir;
     let mut show_help = false;
     let mut picker: Option<Picker> = None;
+    // Whether a pending picker choice opens a new window vs re-homes the current.
+    let mut picker_new_window = false;
 
-    relayout(&mut panes, &layout, cols, rows)?;
+    let area = rows.saturating_sub(1);
+    {
+        let w = &mut windows[cur];
+        relayout(&mut w.panes, &w.layout, cols, area)?;
+    }
     render(
         &mut out,
-        &panes,
-        &layout,
-        focus_id,
+        &windows,
+        cur,
         cols,
         rows,
         true,
@@ -257,8 +306,7 @@ fn main() -> Result<()> {
     while let Ok(first) = rx.recv() {
         // Drain everything currently queued and handle it as one batch, so a
         // single redraw covers a burst of output/commands. Every message is
-        // handled — none is discarded — which is why we collect rather than
-        // pattern-match the drain (an eaten Quit would hang the app).
+        // handled — none is discarded (an eaten Quit would hang the app).
         let mut batch = vec![first];
         while let Ok(m) = rx.try_recv() {
             batch.push(m);
@@ -266,21 +314,27 @@ fn main() -> Result<()> {
 
         let mut dirty = false;
         let mut quit = false;
-        // A geometry change (resize/split/close) can leave stale cells, so the
-        // next paint must clear first. Plain output/focus changes must not — that
-        // full-screen clear is what caused flicker on every keystroke.
+        // Geometry changes (resize/split/close/window-switch) can leave stale
+        // cells, so the next paint must clear first. Plain output/focus must not.
         let mut needs_clear = false;
         for msg in batch {
             match msg {
                 Msg::Output(id, bytes) => {
-                    if let Some(p) = pane_by_id(&mut panes, id) {
-                        p.feed(&bytes);
+                    // Route to whichever window owns the pane; only redraw if it
+                    // is the current (visible) window.
+                    for (wi, w) in windows.iter_mut().enumerate() {
+                        if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
+                            p.feed(&bytes);
+                            if wi == cur {
+                                dirty = true;
+                            }
+                            break;
+                        }
                     }
-                    dirty = true;
                 }
                 Msg::Input(bytes) => {
                     if let Some(pk) = picker.as_mut() {
-                        // Picker is open: keystrokes drive it, not the panes.
+                        // Picker open: keystrokes drive it, not the panes.
                         match pk.feed_bytes(&bytes) {
                             PickerAction::None => {}
                             PickerAction::Cancel => {
@@ -290,69 +344,83 @@ fn main() -> Result<()> {
                             PickerAction::Chosen(dir) => {
                                 picker = None;
                                 needs_clear = true;
-                                // Tear down and relaunch the IDE in the new dir.
-                                for p in &mut panes {
-                                    p.kill();
-                                }
-                                project_dir = dir;
-                                let base = next_id;
-                                let (np, nl) = spawn_ide(&project_dir, &cfg, &shell, base, &tx)?;
-                                panes = np;
-                                layout = nl;
-                                focus_id = base;
-                                next_id = base + 3;
                                 let (c, r) = terminal::size()?;
-                                relayout(&mut panes, &layout, c, r)?;
+                                let area = r.saturating_sub(1);
+                                let base = next_id;
+                                next_id = base + 3;
+                                if picker_new_window {
+                                    windows.push(new_window(dir, &cfg, &shell, base, &tx)?);
+                                    cur = windows.len() - 1;
+                                } else {
+                                    // Re-home the current window in the new dir.
+                                    for p in &mut windows[cur].panes {
+                                        p.kill();
+                                    }
+                                    windows[cur] = new_window(dir, &cfg, &shell, base, &tx)?;
+                                }
+                                let w = &mut windows[cur];
+                                relayout(&mut w.panes, &w.layout, c, area)?;
                             }
                         }
                         dirty = true;
-                    } else if let Some(p) = pane_by_id(&mut panes, focus_id) {
-                        p.write_input(&bytes)?;
-                        // Typing snaps the view back to the live bottom.
-                        p.scroll_to_bottom();
+                    } else {
+                        let w = &mut windows[cur];
+                        if let Some(p) = w.panes.iter_mut().find(|p| p.id == w.focus_id) {
+                            p.write_input(&bytes)?;
+                            p.scroll_to_bottom();
+                        }
                     }
                 }
                 Msg::Resize => {
                     let (c, r) = terminal::size()?;
-                    relayout(&mut panes, &layout, c, r)?;
+                    let area = r.saturating_sub(1);
+                    for w in &mut windows {
+                        relayout(&mut w.panes, &w.layout, c, area)?;
+                    }
                     dirty = true;
                     needs_clear = true;
                 }
                 Msg::Split(dir) => {
                     let (c, r) = terminal::size()?;
+                    let area = r.saturating_sub(1);
                     let new_id = next_id;
                     next_id += 1;
-                    panes.push(Pane::spawn(
-                        command(&shell, &project_dir),
+                    let w = &mut windows[cur];
+                    let pane = Pane::spawn(
+                        command(&shell, &w.dir),
                         "shell".into(),
                         1,
                         1,
                         new_id,
                         tx.clone(),
-                    )?);
-                    layout.split(focus_id, new_id, dir);
-                    focus_id = new_id;
-                    relayout(&mut panes, &layout, c, r)?;
+                    )?;
+                    w.panes.push(pane);
+                    w.layout.split(w.focus_id, new_id, dir);
+                    w.focus_id = new_id;
+                    relayout(&mut w.panes, &w.layout, c, area)?;
                     dirty = true;
                     needs_clear = true;
                 }
                 Msg::FocusNext => {
+                    let w = &mut windows[cur];
                     let mut ls = Vec::new();
-                    layout.leaves(&mut ls);
-                    if let Some(pos) = ls.iter().position(|&x| x == focus_id) {
-                        focus_id = ls[(pos + 1) % ls.len()];
+                    w.layout.leaves(&mut ls);
+                    if let Some(pos) = ls.iter().position(|&x| x == w.focus_id) {
+                        w.focus_id = ls[(pos + 1) % ls.len()];
                     }
                     dirty = true;
                 }
                 Msg::Mouse { x, y, cb, press } => {
                     let (c, r) = terminal::size()?;
+                    let area = r.saturating_sub(1);
+                    let w = &mut windows[cur];
                     let mut rects = Vec::new();
-                    layout.rects(
+                    w.layout.rects(
                         Rect {
                             x: 0,
                             y: 0,
                             w: c,
-                            h: r,
+                            h: area,
                         },
                         &mut rects,
                     );
@@ -364,20 +432,17 @@ fn main() -> Result<()> {
                         })
                         .copied();
                     if let Some((id, rect)) = hit {
-                        // SGR wheel buttons: 64 = up, 65 = down.
                         let is_wheel = cb == 64 || cb == 65;
-                        // A real button press (not a wheel) focuses the pane.
-                        if press && !is_wheel && focus_id != id {
-                            focus_id = id;
+                        if press && !is_wheel && w.focus_id != id {
+                            w.focus_id = id;
                             dirty = true;
                         }
-                        let wants_mouse = panes
+                        let wants_mouse = w
+                            .panes
                             .iter()
                             .find(|p| p.id == id)
                             .is_some_and(|p| p.wants_mouse());
                         if wants_mouse {
-                            // Forward the event, remapped to the pane's content
-                            // origin, so the child (nvim, claude) handles it.
                             if let Some(inner) = rect.inner() {
                                 if px >= inner.x
                                     && px < inner.x + inner.w
@@ -393,15 +458,13 @@ fn main() -> Result<()> {
                                         ly,
                                         if press { 'M' } else { 'm' }
                                     );
-                                    if let Some(p) = pane_by_id(&mut panes, id) {
+                                    if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
                                         p.write_input(seq.as_bytes())?;
                                     }
                                 }
                             }
                         } else if is_wheel {
-                            // The child doesn't handle the mouse (a shell): scroll
-                            // our own scrollback buffer instead.
-                            if let Some(p) = pane_by_id(&mut panes, id) {
+                            if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
                                 p.scroll(if cb == 64 { 3 } else { -3 });
                             }
                             dirty = true;
@@ -410,51 +473,72 @@ fn main() -> Result<()> {
                 }
                 Msg::Focus(dir) => {
                     let (c, r) = terminal::size()?;
+                    let area = r.saturating_sub(1);
+                    let w = &mut windows[cur];
                     let mut rects = Vec::new();
-                    layout.rects(
+                    w.layout.rects(
                         Rect {
                             x: 0,
                             y: 0,
                             w: c,
-                            h: r,
+                            h: area,
                         },
                         &mut rects,
                     );
-                    if let Some(id) = layout::neighbor(&rects, focus_id, dir) {
-                        focus_id = id;
+                    if let Some(id) = layout::neighbor(&rects, w.focus_id, dir) {
+                        w.focus_id = id;
                     }
                     dirty = true;
                 }
                 Msg::ClosePane => {
-                    close_leaf(&mut panes, &mut layout, focus_id);
-                    match layout.first_leaf() {
-                        Some(id) if !panes.is_empty() => {
-                            focus_id = id;
-                            let (c, r) = terminal::size()?;
-                            relayout(&mut panes, &layout, c, r)?;
-                            dirty = true;
-                            needs_clear = true;
+                    let (c, r) = terminal::size()?;
+                    let area = r.saturating_sub(1);
+                    let w = &mut windows[cur];
+                    close_leaf(&mut w.panes, &mut w.layout, w.focus_id);
+                    if !w.panes.is_empty() {
+                        if let Some(id) = w.layout.first_leaf() {
+                            w.focus_id = id;
                         }
-                        _ => {
-                            quit = true;
-                            break;
-                        }
+                        relayout(&mut w.panes, &w.layout, c, area)?;
                     }
+                    // An emptied window is dropped by the reap pass below.
+                    dirty = true;
+                    needs_clear = true;
                 }
                 Msg::ToggleHelp => {
                     show_help = !show_help;
                     dirty = true;
-                    // Clear so the overlay's box is fully removed when hidden.
                     needs_clear = true;
                 }
                 Msg::OpenPicker => {
                     picker = if picker.is_some() {
                         None
                     } else {
+                        picker_new_window = false;
                         Some(Picker::new(proot.clone()))
                     };
                     dirty = true;
                     needs_clear = true;
+                }
+                Msg::NewWindow => {
+                    picker = Some(Picker::new(proot.clone()));
+                    picker_new_window = true;
+                    dirty = true;
+                    needs_clear = true;
+                }
+                Msg::NextWindow => {
+                    if !windows.is_empty() {
+                        cur = (cur + 1) % windows.len();
+                        dirty = true;
+                        needs_clear = true;
+                    }
+                }
+                Msg::SelectWindow(n) => {
+                    if n < windows.len() && n != cur {
+                        cur = n;
+                        dirty = true;
+                        needs_clear = true;
+                    }
                 }
                 Msg::Quit => {
                     quit = true;
@@ -467,35 +551,53 @@ fn main() -> Result<()> {
             break;
         }
 
-        // Reap panes whose child exited on its own.
-        let mut dead = Vec::new();
-        for p in panes.iter_mut() {
-            if p.is_dead() {
-                dead.push(p.id);
-            }
-        }
-        for id in dead {
-            close_leaf(&mut panes, &mut layout, id);
-            dirty = true;
-            needs_clear = true;
-        }
-        match layout.first_leaf() {
-            Some(_) if panes.is_empty() => break,
-            None => break,
-            Some(id) => {
-                if !leaf_exists(&layout, focus_id) {
-                    focus_id = id;
+        // Reap dead panes across all windows; drop any window left empty.
+        let mut wi = 0;
+        while wi < windows.len() {
+            let mut dead = Vec::new();
+            for p in windows[wi].panes.iter_mut() {
+                if p.is_dead() {
+                    dead.push(p.id);
                 }
             }
+            for id in dead {
+                let w = &mut windows[wi];
+                close_leaf(&mut w.panes, &mut w.layout, id);
+                if wi == cur {
+                    needs_clear = true;
+                }
+                dirty = true;
+            }
+            if windows[wi].panes.is_empty() {
+                windows.remove(wi);
+                if cur > wi || (cur == wi && cur > 0) {
+                    cur -= 1;
+                }
+                needs_clear = true;
+                dirty = true;
+            } else {
+                let w = &mut windows[wi];
+                if !leaf_exists(&w.layout, w.focus_id) {
+                    if let Some(f) = w.layout.first_leaf() {
+                        w.focus_id = f;
+                    }
+                }
+                wi += 1;
+            }
+        }
+        if windows.is_empty() {
+            break;
+        }
+        if cur >= windows.len() {
+            cur = windows.len() - 1;
         }
 
         if dirty {
             let (c, r) = terminal::size()?;
             render(
                 &mut out,
-                &panes,
-                &layout,
-                focus_id,
+                &windows,
+                cur,
                 c,
                 r,
                 needs_clear,
@@ -505,15 +607,12 @@ fn main() -> Result<()> {
         }
     }
 
-    for p in &mut panes {
-        p.kill();
+    for w in &mut windows {
+        for p in &mut w.panes {
+            p.kill();
+        }
     }
     Ok(())
-}
-
-/// Resolve a stable pane id to its current slot.
-fn pane_by_id(panes: &mut [Pane], id: usize) -> Option<&mut Pane> {
-    panes.iter_mut().find(|p| p.id == id)
 }
 
 /// Does `id` still appear as a leaf in the tree?
@@ -627,6 +726,13 @@ fn spawn_stdin(tx: Sender<Msg>, prefix: u8, keys: Keys) {
                             Some(Msg::ToggleHelp)
                         } else if c == keys.picker {
                             Some(Msg::OpenPicker)
+                        } else if c == keys.win_new {
+                            Some(Msg::NewWindow)
+                        } else if c == keys.win_next {
+                            Some(Msg::NextWindow)
+                        } else if b.is_ascii_digit() && b != b'0' {
+                            // prefix 1..9 -> jump to that window.
+                            Some(Msg::SelectWindow((b - b'1') as usize))
                         } else if b == b'a' || b == prefix {
                             // prefix a / prefix prefix -> a literal prefix byte.
                             passthrough.push(prefix);
@@ -697,50 +803,55 @@ fn parse_mouse(body: &[u8], press: bool) -> Option<Msg> {
     Some(Msg::Mouse { x, y, cb, press })
 }
 
-/// Paint every pane into its rectangle, then place the hardware cursor in the
-/// focused pane. Rendering is per-cell so panes can be tiled.
+/// Paint the current window's panes, the status bar, and any overlay, then
+/// place the hardware cursor in the focused pane. Per-cell so panes can tile.
+/// The layout occupies `rows - 1`; the last row is the status bar.
 #[allow(clippy::too_many_arguments)]
 fn render(
     out: &mut io::Stdout,
-    panes: &[Pane],
-    layout: &Layout,
-    focus_id: usize,
+    windows: &[Window],
+    cur: usize,
     cols: u16,
     rows: u16,
     clear: bool,
     show_help: bool,
     picker: Option<&Picker>,
 ) -> Result<()> {
+    let w = &windows[cur];
+    let area = rows.saturating_sub(1);
     let mut rects = Vec::new();
-    layout.rects(
+    w.layout.rects(
         Rect {
             x: 0,
             y: 0,
             w: cols,
-            h: rows,
+            h: area,
         },
         &mut rects,
     );
-    // The panes tile the whole screen and we repaint every cell, so a clear is
-    // only needed when the geometry shrank (resize/split/close) and could leave
-    // stale cells. Clearing on every keystroke is what caused the flicker.
+
+    // The panes tile the whole area and we repaint every cell, so a clear is
+    // only needed when the geometry shrank (and could leave stale cells).
     queue!(out, cursor::Hide, ResetColor)?;
     if clear {
         queue!(out, terminal::Clear(terminal::ClearType::All))?;
     }
 
     for (id, rect) in &rects {
-        if let Some(p) = panes.iter().find(|p| p.id == *id) {
-            draw_border(out, rect, &p.title, *id == focus_id)?;
+        if let Some(p) = w.panes.iter().find(|p| p.id == *id) {
+            draw_border(out, rect, &p.title, *id == w.focus_id)?;
             if let Some(inner) = rect.inner() {
                 blit_pane(out, p.screen(), inner)?;
             }
         }
     }
 
+    draw_status(out, cols, rows, windows, cur)?;
+
     // Position the real cursor inside the focused pane.
-    if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == focus_id) {
-        if let (Some(inner), Some(p)) = (rect.inner(), panes.iter().find(|p| p.id == focus_id)) {
+    if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == w.focus_id) {
+        if let (Some(inner), Some(p)) = (rect.inner(), w.panes.iter().find(|p| p.id == w.focus_id))
+        {
             let screen = p.screen();
             let (crow, ccol) = screen.cursor_position();
             if !screen.hide_cursor() && crow < inner.h && ccol < inner.w {
@@ -763,6 +874,52 @@ fn render(
     Ok(())
 }
 
+/// Draw the bottom status bar: window tabs (1:name …) with the current one
+/// highlighted, plus a hint.
+fn draw_status(
+    out: &mut io::Stdout,
+    cols: u16,
+    rows: u16,
+    windows: &[Window],
+    cur: usize,
+) -> Result<()> {
+    let y = rows.saturating_sub(1);
+    // Fill the row so old content is covered.
+    queue!(
+        out,
+        cursor::MoveTo(0, y),
+        SetBackgroundColor(Color::DarkGrey),
+        SetForegroundColor(Color::White),
+        Print(" ".repeat(cols as usize)),
+        cursor::MoveTo(0, y),
+        Print(" forge "),
+    )?;
+    for (i, w) in windows.iter().enumerate() {
+        if i == cur {
+            queue!(
+                out,
+                SetBackgroundColor(Color::Cyan),
+                SetForegroundColor(Color::Black)
+            )?;
+        } else {
+            queue!(
+                out,
+                SetBackgroundColor(Color::DarkGrey),
+                SetForegroundColor(Color::White)
+            )?;
+        }
+        queue!(out, Print(format!(" {}:{} ", i + 1, w.title)))?;
+    }
+    queue!(
+        out,
+        SetBackgroundColor(Color::DarkGrey),
+        SetForegroundColor(Color::Grey),
+        Print("  ^a c:new  ^a n:next  ^a ?:help"),
+        ResetColor,
+    )?;
+    Ok(())
+}
+
 /// Draw a centered overlay listing the CodeForge keybindings.
 fn draw_help(out: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
     let lines = [
@@ -774,11 +931,14 @@ fn draw_help(out: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
         "  Ctrl-a o      cycle focus          ",
         "  Ctrl-a x      close pane           ",
         "  Ctrl-a p      switch project       ",
+        "  Ctrl-a c      new window           ",
+        "  Ctrl-a n      next window          ",
+        "  Ctrl-a 1..9   jump to window       ",
         "  Ctrl-a q      quit                 ",
         "  Ctrl-a ?      toggle this help     ",
         "  click / wheel  focus / scroll      ",
         "",
-        "  (editable keybinds: config, soon)  ",
+        "  edit ~/.config/codeforge/config.toml",
     ];
     let w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 2;
     let h = lines.len() as u16 + 2;

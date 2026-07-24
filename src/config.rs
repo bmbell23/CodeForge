@@ -46,6 +46,10 @@ pub struct Keys {
     pub picker: char,
     pub help: char,
     pub quit: char,
+    /// New window (opens the picker to choose its project).
+    pub win_new: char,
+    /// Switch to the next window.
+    pub win_next: char,
 }
 
 impl Default for Config {
@@ -77,6 +81,8 @@ impl Default for Keys {
             picker: 'p',
             help: '?',
             quit: 'q',
+            win_new: 'c',
+            win_next: 'n',
         }
     }
 }
@@ -169,4 +175,7 @@ close = "x"
 picker = "p"
 help = "?"
 quit = "q"
+win_new = "c"    # new window (choose its project)
+win_next = "n"   # switch to next window
+# also: prefix + 1..9 jumps to that window
 "#;

@@ -46,7 +46,12 @@ forge ~/src/foo       # open a project by path
 
 Bare `forge` shows a **project picker** (type to filter, ↑↓ to select, Enter to
 open, Ctrl-c to cancel). All three panes (nvim, shell, claude) start in the
-chosen directory. Switch projects live any time with **`Ctrl-a p`**.
+chosen directory.
+
+**Windows.** Each window is an independent editor/shell/AI workspace for one
+project or worktree. `Ctrl-a c` opens a new window (pick its project), `Ctrl-a n`
+cycles, `Ctrl-a 1`–`9` jump. The bottom status bar lists them. `Ctrl-a p`
+re-homes the *current* window in a different project.
 
 The **projects root** is `$DDN_PROJECTS` if set (from the DDN bashrc), otherwise
 the first of `~/projects` or `~/work/projects` that exists.
@@ -62,7 +67,10 @@ the first of `~/projects` or `~/work/projects` that exists.
 | `Ctrl-a h/j/k/l` | Move focus left/down/up/right   |
 | `Ctrl-a o`  | Cycle focus                          |
 | `Ctrl-a x`  | Close focused pane                   |
-| `Ctrl-a p`  | Switch project (picker)              |
+| `Ctrl-a p`  | Switch project (re-home window)      |
+| `Ctrl-a c`  | New window (pick its project)        |
+| `Ctrl-a n`  | Next window                          |
+| `Ctrl-a 1`–`9` | Jump to window                    |
 | `Ctrl-a ?`  | Toggle keybinding help               |
 | `Ctrl-a q`  | Quit CodeForge                       |
 | `Ctrl-a a`  | Send a literal `Ctrl-a` to the child |
