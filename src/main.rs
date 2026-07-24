@@ -13,6 +13,8 @@
 //!   Ctrl-a hjkl  move focus left/down/up/right
 //!   Ctrl-a o     cycle focus to the next pane
 //!   Ctrl-a x     close the focused pane
+//!   Ctrl-a p     open the project picker (switch project live)
+//!   Ctrl-a ?     toggle the keybinding help overlay
 //!   Ctrl-a q     quit CodeForge
 //!   Ctrl-a a     send a literal Ctrl-a to the child
 //! Click a pane to focus it; mouse events pass through to the child (nvim mouse
@@ -20,6 +22,7 @@
 
 mod layout;
 mod pane;
+mod picker;
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -41,6 +44,7 @@ use signal_hook::iterator::Signals;
 
 use layout::{Dir, FocusDir, Layout, Rect};
 use pane::Pane;
+use picker::{Picker, PickerAction};
 
 /// The tmux-style prefix. Ctrl-a (0x01) begins a CodeForge command.
 const PREFIX: u8 = 0x01;
@@ -71,8 +75,57 @@ pub enum Msg {
     ClosePane,
     /// Toggle the keybinding help overlay.
     ToggleHelp,
+    /// Toggle the project picker.
+    OpenPicker,
     /// User asked to quit.
     Quit,
+}
+
+/// Spawn the default IDE layout (nvim + shell + claude) in `project_dir`, with
+/// pane ids starting at `base`. Returns the panes and the layout tree; the
+/// focused pane is `base` (nvim).
+fn spawn_ide(
+    project_dir: &Path,
+    shell: &str,
+    base: usize,
+    tx: &Sender<Msg>,
+) -> Result<(Vec<Pane>, Layout)> {
+    let mut nvim = command("nvim", project_dir);
+    nvim.arg(".");
+    nvim.env("NVIM_APPNAME", "codeforge");
+
+    let panes = vec![
+        Pane::spawn(nvim, "nvim".into(), 1, 1, base, tx.clone())?,
+        Pane::spawn(
+            command(shell, project_dir),
+            "shell".into(),
+            1,
+            1,
+            base + 1,
+            tx.clone(),
+        )?,
+        Pane::spawn(
+            command("claude", project_dir),
+            "claude".into(),
+            1,
+            1,
+            base + 2,
+            tx.clone(),
+        )?,
+    ];
+
+    let layout = Layout::Split {
+        dir: Dir::Row,
+        ratio: 0.5,
+        a: Box::new(Layout::Leaf(base)),
+        b: Box::new(Layout::Split {
+            dir: Dir::Col,
+            ratio: 0.55,
+            a: Box::new(Layout::Leaf(base + 1)),
+            b: Box::new(Layout::Leaf(base + 2)),
+        }),
+    };
+    Ok((panes, layout))
 }
 
 /// Build a command that inherits our environment, runs in `cwd`, and advertises
@@ -102,21 +155,18 @@ fn projects_root() -> PathBuf {
     home
 }
 
-/// Resolve the project directory to open: the first CLI arg (an absolute/relative
-/// path, or a bare name resolved under the projects root), else the current dir.
-fn resolve_project_dir() -> PathBuf {
-    if let Some(arg) = std::env::args().nth(1) {
-        let p = PathBuf::from(&arg);
-        if p.is_dir() {
-            return p.canonicalize().unwrap_or(p);
-        }
-        let under = projects_root().join(&arg);
-        if under.is_dir() {
-            return under;
-        }
-        return p; // Let the child surface the error (e.g. nvim on a new path).
+/// Resolve a CLI project argument: an absolute/relative path, or a bare name
+/// resolved under the projects root.
+fn resolve_arg_dir(arg: &str) -> PathBuf {
+    let p = PathBuf::from(arg);
+    if p.is_dir() {
+        return p.canonicalize().unwrap_or(p);
     }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    let under = projects_root().join(arg);
+    if under.is_dir() {
+        return under;
+    }
+    p // Let the child surface the error (e.g. nvim on a new path).
 }
 
 fn main() -> Result<()> {
@@ -124,9 +174,6 @@ fn main() -> Result<()> {
     let (cols, rows) = terminal::size().context("querying terminal size")?;
 
     let (tx, rx) = mpsc::channel::<Msg>();
-
-    // Producer: raw stdin, with the Ctrl-a prefix handled locally.
-    spawn_stdin(tx.clone());
 
     // Producer: SIGWINCH -> Resize.
     let mut signals = Signals::new([SIGWINCH]).context("installing SIGWINCH handler")?;
@@ -141,67 +188,46 @@ fn main() -> Result<()> {
         });
     }
 
-    // Default IDE layout: nvim on the left, a shell and Claude stacked on the
-    // right. Real sizes are set by `relayout` below; spawn at 1x1 and let the
-    // children reflow via SIGWINCH.
-    //
-    //   ┌────────────┬──────────┐
-    //   │            │  shell   │
-    //   │    nvim    ├──────────┤
-    //   │            │  claude  │
-    //   └────────────┴──────────┘
-    // All panes open in the selected project directory.
-    let project_dir = resolve_project_dir();
-
-    let mut nvim = command("nvim", &project_dir);
-    nvim.arg(".");
-    // Isolate our editor config under ~/.config/codeforge (see config/nvim/).
-    nvim.env("NVIM_APPNAME", "codeforge");
-
-    let mut panes: Vec<Pane> = Vec::new();
-    panes.push(Pane::spawn(nvim, "nvim".into(), 1, 1, 0, tx.clone())?);
-    panes.push(Pane::spawn(
-        command(&shell, &project_dir),
-        "shell".into(),
-        1,
-        1,
-        1,
-        tx.clone(),
-    )?);
-    panes.push(Pane::spawn(
-        command("claude", &project_dir),
-        "claude".into(),
-        1,
-        1,
-        2,
-        tx.clone(),
-    )?);
-
-    let mut layout = Layout::Split {
-        dir: Dir::Row,
-        ratio: 0.5,
-        a: Box::new(Layout::Leaf(0)),
-        b: Box::new(Layout::Split {
-            dir: Dir::Col,
-            ratio: 0.55,
-            a: Box::new(Layout::Leaf(1)),
-            b: Box::new(Layout::Leaf(2)),
-        }),
-    };
-    let mut focus_id: usize = 0;
-    let mut next_id: usize = 3;
-    let mut show_help = false;
-
-    // Enter the alternate screen in raw mode; restore on any exit path.
+    // Enter the alternate screen in raw mode; restore on any exit path. Done
+    // before the startup picker, which draws to the alternate screen.
     let mut out = io::stdout();
     enable_raw_mode().context("enabling raw mode")?;
     queue!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
     out.flush()?;
     let _guard = TerminalGuard;
 
+    // Choose the project: a CLI arg, or the startup picker (bare `forge`).
+    let project_dir = match std::env::args().nth(1) {
+        Some(arg) => resolve_arg_dir(&arg),
+        None => Picker::new(projects_root())
+            .run_blocking(&mut out)?
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+    };
+
+    // Producer: raw stdin. Started AFTER the startup picker so they don't both
+    // try to read stdin at once.
+    spawn_stdin(tx.clone());
+
+    // Default IDE layout: nvim (left) + shell and Claude (stacked, right). Real
+    // sizes are set by `relayout`; children reflow via SIGWINCH.
+    let (mut panes, mut layout) = spawn_ide(&project_dir, &shell, 0, &tx)?;
+    let mut focus_id: usize = 0;
+    let mut next_id: usize = 3;
+    let mut project_dir = project_dir;
+    let mut show_help = false;
+    let mut picker: Option<Picker> = None;
+
     relayout(&mut panes, &layout, cols, rows)?;
     render(
-        &mut out, &panes, &layout, focus_id, cols, rows, true, show_help,
+        &mut out,
+        &panes,
+        &layout,
+        focus_id,
+        cols,
+        rows,
+        true,
+        show_help,
+        picker.as_ref(),
     )?;
 
     while let Ok(first) = rx.recv() {
@@ -229,7 +255,34 @@ fn main() -> Result<()> {
                     dirty = true;
                 }
                 Msg::Input(bytes) => {
-                    if let Some(p) = pane_by_id(&mut panes, focus_id) {
+                    if let Some(pk) = picker.as_mut() {
+                        // Picker is open: keystrokes drive it, not the panes.
+                        match pk.feed_bytes(&bytes) {
+                            PickerAction::None => {}
+                            PickerAction::Cancel => {
+                                picker = None;
+                                needs_clear = true;
+                            }
+                            PickerAction::Chosen(dir) => {
+                                picker = None;
+                                needs_clear = true;
+                                // Tear down and relaunch the IDE in the new dir.
+                                for p in &mut panes {
+                                    p.kill();
+                                }
+                                project_dir = dir;
+                                let base = next_id;
+                                let (np, nl) = spawn_ide(&project_dir, &shell, base, &tx)?;
+                                panes = np;
+                                layout = nl;
+                                focus_id = base;
+                                next_id = base + 3;
+                                let (c, r) = terminal::size()?;
+                                relayout(&mut panes, &layout, c, r)?;
+                            }
+                        }
+                        dirty = true;
+                    } else if let Some(p) = pane_by_id(&mut panes, focus_id) {
                         p.write_input(&bytes)?;
                         // Typing snaps the view back to the live bottom.
                         p.scroll_to_bottom();
@@ -370,6 +423,15 @@ fn main() -> Result<()> {
                     // Clear so the overlay's box is fully removed when hidden.
                     needs_clear = true;
                 }
+                Msg::OpenPicker => {
+                    picker = if picker.is_some() {
+                        None
+                    } else {
+                        Some(Picker::new(projects_root()))
+                    };
+                    dirty = true;
+                    needs_clear = true;
+                }
                 Msg::Quit => {
                     quit = true;
                     break;
@@ -414,6 +476,7 @@ fn main() -> Result<()> {
                 r,
                 needs_clear,
                 show_help,
+                picker.as_ref(),
             )?;
         }
     }
@@ -528,6 +591,7 @@ fn spawn_stdin(tx: Sender<Msg>) {
                             b'l' => Some(Msg::Focus(FocusDir::Right)),
                             b'x' => Some(Msg::ClosePane),
                             b'?' => Some(Msg::ToggleHelp),
+                            b'p' => Some(Msg::OpenPicker),
                             // Ctrl-a a -> literal Ctrl-a to the child.
                             b'a' | PREFIX => {
                                 passthrough.push(PREFIX);
@@ -610,6 +674,7 @@ fn render(
     rows: u16,
     clear: bool,
     show_help: bool,
+    picker: Option<&Picker>,
 ) -> Result<()> {
     let mut rects = Vec::new();
     layout.rects(
@@ -656,6 +721,9 @@ fn render(
     if show_help {
         draw_help(out, cols, rows)?;
     }
+    if let Some(pk) = picker {
+        pk.render(out, cols, rows)?;
+    }
     out.flush()?;
     Ok(())
 }
@@ -670,6 +738,7 @@ fn draw_help(out: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
         "  Ctrl-a hjkl   move focus           ",
         "  Ctrl-a o      cycle focus          ",
         "  Ctrl-a x      close pane           ",
+        "  Ctrl-a p      switch project       ",
         "  Ctrl-a q      quit                 ",
         "  Ctrl-a ?      toggle this help     ",
         "  click / wheel  focus / scroll      ",

@@ -39,15 +39,17 @@ for faster file finding, and LSP servers via `:Mason` inside nvim.
 ### Run
 
 ```bash
-forge                 # open the current directory as the project
+forge                 # startup picker: choose a project from your projects root
 forge codeforge       # open a project by name under your projects root
 forge ~/src/foo       # open a project by path
 ```
 
-All three panes (nvim, shell, claude) start in the chosen project directory.
+Bare `forge` shows a **project picker** (type to filter, ↑↓ to select, Enter to
+open, Ctrl-c to cancel). All three panes (nvim, shell, claude) start in the
+chosen directory. Switch projects live any time with **`Ctrl-a p`**.
+
 The **projects root** is `$DDN_PROJECTS` if set (from the DDN bashrc), otherwise
-the first of `~/projects` or `~/work/projects` that exists — a bare `forge <name>`
-resolves against it.
+the first of `~/projects` or `~/work/projects` that exists.
 
 ## Keys
 
@@ -60,6 +62,8 @@ resolves against it.
 | `Ctrl-a h/j/k/l` | Move focus left/down/up/right   |
 | `Ctrl-a o`  | Cycle focus                          |
 | `Ctrl-a x`  | Close focused pane                   |
+| `Ctrl-a p`  | Switch project (picker)              |
+| `Ctrl-a ?`  | Toggle keybinding help               |
 | `Ctrl-a q`  | Quit CodeForge                       |
 | `Ctrl-a a`  | Send a literal `Ctrl-a` to the child |
 | **Click a pane** | Focus it (clicks reach nvim too) |
