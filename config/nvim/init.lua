@@ -81,6 +81,9 @@ require("lazy").setup({
   -- Syntax + structural editing.
   {
     "nvim-treesitter/nvim-treesitter",
+    -- Pin the stable branch: the rewritten `main` branch dropped the
+    -- `nvim-treesitter.configs` setup API this config uses.
+    branch = "master",
     build = ":TSUpdate",
     config = function()
       require("nvim-treesitter.configs").setup({
