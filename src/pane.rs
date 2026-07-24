@@ -29,9 +29,16 @@ pub struct Pane {
 }
 
 impl Pane {
-    /// Spawn `command` in a fresh PTY sized to `rows`x`cols`, streaming its
-    /// output back to the event loop tagged with `id`.
-    pub fn spawn(command: &str, rows: u16, cols: u16, id: usize, tx: Sender<Msg>) -> Result<Pane> {
+    /// Spawn `cmd` in a fresh PTY sized to `rows`x`cols`, streaming its output
+    /// back to the event loop tagged with `id`. `title` is shown in the border.
+    pub fn spawn(
+        cmd: CommandBuilder,
+        title: String,
+        rows: u16,
+        cols: u16,
+        id: usize,
+        tx: Sender<Msg>,
+    ) -> Result<Pane> {
         let (rows, cols) = clamp_size(rows, cols);
         let pair = native_pty_system()
             .openpty(PtySize {
@@ -44,8 +51,8 @@ impl Pane {
 
         let child = pair
             .slave
-            .spawn_command(CommandBuilder::new(command))
-            .with_context(|| format!("spawning {command}"))?;
+            .spawn_command(cmd)
+            .with_context(|| format!("spawning pane {id}"))?;
         // Slave is dropped here; the master keeps the PTY open.
 
         let writer = pair.master.take_writer().context("taking pty writer")?;
@@ -74,7 +81,7 @@ impl Pane {
             writer,
             child,
             parser: vt100::Parser::new(rows, cols, 0),
-            title: command.to_string(),
+            title,
         })
     }
 

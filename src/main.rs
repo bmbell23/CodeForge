@@ -1,10 +1,12 @@
 //! CodeForge — terminal-native IDE.
 //!
-//! Splits & layout tree (#2). CodeForge hosts N child processes, each in its own
-//! PTY + vt100 emulator (`pane.rs`), arranged by a binary split tree (`layout.rs`)
-//! and blitted into bordered rectangles of the real terminal. Input is routed to
-//! the focused pane; its border is highlighted. Directional focus movement is #3;
-//! for now `Ctrl-a o` cycles.
+//! Default IDE layout (#4). On start CodeForge opens Neovim (left), a shell and
+//! the Claude CLI (stacked, right) — each a child in its own PTY + vt100 emulator
+//! (`pane.rs`), arranged by a binary split tree (`layout.rs`) and blitted into
+//! bordered rectangles of the real terminal. Input is routed to the focused pane;
+//! its border is highlighted. Directional focus movement is #3; for now `Ctrl-a o`
+//! cycles. The editor's IDE features (fuzzy find, grep, LSP) come from the Neovim
+//! config in `config/nvim/`, loaded via NVIM_APPNAME=codeforge.
 //!
 //! Controls (Ctrl-a is the prefix):
 //!   Ctrl-a |   split the focused pane side by side (new $SHELL)
@@ -30,6 +32,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::{cursor, queue, terminal};
+use portable_pty::CommandBuilder;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
@@ -57,6 +60,17 @@ pub enum Msg {
     Quit,
 }
 
+/// Build a command that inherits our environment, runs in the current
+/// directory, and advertises a 256-color terminal to the child.
+fn command(program: &str) -> CommandBuilder {
+    let mut c = CommandBuilder::new(program);
+    if let Ok(cwd) = std::env::current_dir() {
+        c.cwd(cwd);
+    }
+    c.env("TERM", "xterm-256color");
+    c
+}
+
 fn main() -> Result<()> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     let (cols, rows) = terminal::size().context("querying terminal size")?;
@@ -79,20 +93,52 @@ fn main() -> Result<()> {
         });
     }
 
-    // Single root pane to start.
-    let mut panes: Vec<Pane> = Vec::new();
-    let mut layout = Layout::Leaf(0);
-    let mut focus_id: usize = 0;
-    let mut next_id: usize = 1;
+    // Default IDE layout: nvim on the left, a shell and Claude stacked on the
+    // right. Real sizes are set by `relayout` below; spawn at 1x1 and let the
+    // children reflow via SIGWINCH.
+    //
+    //   ┌────────────┬──────────┐
+    //   │            │  shell   │
+    //   │    nvim    ├──────────┤
+    //   │            │  claude  │
+    //   └────────────┴──────────┘
+    let mut nvim = command("nvim");
+    nvim.arg(".");
+    // Isolate our editor config under ~/.config/codeforge (see config/nvim/).
+    nvim.env("NVIM_APPNAME", "codeforge");
 
-    let full = Rect {
-        x: 0,
-        y: 0,
-        w: cols,
-        h: rows,
+    let mut panes: Vec<Pane> = Vec::new();
+    panes.push(Pane::spawn(nvim, "nvim".into(), 1, 1, 0, tx.clone())?);
+    panes.push(Pane::spawn(
+        command(&shell),
+        "shell".into(),
+        1,
+        1,
+        1,
+        tx.clone(),
+    )?);
+    panes.push(Pane::spawn(
+        command("claude"),
+        "claude".into(),
+        1,
+        1,
+        2,
+        tx.clone(),
+    )?);
+
+    let mut layout = Layout::Split {
+        dir: Dir::Row,
+        ratio: 0.68,
+        a: Box::new(Layout::Leaf(0)),
+        b: Box::new(Layout::Split {
+            dir: Dir::Col,
+            ratio: 0.55,
+            a: Box::new(Layout::Leaf(1)),
+            b: Box::new(Layout::Leaf(2)),
+        }),
     };
-    let inner = full.inner().unwrap_or(full);
-    panes.push(Pane::spawn(&shell, inner.h, inner.w, 0, tx.clone())?);
+    let mut focus_id: usize = 0;
+    let mut next_id: usize = 3;
 
     // Enter the alternate screen in raw mode; restore on any exit path.
     let mut out = io::stdout();
@@ -138,7 +184,14 @@ fn main() -> Result<()> {
                     let (c, r) = terminal::size()?;
                     let new_id = next_id;
                     next_id += 1;
-                    panes.push(Pane::spawn(&shell, 1, 1, new_id, tx.clone())?);
+                    panes.push(Pane::spawn(
+                        command(&shell),
+                        "shell".into(),
+                        1,
+                        1,
+                        new_id,
+                        tx.clone(),
+                    )?);
                     layout.split(focus_id, new_id, dir);
                     focus_id = new_id;
                     relayout(&mut panes, &layout, c, r)?;
