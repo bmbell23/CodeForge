@@ -24,9 +24,14 @@ pub struct Pane {
     child: Box<dyn Child + Send + Sync>,
     /// vt100 emulator holding the child's current screen.
     parser: vt100::Parser,
+    /// How many rows we're scrolled back into history (0 = live bottom).
+    scroll: usize,
     /// Shown in the pane's border.
     pub title: String,
 }
+
+/// Scrollback history kept per pane, in rows.
+const SCROLLBACK: usize = 10_000;
 
 impl Pane {
     /// Spawn `cmd` in a fresh PTY sized to `rows`x`cols`, streaming its output
@@ -80,7 +85,8 @@ impl Pane {
             master: pair.master,
             writer,
             child,
-            parser: vt100::Parser::new(rows, cols, 0),
+            parser: vt100::Parser::new(rows, cols, SCROLLBACK),
+            scroll: 0,
             title,
         })
     }
@@ -119,6 +125,23 @@ impl Pane {
     /// events to a child that hasn't (e.g. a bare shell) just prints junk.
     pub fn wants_mouse(&self) -> bool {
         self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
+    /// Scroll the view by `delta` rows into history (positive = back in time).
+    /// Used for mouse-wheel scrollback in panes whose child doesn't handle the
+    /// mouse itself (e.g. a shell).
+    pub fn scroll(&mut self, delta: i32) {
+        let next = (self.scroll as i32 + delta).max(0) as usize;
+        self.scroll = next.min(SCROLLBACK);
+        self.parser.set_scrollback(self.scroll);
+    }
+
+    /// Jump back to the live bottom of the buffer (e.g. when the user types).
+    pub fn scroll_to_bottom(&mut self) {
+        if self.scroll != 0 {
+            self.scroll = 0;
+            self.parser.set_scrollback(0);
+        }
     }
 
     /// Has the child exited?

@@ -69,6 +69,8 @@ pub enum Msg {
     },
     /// Close the focused pane.
     ClosePane,
+    /// Toggle the keybinding help overlay.
+    ToggleHelp,
     /// User asked to quit.
     Quit,
 }
@@ -177,7 +179,7 @@ fn main() -> Result<()> {
 
     let mut layout = Layout::Split {
         dir: Dir::Row,
-        ratio: 0.68,
+        ratio: 0.5,
         a: Box::new(Layout::Leaf(0)),
         b: Box::new(Layout::Split {
             dir: Dir::Col,
@@ -188,6 +190,7 @@ fn main() -> Result<()> {
     };
     let mut focus_id: usize = 0;
     let mut next_id: usize = 3;
+    let mut show_help = false;
 
     // Enter the alternate screen in raw mode; restore on any exit path.
     let mut out = io::stdout();
@@ -197,7 +200,9 @@ fn main() -> Result<()> {
     let _guard = TerminalGuard;
 
     relayout(&mut panes, &layout, cols, rows)?;
-    render(&mut out, &panes, &layout, focus_id, cols, rows, true)?;
+    render(
+        &mut out, &panes, &layout, focus_id, cols, rows, true, show_help,
+    )?;
 
     while let Ok(first) = rx.recv() {
         // Drain everything currently queued and handle it as one batch, so a
@@ -226,6 +231,8 @@ fn main() -> Result<()> {
                 Msg::Input(bytes) => {
                     if let Some(p) = pane_by_id(&mut panes, focus_id) {
                         p.write_input(&bytes)?;
+                        // Typing snaps the view back to the live bottom.
+                        p.scroll_to_bottom();
                     }
                 }
                 Msg::Resize => {
@@ -280,19 +287,20 @@ fn main() -> Result<()> {
                         })
                         .copied();
                     if let Some((id, rect)) = hit {
-                        // A press focuses the pane under the cursor.
-                        if press && focus_id != id {
+                        // SGR wheel buttons: 64 = up, 65 = down.
+                        let is_wheel = cb == 64 || cb == 65;
+                        // A real button press (not a wheel) focuses the pane.
+                        if press && !is_wheel && focus_id != id {
                             focus_id = id;
                             dirty = true;
                         }
-                        // Forward the event, remapped to the pane's content
-                        // origin, but only if that child actually uses the mouse
-                        // (nvim yes; a bare shell would just print the escape).
                         let wants_mouse = panes
                             .iter()
                             .find(|p| p.id == id)
                             .is_some_and(|p| p.wants_mouse());
                         if wants_mouse {
+                            // Forward the event, remapped to the pane's content
+                            // origin, so the child (nvim, claude) handles it.
                             if let Some(inner) = rect.inner() {
                                 if px >= inner.x
                                     && px < inner.x + inner.w
@@ -313,6 +321,13 @@ fn main() -> Result<()> {
                                     }
                                 }
                             }
+                        } else if is_wheel {
+                            // The child doesn't handle the mouse (a shell): scroll
+                            // our own scrollback buffer instead.
+                            if let Some(p) = pane_by_id(&mut panes, id) {
+                                p.scroll(if cb == 64 { 3 } else { -3 });
+                            }
+                            dirty = true;
                         }
                     }
                 }
@@ -349,6 +364,12 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                Msg::ToggleHelp => {
+                    show_help = !show_help;
+                    dirty = true;
+                    // Clear so the overlay's box is fully removed when hidden.
+                    needs_clear = true;
+                }
                 Msg::Quit => {
                     quit = true;
                     break;
@@ -384,7 +405,16 @@ fn main() -> Result<()> {
 
         if dirty {
             let (c, r) = terminal::size()?;
-            render(&mut out, &panes, &layout, focus_id, c, r, needs_clear)?;
+            render(
+                &mut out,
+                &panes,
+                &layout,
+                focus_id,
+                c,
+                r,
+                needs_clear,
+                show_help,
+            )?;
         }
     }
 
@@ -497,6 +527,7 @@ fn spawn_stdin(tx: Sender<Msg>) {
                             b'k' => Some(Msg::Focus(FocusDir::Up)),
                             b'l' => Some(Msg::Focus(FocusDir::Right)),
                             b'x' => Some(Msg::ClosePane),
+                            b'?' => Some(Msg::ToggleHelp),
                             // Ctrl-a a -> literal Ctrl-a to the child.
                             b'a' | PREFIX => {
                                 passthrough.push(PREFIX);
@@ -569,6 +600,7 @@ fn parse_mouse(body: &[u8], press: bool) -> Option<Msg> {
 
 /// Paint every pane into its rectangle, then place the hardware cursor in the
 /// focused pane. Rendering is per-cell so panes can be tiled.
+#[allow(clippy::too_many_arguments)]
 fn render(
     out: &mut io::Stdout,
     panes: &[Pane],
@@ -577,6 +609,7 @@ fn render(
     cols: u16,
     rows: u16,
     clear: bool,
+    show_help: bool,
 ) -> Result<()> {
     let mut rects = Vec::new();
     layout.rects(
@@ -619,7 +652,64 @@ fn render(
             }
         }
     }
+
+    if show_help {
+        draw_help(out, cols, rows)?;
+    }
     out.flush()?;
+    Ok(())
+}
+
+/// Draw a centered overlay listing the CodeForge keybindings.
+fn draw_help(out: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
+    let lines = [
+        "  CodeForge — keys (prefix Ctrl-a)  ",
+        "",
+        "  Ctrl-a |      split side by side   ",
+        "  Ctrl-a -      split top/bottom     ",
+        "  Ctrl-a hjkl   move focus           ",
+        "  Ctrl-a o      cycle focus          ",
+        "  Ctrl-a x      close pane           ",
+        "  Ctrl-a q      quit                 ",
+        "  Ctrl-a ?      toggle this help     ",
+        "  click / wheel  focus / scroll      ",
+        "",
+        "  (editable keybinds: config, soon)  ",
+    ];
+    let w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 2;
+    let h = lines.len() as u16 + 2;
+    if w > cols || h > rows {
+        return Ok(());
+    }
+    let x = (cols - w) / 2;
+    let y = (rows - h) / 2;
+
+    queue!(
+        out,
+        cursor::Hide,
+        SetForegroundColor(Color::Black),
+        SetBackgroundColor(Color::Cyan)
+    )?;
+    // Top/bottom borders and body.
+    queue!(
+        out,
+        cursor::MoveTo(x, y),
+        Print(format!("┌{}┐", "─".repeat((w - 2) as usize)))
+    )?;
+    for (i, line) in lines.iter().enumerate() {
+        let padded = format!("{line:<width$}", width = (w - 2) as usize);
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 1 + i as u16),
+            Print(format!("│{padded}│"))
+        )?;
+    }
+    queue!(
+        out,
+        cursor::MoveTo(x, y + h - 1),
+        Print(format!("└{}┘", "─".repeat((w - 2) as usize)))
+    )?;
+    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
