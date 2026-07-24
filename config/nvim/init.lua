@@ -78,19 +78,29 @@ require("lazy").setup({
     end,
   },
 
-  -- Syntax + structural editing.
+  -- Syntax + structural editing. nvim-treesitter rewrote its API: the old
+  -- `nvim-treesitter.configs` module is gone. New API: setup(), install(), and
+  -- highlighting via vim.treesitter.start() per buffer.
   {
     "nvim-treesitter/nvim-treesitter",
-    -- Pin the stable branch: the rewritten `main` branch dropped the
-    -- `nvim-treesitter.configs` setup API this config uses.
-    branch = "master",
+    branch = "main",
     build = ":TSUpdate",
     config = function()
-      require("nvim-treesitter.configs").setup({
-        ensure_installed = { "lua", "rust", "python", "bash", "markdown", "json", "toml" },
-        auto_install = true,
-        highlight = { enable = true },
-        indent = { enable = true },
+      require("nvim-treesitter").setup()
+      -- Install parsers asynchronously (no-op if already present).
+      pcall(function()
+        require("nvim-treesitter").install({
+          "lua", "rust", "python", "bash", "markdown", "json", "toml", "c",
+        })
+      end)
+      -- Enable treesitter highlighting + indentation when a parser exists.
+      vim.api.nvim_create_autocmd("FileType", {
+        callback = function(ev)
+          pcall(vim.treesitter.start, ev.buf)
+          pcall(function()
+            vim.bo[ev.buf].indentexpr = "v:lua.require'nvim-treesitter'.indentexpr()"
+          end)
+        end,
       })
     end,
   },

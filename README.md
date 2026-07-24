@@ -39,9 +39,15 @@ for faster file finding, and LSP servers via `:Mason` inside nvim.
 ### Run
 
 ```bash
-forge                                     # or: cargo run
-cargo build --release && ./target/release/forge
+forge                 # open the current directory as the project
+forge codeforge       # open a project by name under your projects root
+forge ~/src/foo       # open a project by path
 ```
+
+All three panes (nvim, shell, claude) start in the chosen project directory.
+The **projects root** is `$DDN_PROJECTS` if set (from the DDN bashrc), otherwise
+the first of `~/projects` or `~/work/projects` that exists — a bare `forge <name>`
+resolves against it.
 
 ## Keys
 

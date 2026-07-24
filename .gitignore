@@ -1,3 +1,6 @@
 /target
 **/*.rs.bk
 *.pdb
+
+# per-machine plugin lockfile
+config/nvim/lazy-lock.json

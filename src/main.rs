@@ -21,6 +21,7 @@ mod layout;
 mod pane;
 
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 
@@ -62,15 +63,48 @@ pub enum Msg {
     Quit,
 }
 
-/// Build a command that inherits our environment, runs in the current
-/// directory, and advertises a 256-color terminal to the child.
-fn command(program: &str) -> CommandBuilder {
+/// Build a command that inherits our environment, runs in `cwd`, and advertises
+/// a 256-color terminal to the child.
+fn command(program: &str, cwd: &Path) -> CommandBuilder {
     let mut c = CommandBuilder::new(program);
-    if let Ok(cwd) = std::env::current_dir() {
-        c.cwd(cwd);
-    }
+    c.cwd(cwd);
     c.env("TERM", "xterm-256color");
     c
+}
+
+/// The user's projects root: `$DDN_PROJECTS` if set (see the DDN bashrc), else
+/// the first of `~/projects` / `~/work/projects` that exists, else `$HOME`.
+fn projects_root() -> PathBuf {
+    if let Ok(p) = std::env::var("DDN_PROJECTS") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
+    for cand in ["projects", "work/projects"] {
+        let d = home.join(cand);
+        if d.is_dir() {
+            return d;
+        }
+    }
+    home
+}
+
+/// Resolve the project directory to open: the first CLI arg (an absolute/relative
+/// path, or a bare name resolved under the projects root), else the current dir.
+fn resolve_project_dir() -> PathBuf {
+    if let Some(arg) = std::env::args().nth(1) {
+        let p = PathBuf::from(&arg);
+        if p.is_dir() {
+            return p.canonicalize().unwrap_or(p);
+        }
+        let under = projects_root().join(&arg);
+        if under.is_dir() {
+            return under;
+        }
+        return p; // Let the child surface the error (e.g. nvim on a new path).
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn main() -> Result<()> {
@@ -104,7 +138,10 @@ fn main() -> Result<()> {
     //   │    nvim    ├──────────┤
     //   │            │  claude  │
     //   └────────────┴──────────┘
-    let mut nvim = command("nvim");
+    // All panes open in the selected project directory.
+    let project_dir = resolve_project_dir();
+
+    let mut nvim = command("nvim", &project_dir);
     nvim.arg(".");
     // Isolate our editor config under ~/.config/codeforge (see config/nvim/).
     nvim.env("NVIM_APPNAME", "codeforge");
@@ -112,7 +149,7 @@ fn main() -> Result<()> {
     let mut panes: Vec<Pane> = Vec::new();
     panes.push(Pane::spawn(nvim, "nvim".into(), 1, 1, 0, tx.clone())?);
     panes.push(Pane::spawn(
-        command(&shell),
+        command(&shell, &project_dir),
         "shell".into(),
         1,
         1,
@@ -120,7 +157,7 @@ fn main() -> Result<()> {
         tx.clone(),
     )?);
     panes.push(Pane::spawn(
-        command("claude"),
+        command("claude", &project_dir),
         "claude".into(),
         1,
         1,
@@ -187,7 +224,7 @@ fn main() -> Result<()> {
                     let new_id = next_id;
                     next_id += 1;
                     panes.push(Pane::spawn(
-                        command(&shell),
+                        command(&shell, &project_dir),
                         "shell".into(),
                         1,
                         1,
