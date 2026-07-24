@@ -1,20 +1,21 @@
 //! CodeForge — terminal-native IDE.
 //!
-//! Multi-pane compositor (#1). CodeForge hosts N child processes, each in its
-//! own PTY + vt100 emulator (see `pane.rs`), and tiles them into columns of the
-//! real terminal with borders. Input is routed to the focused pane; the focused
-//! border is highlighted. Splits with real direction (#2) and directional focus
-//! (#3) build on this layout; for now panes are equal-width columns and the
-//! prefix keys below add/close/cycle them.
+//! Splits & layout tree (#2). CodeForge hosts N child processes, each in its own
+//! PTY + vt100 emulator (`pane.rs`), arranged by a binary split tree (`layout.rs`)
+//! and blitted into bordered rectangles of the real terminal. Input is routed to
+//! the focused pane; its border is highlighted. Directional focus movement is #3;
+//! for now `Ctrl-a o` cycles.
 //!
 //! Controls (Ctrl-a is the prefix):
-//!   Ctrl-a q   quit CodeForge
-//!   Ctrl-a c   new pane (spawns $SHELL)          [temporary until splits, #2]
-//!   Ctrl-a o   cycle focus to the next pane      [temporary until focus, #3]
+//!   Ctrl-a |   split the focused pane side by side (new $SHELL)
+//!   Ctrl-a -   split the focused pane top/bottom (new $SHELL)
+//!   Ctrl-a o   cycle focus to the next pane        [directional focus is #3]
 //!   Ctrl-a x   close the focused pane
+//!   Ctrl-a q   quit CodeForge
 //!   Ctrl-a a   send a literal Ctrl-a to the child
 //! Every other key is forwarded to the focused pane's child unchanged.
 
+mod layout;
 mod pane;
 
 use std::io::{self, Read, Write};
@@ -32,6 +33,7 @@ use crossterm::{cursor, queue, terminal};
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
+use layout::{Dir, Layout, Rect};
 use pane::Pane;
 
 /// The tmux-style prefix. Ctrl-a (0x01) begins a CodeForge command.
@@ -45,38 +47,14 @@ pub enum Msg {
     Input(Vec<u8>),
     /// The real terminal was resized.
     Resize,
-    /// Spawn a new pane.
-    NewPane,
+    /// Split the focused pane along `Dir`.
+    Split(Dir),
     /// Move focus to the next pane.
     FocusNext,
     /// Close the focused pane.
     ClosePane,
     /// User asked to quit.
     Quit,
-}
-
-/// A rectangle in terminal cells, borders included.
-#[derive(Clone, Copy)]
-struct Rect {
-    x: u16,
-    y: u16,
-    w: u16,
-    h: u16,
-}
-
-impl Rect {
-    /// The drawable content area inside the 1-cell border, if any remains.
-    fn inner(&self) -> Option<Rect> {
-        if self.w < 3 || self.h < 3 {
-            return None;
-        }
-        Some(Rect {
-            x: self.x + 1,
-            y: self.y + 1,
-            w: self.w - 2,
-            h: self.h - 2,
-        })
-    }
 }
 
 fn main() -> Result<()> {
@@ -101,20 +79,20 @@ fn main() -> Result<()> {
         });
     }
 
-    // Start with a single pane; its geometry is fixed up on the first render.
+    // Single root pane to start.
     let mut panes: Vec<Pane> = Vec::new();
-    let mut next_id: usize = 0;
-    let mut focus: usize = 0;
+    let mut layout = Layout::Leaf(0);
+    let mut focus_id: usize = 0;
+    let mut next_id: usize = 1;
 
-    let rects = layout_rects(cols, rows, 1);
-    let inner = rects[0].inner().unwrap_or(Rect {
+    let full = Rect {
         x: 0,
         y: 0,
         w: cols,
         h: rows,
-    });
-    panes.push(Pane::spawn(&shell, inner.h, inner.w, next_id, tx.clone())?);
-    next_id += 1;
+    };
+    let inner = full.inner().unwrap_or(full);
+    panes.push(Pane::spawn(&shell, inner.h, inner.w, 0, tx.clone())?);
 
     // Enter the alternate screen in raw mode; restore on any exit path.
     let mut out = io::stdout();
@@ -123,68 +101,107 @@ fn main() -> Result<()> {
     out.flush()?;
     let _guard = TerminalGuard;
 
-    apply_layout(&mut panes, cols, rows)?;
-    render(&mut out, &panes, focus, cols, rows)?;
+    relayout(&mut panes, &layout, cols, rows)?;
+    render(&mut out, &panes, &layout, focus_id, cols, rows)?;
 
-    while let Ok(msg) = rx.recv() {
-        let mut dirty = true;
-        match msg {
-            Msg::Output(id, bytes) => {
-                if let Some(p) = pane_by_id(&mut panes, id) {
-                    p.feed(&bytes);
-                }
-                // Coalesce any further pending output before one redraw.
-                while let Ok(Msg::Output(id2, more)) = rx.try_recv() {
-                    if let Some(p) = pane_by_id(&mut panes, id2) {
-                        p.feed(&more);
-                    }
-                }
-            }
-            Msg::Input(bytes) => {
-                if let Some(p) = panes.get_mut(focus) {
-                    p.write_input(&bytes)?;
-                }
-                dirty = false;
-            }
-            Msg::Resize => {
-                let (c, r) = terminal::size()?;
-                apply_layout(&mut panes, c, r)?;
-            }
-            Msg::NewPane => {
-                let (c, r) = terminal::size()?;
-                panes.push(Pane::spawn(&shell, 1, 1, next_id, tx.clone())?);
-                next_id += 1;
-                focus = panes.len() - 1;
-                apply_layout(&mut panes, c, r)?;
-            }
-            Msg::FocusNext => {
-                if !panes.is_empty() {
-                    focus = (focus + 1) % panes.len();
-                }
-            }
-            Msg::ClosePane => {
-                if let Some(mut p) = take_pane(&mut panes, focus) {
-                    p.kill();
-                }
-                if panes.is_empty() {
-                    break;
-                }
-                focus = focus.min(panes.len() - 1);
-                let (c, r) = terminal::size()?;
-                apply_layout(&mut panes, c, r)?;
-            }
-            Msg::Quit => break,
+    while let Ok(first) = rx.recv() {
+        // Drain everything currently queued and handle it as one batch, so a
+        // single redraw covers a burst of output/commands. Every message is
+        // handled — none is discarded — which is why we collect rather than
+        // pattern-match the drain (an eaten Quit would hang the app).
+        let mut batch = vec![first];
+        while let Ok(m) = rx.try_recv() {
+            batch.push(m);
         }
 
-        // Reap any panes whose child exited on its own.
-        reap_dead(&mut panes, &mut focus);
-        if panes.is_empty() {
+        let mut dirty = false;
+        let mut quit = false;
+        for msg in batch {
+            match msg {
+                Msg::Output(id, bytes) => {
+                    if let Some(p) = pane_by_id(&mut panes, id) {
+                        p.feed(&bytes);
+                    }
+                    dirty = true;
+                }
+                Msg::Input(bytes) => {
+                    if let Some(p) = pane_by_id(&mut panes, focus_id) {
+                        p.write_input(&bytes)?;
+                    }
+                }
+                Msg::Resize => {
+                    let (c, r) = terminal::size()?;
+                    relayout(&mut panes, &layout, c, r)?;
+                    dirty = true;
+                }
+                Msg::Split(dir) => {
+                    let (c, r) = terminal::size()?;
+                    let new_id = next_id;
+                    next_id += 1;
+                    panes.push(Pane::spawn(&shell, 1, 1, new_id, tx.clone())?);
+                    layout.split(focus_id, new_id, dir);
+                    focus_id = new_id;
+                    relayout(&mut panes, &layout, c, r)?;
+                    dirty = true;
+                }
+                Msg::FocusNext => {
+                    let mut ls = Vec::new();
+                    layout.leaves(&mut ls);
+                    if let Some(pos) = ls.iter().position(|&x| x == focus_id) {
+                        focus_id = ls[(pos + 1) % ls.len()];
+                    }
+                    dirty = true;
+                }
+                Msg::ClosePane => {
+                    close_leaf(&mut panes, &mut layout, focus_id);
+                    match layout.first_leaf() {
+                        Some(id) if !panes.is_empty() => {
+                            focus_id = id;
+                            let (c, r) = terminal::size()?;
+                            relayout(&mut panes, &layout, c, r)?;
+                            dirty = true;
+                        }
+                        _ => {
+                            quit = true;
+                            break;
+                        }
+                    }
+                }
+                Msg::Quit => {
+                    quit = true;
+                    break;
+                }
+            }
+        }
+
+        if quit {
             break;
+        }
+
+        // Reap panes whose child exited on its own.
+        let mut dead = Vec::new();
+        for p in panes.iter_mut() {
+            if p.is_dead() {
+                dead.push(p.id);
+            }
+        }
+        for id in dead {
+            close_leaf(&mut panes, &mut layout, id);
+            dirty = true;
+        }
+        match layout.first_leaf() {
+            Some(_) if panes.is_empty() => break,
+            None => break,
+            Some(id) => {
+                if !leaf_exists(&layout, focus_id) {
+                    focus_id = id;
+                }
+            }
         }
 
         if dirty {
             let (c, r) = terminal::size()?;
-            render(&mut out, &panes, focus, c, r)?;
+            render(&mut out, &panes, &layout, focus_id, c, r)?;
         }
     }
 
@@ -194,74 +211,46 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Resolve a stable pane id to its current slot (indices shift when panes close).
+/// Resolve a stable pane id to its current slot.
 fn pane_by_id(panes: &mut [Pane], id: usize) -> Option<&mut Pane> {
     panes.iter_mut().find(|p| p.id == id)
 }
 
-/// Remove and return the pane at `idx`, if present.
-fn take_pane(panes: &mut Vec<Pane>, idx: usize) -> Option<Pane> {
-    if idx < panes.len() {
-        Some(panes.remove(idx))
-    } else {
-        None
-    }
+/// Does `id` still appear as a leaf in the tree?
+fn leaf_exists(layout: &Layout, id: usize) -> bool {
+    let mut ls = Vec::new();
+    layout.leaves(&mut ls);
+    ls.contains(&id)
 }
 
-/// Drop panes whose child has exited, fixing up the focus index.
-fn reap_dead(panes: &mut Vec<Pane>, focus: &mut usize) {
-    let mut i = 0;
-    while i < panes.len() {
-        if panes[i].is_dead() {
-            panes.remove(i);
-            if *focus >= i && *focus > 0 {
-                *focus -= 1;
-            }
-        } else {
-            i += 1;
-        }
+/// Kill and drop the pane `id`, then prune its leaf from the tree.
+fn close_leaf(panes: &mut Vec<Pane>, layout: &mut Layout, id: usize) {
+    if let Some(pos) = panes.iter().position(|p| p.id == id) {
+        panes.remove(pos).kill();
     }
-    if !panes.is_empty() {
-        *focus = (*focus).min(panes.len() - 1);
-    }
+    // `Layout::remove` consumes self; swap a throwaway leaf in to move it out.
+    let taken = std::mem::replace(layout, Layout::Leaf(usize::MAX));
+    *layout = taken.remove(id).unwrap_or(Layout::Leaf(usize::MAX));
 }
 
-/// Recompute geometry for the current pane count and resize every PTY.
-fn apply_layout(panes: &mut [Pane], cols: u16, rows: u16) -> Result<()> {
-    let rects = layout_rects(cols, rows, panes.len());
-    for (p, rect) in panes.iter_mut().zip(rects.iter()) {
-        if let Some(inner) = rect.inner() {
+/// Resize every pane's PTY to match its current rectangle.
+fn relayout(panes: &mut [Pane], layout: &Layout, cols: u16, rows: u16) -> Result<()> {
+    let mut rects = Vec::new();
+    layout.rects(
+        Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        },
+        &mut rects,
+    );
+    for (id, rect) in rects {
+        if let (Some(inner), Some(p)) = (rect.inner(), panes.iter_mut().find(|p| p.id == id)) {
             p.resize(inner.h, inner.w)?;
         }
     }
     Ok(())
-}
-
-/// Tile `n` panes as equal-width columns spanning the whole terminal.
-///
-/// #2 replaces this with a real layout tree (horizontal *and* vertical splits);
-/// columns are enough to prove the compositor.
-fn layout_rects(cols: u16, rows: u16, n: usize) -> Vec<Rect> {
-    if n == 0 {
-        return Vec::new();
-    }
-    let n_u16 = n as u16;
-    let base = cols / n_u16;
-    let extra = cols % n_u16;
-    let mut rects = Vec::with_capacity(n);
-    let mut x = 0u16;
-    for i in 0..n_u16 {
-        // Distribute the remainder across the leftmost columns.
-        let w = base + if i < extra { 1 } else { 0 };
-        rects.push(Rect {
-            x,
-            y: 0,
-            w,
-            h: rows,
-        });
-        x += w;
-    }
-    rects
 }
 
 /// Read raw stdin bytes, peel off `Ctrl-a` prefix commands, forward the rest.
@@ -281,7 +270,8 @@ fn spawn_stdin(tx: Sender<Msg>) {
                     prefixed = false;
                     let cmd = match b {
                         b'q' => Some(Msg::Quit),
-                        b'c' => Some(Msg::NewPane),
+                        b'|' => Some(Msg::Split(Dir::Row)),
+                        b'-' => Some(Msg::Split(Dir::Col)),
                         b'o' => Some(Msg::FocusNext),
                         b'x' => Some(Msg::ClosePane),
                         // Ctrl-a a -> literal Ctrl-a to the child.
@@ -315,10 +305,25 @@ fn spawn_stdin(tx: Sender<Msg>) {
 }
 
 /// Paint every pane into its rectangle, then place the hardware cursor in the
-/// focused pane. Rendering is per-cell so panes can be tiled (vt100's
-/// whole-screen `contents_formatted` only works for a full-terminal single pane).
-fn render(out: &mut io::Stdout, panes: &[Pane], focus: usize, cols: u16, rows: u16) -> Result<()> {
-    let rects = layout_rects(cols, rows, panes.len());
+/// focused pane. Rendering is per-cell so panes can be tiled.
+fn render(
+    out: &mut io::Stdout,
+    panes: &[Pane],
+    layout: &Layout,
+    focus_id: usize,
+    cols: u16,
+    rows: u16,
+) -> Result<()> {
+    let mut rects = Vec::new();
+    layout.rects(
+        Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: rows,
+        },
+        &mut rects,
+    );
     queue!(
         out,
         cursor::Hide,
@@ -326,16 +331,18 @@ fn render(out: &mut io::Stdout, panes: &[Pane], focus: usize, cols: u16, rows: u
         terminal::Clear(terminal::ClearType::All)
     )?;
 
-    for (i, (p, rect)) in panes.iter().zip(rects.iter()).enumerate() {
-        draw_border(out, rect, &p.title, i == focus)?;
-        if let Some(inner) = rect.inner() {
-            blit_pane(out, p.screen(), inner)?;
+    for (id, rect) in &rects {
+        if let Some(p) = panes.iter().find(|p| p.id == *id) {
+            draw_border(out, rect, &p.title, *id == focus_id)?;
+            if let Some(inner) = rect.inner() {
+                blit_pane(out, p.screen(), inner)?;
+            }
         }
     }
 
     // Position the real cursor inside the focused pane.
-    if let (Some(p), Some(rect)) = (panes.get(focus), rects.get(focus)) {
-        if let Some(inner) = rect.inner() {
+    if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == focus_id) {
+        if let (Some(inner), Some(p)) = (rect.inner(), panes.iter().find(|p| p.id == focus_id)) {
             let screen = p.screen();
             let (crow, ccol) = screen.cursor_position();
             if !screen.hide_cursor() && crow < inner.h && ccol < inner.w {
