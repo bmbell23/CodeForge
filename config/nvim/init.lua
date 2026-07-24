@@ -161,7 +161,14 @@ require("lazy").setup({
   -- lazy.nvim UI/opts.
   ui = { border = "rounded" },
   change_detection = { notify = false },
+  -- Check for plugin updates in the background, but don't nag on startup.
+  -- Update on demand with <leader>u (mapped below).
+  checker = { enabled = true, notify = false, frequency = 86400 },
 })
+
+-- Update plugins on demand (avoids auto-updating on every launch, which would
+-- re-fetch once per nvim window and could break the editor silently).
+vim.keymap.set("n", "<leader>u", "<cmd>Lazy update<cr>", { desc = "Update plugins" })
 
 -- Project-wide search-and-replace scaffold (fill in the pattern).
 vim.keymap.set("n", "<leader>rr", ":%s//g<Left><Left>", { desc = "Replace in file" })
