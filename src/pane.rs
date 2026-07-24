@@ -115,6 +115,12 @@ impl Pane {
         self.parser.screen()
     }
 
+    /// Whether the child has enabled a mouse reporting mode. Forwarding mouse
+    /// events to a child that hasn't (e.g. a bare shell) just prints junk.
+    pub fn wants_mouse(&self) -> bool {
+        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    }
+
     /// Has the child exited?
     pub fn is_dead(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(Some(_)))

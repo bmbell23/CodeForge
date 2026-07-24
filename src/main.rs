@@ -197,7 +197,7 @@ fn main() -> Result<()> {
     let _guard = TerminalGuard;
 
     relayout(&mut panes, &layout, cols, rows)?;
-    render(&mut out, &panes, &layout, focus_id, cols, rows)?;
+    render(&mut out, &panes, &layout, focus_id, cols, rows, true)?;
 
     while let Ok(first) = rx.recv() {
         // Drain everything currently queued and handle it as one batch, so a
@@ -211,6 +211,10 @@ fn main() -> Result<()> {
 
         let mut dirty = false;
         let mut quit = false;
+        // A geometry change (resize/split/close) can leave stale cells, so the
+        // next paint must clear first. Plain output/focus changes must not — that
+        // full-screen clear is what caused flicker on every keystroke.
+        let mut needs_clear = false;
         for msg in batch {
             match msg {
                 Msg::Output(id, bytes) => {
@@ -228,6 +232,7 @@ fn main() -> Result<()> {
                     let (c, r) = terminal::size()?;
                     relayout(&mut panes, &layout, c, r)?;
                     dirty = true;
+                    needs_clear = true;
                 }
                 Msg::Split(dir) => {
                     let (c, r) = terminal::size()?;
@@ -245,6 +250,7 @@ fn main() -> Result<()> {
                     focus_id = new_id;
                     relayout(&mut panes, &layout, c, r)?;
                     dirty = true;
+                    needs_clear = true;
                 }
                 Msg::FocusNext => {
                     let mut ls = Vec::new();
@@ -279,25 +285,32 @@ fn main() -> Result<()> {
                             focus_id = id;
                             dirty = true;
                         }
-                        // Forward the event to the pane, remapped to its content
-                        // origin, so the child (e.g. nvim) sees the click locally.
-                        if let Some(inner) = rect.inner() {
-                            if px >= inner.x
-                                && px < inner.x + inner.w
-                                && py >= inner.y
-                                && py < inner.y + inner.h
-                            {
-                                let lx = px - inner.x + 1;
-                                let ly = py - inner.y + 1;
-                                let seq = format!(
-                                    "\x1b[<{};{};{}{}",
-                                    cb,
-                                    lx,
-                                    ly,
-                                    if press { 'M' } else { 'm' }
-                                );
-                                if let Some(p) = pane_by_id(&mut panes, id) {
-                                    p.write_input(seq.as_bytes())?;
+                        // Forward the event, remapped to the pane's content
+                        // origin, but only if that child actually uses the mouse
+                        // (nvim yes; a bare shell would just print the escape).
+                        let wants_mouse = panes
+                            .iter()
+                            .find(|p| p.id == id)
+                            .is_some_and(|p| p.wants_mouse());
+                        if wants_mouse {
+                            if let Some(inner) = rect.inner() {
+                                if px >= inner.x
+                                    && px < inner.x + inner.w
+                                    && py >= inner.y
+                                    && py < inner.y + inner.h
+                                {
+                                    let lx = px - inner.x + 1;
+                                    let ly = py - inner.y + 1;
+                                    let seq = format!(
+                                        "\x1b[<{};{};{}{}",
+                                        cb,
+                                        lx,
+                                        ly,
+                                        if press { 'M' } else { 'm' }
+                                    );
+                                    if let Some(p) = pane_by_id(&mut panes, id) {
+                                        p.write_input(seq.as_bytes())?;
+                                    }
                                 }
                             }
                         }
@@ -328,6 +341,7 @@ fn main() -> Result<()> {
                             let (c, r) = terminal::size()?;
                             relayout(&mut panes, &layout, c, r)?;
                             dirty = true;
+                            needs_clear = true;
                         }
                         _ => {
                             quit = true;
@@ -356,6 +370,7 @@ fn main() -> Result<()> {
         for id in dead {
             close_leaf(&mut panes, &mut layout, id);
             dirty = true;
+            needs_clear = true;
         }
         match layout.first_leaf() {
             Some(_) if panes.is_empty() => break,
@@ -369,7 +384,7 @@ fn main() -> Result<()> {
 
         if dirty {
             let (c, r) = terminal::size()?;
-            render(&mut out, &panes, &layout, focus_id, c, r)?;
+            render(&mut out, &panes, &layout, focus_id, c, r, needs_clear)?;
         }
     }
 
@@ -561,6 +576,7 @@ fn render(
     focus_id: usize,
     cols: u16,
     rows: u16,
+    clear: bool,
 ) -> Result<()> {
     let mut rects = Vec::new();
     layout.rects(
@@ -572,12 +588,13 @@ fn render(
         },
         &mut rects,
     );
-    queue!(
-        out,
-        cursor::Hide,
-        ResetColor,
-        terminal::Clear(terminal::ClearType::All)
-    )?;
+    // The panes tile the whole screen and we repaint every cell, so a clear is
+    // only needed when the geometry shrank (resize/split/close) and could leave
+    // stale cells. Clearing on every keystroke is what caused the flicker.
+    queue!(out, cursor::Hide, ResetColor)?;
+    if clear {
+        queue!(out, terminal::Clear(terminal::ClearType::All))?;
+    }
 
     for (id, rect) in &rects {
         if let Some(p) = panes.iter().find(|p| p.id == *id) {
