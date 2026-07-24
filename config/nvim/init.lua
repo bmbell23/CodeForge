@@ -70,7 +70,10 @@ require("lazy").setup({
   -- File explorer as an editable buffer.
   {
     "stevearc/oil.nvim",
-    opts = { view_options = { show_hidden = true } },
+    opts = {
+      default_file_explorer = true,
+      view_options = { show_hidden = true },
+    },
     config = function(_, opts)
       require("oil").setup(opts)
       vim.keymap.set("n", "<leader>e", "<cmd>Oil<cr>", { desc = "File explorer" })

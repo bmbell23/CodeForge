@@ -62,8 +62,21 @@ resolves against it.
 | `Ctrl-a x`  | Close focused pane                   |
 | `Ctrl-a q`  | Quit CodeForge                       |
 | `Ctrl-a a`  | Send a literal `Ctrl-a` to the child |
+| **Click a pane** | Focus it (clicks reach nvim too) |
 
 Every other key goes to the focused pane's process.
+
+> **Running inside tmux?** Don't — CodeForge is itself a multiplexer, and tmux
+> will intercept `Ctrl-a`. Run `forge` in a plain terminal. (If you must nest it,
+> press `Ctrl-a` twice to send one through tmux.)
+>
+> **First launch** opens the Lazy plugin-manager window (Home/Install/Update…)
+> while it installs. Press `q` to close it once it's done, then use the keys below.
+
+### Open a file
+
+Click the nvim pane (or `Ctrl-a h`), then either `Space ff` and type a filename,
+`Space fg` to grep the repo, or `Space e` / `-` for the file explorer (Enter opens).
 
 ### Neovim (leader = `Space`)
 

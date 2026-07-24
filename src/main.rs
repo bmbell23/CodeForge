@@ -15,7 +15,8 @@
 //!   Ctrl-a x     close the focused pane
 //!   Ctrl-a q     quit CodeForge
 //!   Ctrl-a a     send a literal Ctrl-a to the child
-//! Every other key is forwarded to the focused pane's child unchanged.
+//! Click a pane to focus it; mouse events pass through to the child (nvim mouse
+//! works). Every other key is forwarded to the focused pane's child unchanged.
 
 mod layout;
 mod pane;
@@ -26,6 +27,7 @@ use std::sync::mpsc::{self, Sender};
 use std::thread;
 
 use anyhow::{Context, Result};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::style::{
     Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
@@ -57,6 +59,14 @@ pub enum Msg {
     FocusNext,
     /// Move focus to the neighbouring pane in a direction.
     Focus(FocusDir),
+    /// A mouse event at 1-based screen coords, with the SGR button code and
+    /// whether it's a press/drag (`M`) vs release (`m`).
+    Mouse {
+        x: u16,
+        y: u16,
+        cb: u16,
+        press: bool,
+    },
     /// Close the focused pane.
     ClosePane,
     /// User asked to quit.
@@ -182,7 +192,7 @@ fn main() -> Result<()> {
     // Enter the alternate screen in raw mode; restore on any exit path.
     let mut out = io::stdout();
     enable_raw_mode().context("enabling raw mode")?;
-    queue!(out, EnterAlternateScreen, cursor::Hide)?;
+    queue!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
     out.flush()?;
     let _guard = TerminalGuard;
 
@@ -243,6 +253,55 @@ fn main() -> Result<()> {
                         focus_id = ls[(pos + 1) % ls.len()];
                     }
                     dirty = true;
+                }
+                Msg::Mouse { x, y, cb, press } => {
+                    let (c, r) = terminal::size()?;
+                    let mut rects = Vec::new();
+                    layout.rects(
+                        Rect {
+                            x: 0,
+                            y: 0,
+                            w: c,
+                            h: r,
+                        },
+                        &mut rects,
+                    );
+                    let (px, py) = (x.saturating_sub(1), y.saturating_sub(1));
+                    let hit = rects
+                        .iter()
+                        .find(|(_, rc)| {
+                            px >= rc.x && px < rc.x + rc.w && py >= rc.y && py < rc.y + rc.h
+                        })
+                        .copied();
+                    if let Some((id, rect)) = hit {
+                        // A press focuses the pane under the cursor.
+                        if press && focus_id != id {
+                            focus_id = id;
+                            dirty = true;
+                        }
+                        // Forward the event to the pane, remapped to its content
+                        // origin, so the child (e.g. nvim) sees the click locally.
+                        if let Some(inner) = rect.inner() {
+                            if px >= inner.x
+                                && px < inner.x + inner.w
+                                && py >= inner.y
+                                && py < inner.y + inner.h
+                            {
+                                let lx = px - inner.x + 1;
+                                let ly = py - inner.y + 1;
+                                let seq = format!(
+                                    "\x1b[<{};{};{}{}",
+                                    cb,
+                                    lx,
+                                    ly,
+                                    if press { 'M' } else { 'm' }
+                                );
+                                if let Some(p) = pane_by_id(&mut panes, id) {
+                                    p.write_input(seq.as_bytes())?;
+                                }
+                            }
+                        }
+                    }
                 }
                 Msg::Focus(dir) => {
                     let (c, r) = terminal::size()?;
@@ -362,59 +421,135 @@ fn relayout(panes: &mut [Pane], layout: &Layout, cols: u16, rows: u16) -> Result
     Ok(())
 }
 
-/// Read raw stdin bytes, peel off `Ctrl-a` prefix commands, forward the rest.
+/// Reader state: what we're in the middle of parsing on the stdin byte stream.
+enum InState {
+    /// Normal keystrokes.
+    Normal,
+    /// Saw the `Ctrl-a` prefix; next byte is a command.
+    Prefix,
+    /// Saw `ESC`; might be the start of a CSI/mouse sequence.
+    Esc,
+    /// Saw `ESC [`; a `<` next means an SGR mouse sequence.
+    Csi,
+    /// Inside an SGR mouse sequence (`ESC [ < ...`), collecting `cb;x;y`.
+    Mouse,
+}
+
+/// Read raw stdin bytes: intercept `Ctrl-a` prefix commands and SGR mouse
+/// events, and forward everything else to the focused pane unchanged.
+///
+/// Mouse events (enabled via `EnableMouseCapture`) arrive as `ESC [ < cb;x;y M`
+/// (press/drag) or `... m` (release). We pull them out so clicks can focus a
+/// pane; the main loop re-forwards them, remapped, into the target child. Non-
+/// mouse escape sequences (arrow keys, etc.) pass straight through.
 fn spawn_stdin(tx: Sender<Msg>) {
     thread::spawn(move || {
         let mut stdin = io::stdin();
         let mut buf = [0u8; 4096];
-        let mut prefixed = false;
+        let mut state = InState::Normal;
+        let mut mouse: Vec<u8> = Vec::new();
+        let mut passthrough: Vec<u8> = Vec::new();
+
+        // Send any buffered passthrough, preserving order before a command.
+        let flush = |pt: &mut Vec<u8>| -> bool {
+            if pt.is_empty() {
+                return true;
+            }
+            tx.send(Msg::Input(std::mem::take(pt))).is_ok()
+        };
+
         loop {
             let n = match stdin.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
-            let mut passthrough: Vec<u8> = Vec::with_capacity(n);
             for &b in &buf[..n] {
-                if prefixed {
-                    prefixed = false;
-                    let cmd = match b {
-                        b'q' => Some(Msg::Quit),
-                        b'|' => Some(Msg::Split(Dir::Row)),
-                        b'-' => Some(Msg::Split(Dir::Col)),
-                        b'o' => Some(Msg::FocusNext),
-                        b'h' => Some(Msg::Focus(FocusDir::Left)),
-                        b'j' => Some(Msg::Focus(FocusDir::Down)),
-                        b'k' => Some(Msg::Focus(FocusDir::Up)),
-                        b'l' => Some(Msg::Focus(FocusDir::Right)),
-                        b'x' => Some(Msg::ClosePane),
-                        // Ctrl-a a -> literal Ctrl-a to the child.
-                        b'a' | PREFIX => {
-                            passthrough.push(PREFIX);
-                            None
-                        }
-                        // Unknown command: swallow it.
-                        _ => None,
-                    };
-                    if let Some(m) = cmd {
-                        // Flush pending passthrough before the command.
-                        if !passthrough.is_empty() {
-                            let _ = tx.send(Msg::Input(std::mem::take(&mut passthrough)));
-                        }
-                        if tx.send(m).is_err() {
-                            return;
+                match state {
+                    InState::Normal => match b {
+                        PREFIX => state = InState::Prefix,
+                        0x1b => state = InState::Esc,
+                        _ => passthrough.push(b),
+                    },
+                    InState::Prefix => {
+                        state = InState::Normal;
+                        let cmd = match b {
+                            b'q' => Some(Msg::Quit),
+                            b'|' => Some(Msg::Split(Dir::Row)),
+                            b'-' => Some(Msg::Split(Dir::Col)),
+                            b'o' => Some(Msg::FocusNext),
+                            b'h' => Some(Msg::Focus(FocusDir::Left)),
+                            b'j' => Some(Msg::Focus(FocusDir::Down)),
+                            b'k' => Some(Msg::Focus(FocusDir::Up)),
+                            b'l' => Some(Msg::Focus(FocusDir::Right)),
+                            b'x' => Some(Msg::ClosePane),
+                            // Ctrl-a a -> literal Ctrl-a to the child.
+                            b'a' | PREFIX => {
+                                passthrough.push(PREFIX);
+                                None
+                            }
+                            _ => None,
+                        };
+                        if let Some(m) = cmd {
+                            if !flush(&mut passthrough) || tx.send(m).is_err() {
+                                return;
+                            }
                         }
                     }
-                } else if b == PREFIX {
-                    prefixed = true;
-                } else {
-                    passthrough.push(b);
+                    InState::Esc => match b {
+                        b'[' => state = InState::Csi,
+                        // Not a CSI: forward the ESC and reinterpret this byte.
+                        _ => {
+                            passthrough.push(0x1b);
+                            match b {
+                                PREFIX => state = InState::Prefix,
+                                0x1b => state = InState::Esc,
+                                _ => {
+                                    passthrough.push(b);
+                                    state = InState::Normal;
+                                }
+                            }
+                        }
+                    },
+                    InState::Csi => {
+                        if b == b'<' {
+                            state = InState::Mouse;
+                            mouse.clear();
+                        } else {
+                            // Ordinary CSI (arrows, etc.): forward ESC [ then b.
+                            passthrough.extend_from_slice(b"\x1b[");
+                            passthrough.push(b);
+                            state = InState::Normal;
+                        }
+                    }
+                    InState::Mouse => {
+                        if b == b'M' || b == b'm' {
+                            state = InState::Normal;
+                            if let Some(ev) = parse_mouse(&mouse, b == b'M') {
+                                if !flush(&mut passthrough) || tx.send(ev).is_err() {
+                                    return;
+                                }
+                            }
+                        } else {
+                            mouse.push(b);
+                        }
+                    }
                 }
             }
-            if !passthrough.is_empty() && tx.send(Msg::Input(passthrough)).is_err() {
+            if !flush(&mut passthrough) {
                 break;
             }
         }
     });
+}
+
+/// Parse the `cb;x;y` body of an SGR mouse sequence into a `Msg::Mouse`.
+fn parse_mouse(body: &[u8], press: bool) -> Option<Msg> {
+    let s = std::str::from_utf8(body).ok()?;
+    let mut parts = s.split(';');
+    let cb: u16 = parts.next()?.parse().ok()?;
+    let x: u16 = parts.next()?.parse().ok()?;
+    let y: u16 = parts.next()?.parse().ok()?;
+    Some(Msg::Mouse { x, y, cb, press })
 }
 
 /// Paint every pane into its rectangle, then place the hardware cursor in the
@@ -571,8 +706,25 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
-        let _ = queue!(out, cursor::Show, LeaveAlternateScreen);
+        let _ = queue!(out, cursor::Show, DisableMouseCapture, LeaveAlternateScreen);
         let _ = out.flush();
         let _ = disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sgr_mouse() {
+        // ESC [ < 0 ; 12 ; 5 M  -> left button press at (12,5)
+        match parse_mouse(b"0;12;5", true) {
+            Some(Msg::Mouse { x, y, cb, press }) => {
+                assert_eq!((x, y, cb, press), (12, 5, 0, true));
+            }
+            _ => panic!("expected a mouse event"),
+        }
+        assert!(parse_mouse(b"garbage", true).is_none());
     }
 }
