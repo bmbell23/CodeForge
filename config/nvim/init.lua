@@ -57,6 +57,8 @@ require("lazy").setup({
     dependencies = { "nvim-lua/plenary.nvim" },
     config = function()
       local t = require("telescope.builtin")
+      -- Ctrl-P: open a file by name (VS Code style), same as <leader>ff.
+      vim.keymap.set("n", "<C-p>", t.find_files, { desc = "Open file (find files)" })
       vim.keymap.set("n", "<leader>ff", t.find_files, { desc = "Find files" })
       vim.keymap.set("n", "<leader>fg", t.live_grep, { desc = "Find all (grep repo)" })
       vim.keymap.set("n", "<leader>fb", t.buffers, { desc = "Find buffers" })
