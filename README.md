@@ -132,6 +132,7 @@ the first of `~/projects` or `~/work/projects` that exists.
 | `Ctrl-a s`  | New tab in the focused slot (terminal/Claude) |
 | `Ctrl-a ]` / `[` | Next / prev tab in the focused slot |
 | `Ctrl-a w`  | Close the active tab in the focused slot |
+| `Ctrl-a v`  | Copy/scroll mode on the focused pane |
 | `Ctrl-a h/j/k/l` | Move focus left/down/up/right   |
 | `Ctrl-a o`  | Cycle focus                          |
 | `Ctrl-a p`  | Switch project (re-home window)      |
@@ -150,6 +151,19 @@ Keys are rebindable live in the `Ctrl-a ?` overlay (press `e`), no file editing
 needed. Each slot (terminal, Claude) can hold several **tabs**; the border shows
 `shell 2/3` when a slot is stacked. The editor stays a single nvim — use its
 native buffers/tabs (see below) for multiple files.
+
+**Copy / scroll a pane.** `Ctrl-a v` enters copy mode on the focused pane
+(scroll back through its output and copy text — works on the terminal and
+Claude, where the terminal's own selection can't be copied over SSH):
+
+| Key | Action |
+|-----|--------|
+| `k` / `j` or ↑ / ↓ | Move up / down (scrolls at the edges) |
+| `Ctrl-u` / `Ctrl-d`, PgUp / PgDn | Half-page up / down |
+| `g` / `G` | Top of scrollback / live bottom |
+| `v` or Space | Start / clear selection |
+| `y` or Enter | Copy selection (or the cursor line) — sets the clipboard via OSC 52 |
+| `Esc` / `q` | Leave copy mode |
 
 Every other key goes to the focused pane's process. **Exiting a pane's program**
 (`exit`, Ctrl-D, `:q`) **respawns it** — the terminal comes back, the editor

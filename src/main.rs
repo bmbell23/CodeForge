@@ -229,6 +229,8 @@ pub enum Msg {
     NewWindow,
     /// Close the current window (kills its panes).
     CloseWindow,
+    /// Enter copy/scroll mode on the focused pane.
+    CopyMode,
     /// New child (tab) in the focused slot.
     TabNew,
     /// Cycle the focused slot's active child (+1 next, -1 prev).
@@ -958,6 +960,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     }
     let mut cur = 0usize;
     let mut help: Option<HelpState> = None;
+    let mut copy: Option<CopyMode> = None;
     let mut picker: Option<Picker> = None;
     let mut picker_new_window = false;
     // (cols, rows) of the attached client; updated on attach/resize.
@@ -1001,7 +1004,31 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     }
                 }
                 Msg::Input(bytes) => {
-                    if let Some(h) = help.as_mut() {
+                    if let Some(cm) = copy.as_mut() {
+                        // Copy/scroll mode is modal on its pane.
+                        let w = &mut windows[cur];
+                        if let Some(p) = w.panes.iter_mut().find(|p| p.id == cm.pane_id) {
+                            let (exit, clip) = copy_input(cm, p, &bytes);
+                            if let Some(text) = clip {
+                                if !text.is_empty() {
+                                    if let Some(cl) = client.as_mut() {
+                                        let _ = protocol::write_frame(
+                                            cl,
+                                            protocol::OUTPUT,
+                                            &osc52(&text),
+                                        );
+                                    }
+                                }
+                            }
+                            if exit {
+                                copy = None;
+                            }
+                        } else {
+                            copy = None; // pane vanished
+                        }
+                        dirty = true;
+                        needs_clear = true;
+                    } else if let Some(h) = help.as_mut() {
                         // The help overlay is modal: it captures keystrokes for
                         // navigation / live rebinding instead of the focused pane.
                         if help_input(h, &bytes, &keys) {
@@ -1190,6 +1217,14 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     };
                     dirty = true;
                     needs_clear = true;
+                }
+                Msg::CopyMode => {
+                    // Enter copy/scroll mode on the focused pane (no overlays up).
+                    if help.is_none() && picker.is_none() {
+                        copy = Some(CopyMode::new(windows[cur].focus_id));
+                        dirty = true;
+                        needs_clear = true;
+                    }
                 }
                 Msg::OpenPicker => {
                     help = None;
@@ -1459,6 +1494,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     size.1,
                     needs_clear,
                     help.as_ref(),
+                    copy.as_ref(),
                     picker.as_ref(),
                     &right_info,
                     ksnap,
@@ -1724,6 +1760,8 @@ impl InputParser {
                         Some(Msg::TabCycle(-1))
                     } else if c == k.tab_close {
                         Some(Msg::TabClose)
+                    } else if c == k.copy {
+                        Some(Msg::CopyMode)
                     } else if c == k.detach {
                         Some(Msg::Detach)
                     } else if c == k.reload {
@@ -1808,6 +1846,7 @@ fn render(
     rows: u16,
     clear: bool,
     help: Option<&HelpState>,
+    copy: Option<&CopyMode>,
     picker: Option<&Picker>,
     right_info: &str,
     keys: Keys,
@@ -1837,14 +1876,21 @@ fn render(
             // Show a tab counter in the border when a slot has more than one
             // child (e.g. "shell 2/3"), so stacked terminals/Claude are visible.
             let (pos, n) = w.slot_pos(p.role);
-            let title = if n > 1 {
+            let mut title = if n > 1 {
                 format!("{} {}/{}", p.title, pos + 1, n)
             } else {
                 p.title.clone()
             };
+            if copy.is_some_and(|cm| cm.pane_id == *id) {
+                title.push_str("  COPY  k/j v y Esc");
+            }
             draw_border(out, rect, &title, *id == w.focus_id)?;
             if let Some(inner) = rect.inner() {
                 blit_pane(out, p.screen(), inner)?;
+                // Copy/scroll-mode selection + cursor on this pane.
+                if let Some(cm) = copy.filter(|cm| cm.pane_id == *id) {
+                    draw_copy_overlay(out, p.screen(), inner, cm)?;
+                }
             }
         }
     }
@@ -2062,6 +2108,245 @@ fn help_input(h: &mut HelpState, bytes: &[u8], keys: &Arc<Mutex<Keys>>) -> bool 
         }
     }
     false
+}
+
+/// Keyboard copy/scroll mode for one pane (#21/#22): scroll the pane's
+/// scrollback and select text to copy over OSC 52. Coordinates are visible
+/// cells (0-based) in the pane's inner area; scrolling shifts the vt100 view.
+struct CopyMode {
+    pane_id: usize,
+    row: u16,
+    col: u16,
+    /// Selection start, if a selection is active.
+    anchor: Option<(u16, u16)>,
+}
+
+impl CopyMode {
+    fn new(pane_id: usize) -> CopyMode {
+        CopyMode {
+            pane_id,
+            row: 0,
+            col: 0,
+            anchor: None,
+        }
+    }
+
+    /// Normalized (start, end) of the selection in reading order.
+    fn selection(&self) -> Option<((u16, u16), (u16, u16))> {
+        let a = self.anchor?;
+        let b = (self.row, self.col);
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+}
+
+enum CopyKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+    Select,
+    Yank,
+    Esc,
+}
+
+/// Decode input bytes into copy-mode keys (hjkl + arrows, C-u/C-d + PageUp/Dn,
+/// g/G, v/space to select, y/Enter to yank, Esc/q to exit).
+fn decode_copy_keys(bytes: &[u8]) -> Vec<CopyKey> {
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'[' {
+                match bytes[i + 2] {
+                    b'A' => v.push(CopyKey::Up),
+                    b'B' => v.push(CopyKey::Down),
+                    b'C' => v.push(CopyKey::Right),
+                    b'D' => v.push(CopyKey::Left),
+                    b'5' => v.push(CopyKey::PageUp),
+                    b'6' => v.push(CopyKey::PageDown),
+                    _ => {}
+                }
+                // Swallow a trailing '~' (ESC [ 5 ~ / 6 ~).
+                if i + 3 < bytes.len() && bytes[i + 3] == b'~' {
+                    i += 1;
+                }
+                i += 3;
+                continue;
+            }
+            v.push(CopyKey::Esc);
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\r' | b'\n' | b'y' => v.push(CopyKey::Yank),
+            0x15 => v.push(CopyKey::PageUp),
+            0x04 => v.push(CopyKey::PageDown),
+            b'k' => v.push(CopyKey::Up),
+            b'j' => v.push(CopyKey::Down),
+            b'h' => v.push(CopyKey::Left),
+            b'l' => v.push(CopyKey::Right),
+            b'g' => v.push(CopyKey::Top),
+            b'G' => v.push(CopyKey::Bottom),
+            b'v' | b' ' => v.push(CopyKey::Select),
+            b'q' => v.push(CopyKey::Esc),
+            _ => {}
+        }
+        i += 1;
+    }
+    v
+}
+
+/// Drive copy mode on pane `p`. Returns `(should_exit, text_to_copy)`.
+fn copy_input(cm: &mut CopyMode, p: &mut Pane, bytes: &[u8]) -> (bool, Option<String>) {
+    let (rows, cols) = p.screen().size();
+    let maxr = rows.saturating_sub(1);
+    let maxc = cols.saturating_sub(1);
+    for ev in decode_copy_keys(bytes) {
+        match ev {
+            CopyKey::Esc => {
+                p.scroll_to_bottom();
+                return (true, None);
+            }
+            CopyKey::Up => {
+                if cm.row > 0 {
+                    cm.row -= 1;
+                } else {
+                    p.scroll(1);
+                }
+            }
+            CopyKey::Down => {
+                if cm.row < maxr {
+                    cm.row += 1;
+                } else {
+                    p.scroll(-1);
+                }
+            }
+            CopyKey::Left => cm.col = cm.col.saturating_sub(1),
+            CopyKey::Right => cm.col = (cm.col + 1).min(maxc),
+            CopyKey::PageUp => p.scroll((rows / 2).max(1) as i32),
+            CopyKey::PageDown => p.scroll(-((rows / 2).max(1) as i32)),
+            CopyKey::Top => {
+                p.scroll(1_000_000);
+                cm.row = 0;
+            }
+            CopyKey::Bottom => {
+                p.scroll_to_bottom();
+                cm.row = maxr;
+            }
+            CopyKey::Select => {
+                cm.anchor = if cm.anchor.is_some() {
+                    None
+                } else {
+                    Some((cm.row, cm.col))
+                };
+            }
+            CopyKey::Yank => {
+                let text = extract_selection(p.screen(), cm);
+                p.scroll_to_bottom();
+                return (true, Some(text));
+            }
+        }
+    }
+    (false, None)
+}
+
+/// Extract the selected text (or the cursor's whole line if nothing selected)
+/// from the currently-visible screen, trimming trailing spaces per line.
+fn extract_selection(screen: &vt100::Screen, cm: &CopyMode) -> String {
+    let (_, cols) = screen.size();
+    let last = cols.saturating_sub(1);
+    let ((sr, sc), (er, ec)) = cm.selection().unwrap_or(((cm.row, 0), (cm.row, last)));
+    let mut out = String::new();
+    for r in sr..=er {
+        let cstart = if r == sr { sc } else { 0 };
+        let cend = (if r == er { ec } else { last }).min(last);
+        let mut line = String::new();
+        for c in cstart..=cend {
+            match screen.cell(r, c).map(|cell| cell.contents()) {
+                Some(s) if !s.is_empty() => line.push_str(&s),
+                _ => line.push(' '),
+            }
+        }
+        while line.ends_with(' ') {
+            line.pop();
+        }
+        out.push_str(&line);
+        if r < er {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// Minimal standard base64 (no deps), for OSC 52 clipboard payloads.
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for ch in data.chunks(3) {
+        let n = ((ch[0] as u32) << 16)
+            | ((*ch.get(1).unwrap_or(&0) as u32) << 8)
+            | (*ch.get(2).unwrap_or(&0) as u32);
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if ch.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if ch.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// An OSC 52 sequence that sets the system clipboard (works over SSH on
+/// terminals that support it).
+fn osc52(text: &str) -> Vec<u8> {
+    format!("\x1b]52;c;{}\x07", base64(text.as_bytes())).into_bytes()
+}
+
+/// Overlay the copy-mode cursor and selection highlight on an already-blitted
+/// pane. `inner` is the pane's content rect.
+fn draw_copy_overlay(
+    out: &mut Vec<u8>,
+    screen: &vt100::Screen,
+    inner: Rect,
+    cm: &CopyMode,
+) -> Result<()> {
+    let sel = cm.selection();
+    let (rows, cols) = screen.size();
+    for r in 0..rows.min(inner.h) {
+        for c in 0..cols.min(inner.w) {
+            let selected = sel.is_some_and(|((sr, sc), (er, ec))| {
+                (r > sr || (r == sr && c >= sc)) && (r < er || (r == er && c <= ec))
+            });
+            let is_cursor = r == cm.row && c == cm.col;
+            if !selected && !is_cursor {
+                continue;
+            }
+            let ch = screen
+                .cell(r, c)
+                .map(|cell| cell.contents())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| " ".to_string());
+            queue!(
+                out,
+                cursor::MoveTo(inner.x + c, inner.y + r),
+                SetAttribute(Attribute::Reverse),
+                Print(ch),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Draw the centered `Ctrl-a ?` overlay — a key reference, or the inline key
@@ -2336,6 +2621,75 @@ mod tests {
         // Digits and TOML-unsafe keys are rejected.
         assert!(k.with_bind("toggle_ai", '1').is_err());
         assert!(k.with_bind("toggle_ai", '"').is_err());
+    }
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn decodes_copy_keys() {
+        assert!(matches!(decode_copy_keys(b"j").as_slice(), [CopyKey::Down]));
+        assert!(matches!(decode_copy_keys(b"k").as_slice(), [CopyKey::Up]));
+        assert!(matches!(
+            decode_copy_keys(b"\x1b[B").as_slice(),
+            [CopyKey::Down]
+        ));
+        assert!(matches!(
+            decode_copy_keys(b"\x1b[5~").as_slice(),
+            [CopyKey::PageUp]
+        ));
+        assert!(matches!(
+            decode_copy_keys(&[0x15]).as_slice(),
+            [CopyKey::PageUp]
+        ));
+        assert!(matches!(
+            decode_copy_keys(b"v").as_slice(),
+            [CopyKey::Select]
+        ));
+        assert!(matches!(decode_copy_keys(b"y").as_slice(), [CopyKey::Yank]));
+        assert!(matches!(
+            decode_copy_keys(&[0x1b]).as_slice(),
+            [CopyKey::Esc]
+        ));
+    }
+
+    #[test]
+    fn extract_selection_reads_cells() {
+        let mut parser = vt100::Parser::new(4, 20, 100);
+        parser.process(b"hello world\r\nsecond line");
+        let screen = parser.screen();
+        // Select "hello" on row 0, cols 0..=4.
+        let cm = CopyMode {
+            pane_id: 0,
+            row: 0,
+            col: 4,
+            anchor: Some((0, 0)),
+        };
+        assert_eq!(extract_selection(screen, &cm), "hello");
+        // No selection -> whole cursor line (trailing spaces trimmed).
+        let line = CopyMode {
+            pane_id: 0,
+            row: 1,
+            col: 0,
+            anchor: None,
+        };
+        assert_eq!(extract_selection(screen, &line), "second line");
+    }
+
+    #[test]
+    fn copy_selection_normalizes() {
+        let mut cm = CopyMode::new(0);
+        cm.anchor = Some((2, 5));
+        cm.row = 1;
+        cm.col = 3;
+        // Cursor before anchor -> selection returned in reading order.
+        assert_eq!(cm.selection(), Some(((1, 3), (2, 5))));
     }
 
     #[test]

@@ -76,6 +76,9 @@ pub struct Keys {
     pub tab_prev: char,
     /// Close the active child in the focused slot.
     pub tab_close: char,
+    /// Enter copy/scroll mode on the focused pane (scroll its scrollback, select
+    /// text, copy). Esc/q exits.
+    pub copy: char,
 }
 
 impl Default for Config {
@@ -122,6 +125,7 @@ impl Default for Keys {
             tab_next: ']',
             tab_prev: '[',
             tab_close: 'w',
+            copy: 'v',
         }
     }
 }
@@ -129,7 +133,7 @@ impl Default for Keys {
 /// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
 /// `(config field, human label)`. Focus keys are listed individually so each
 /// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
-pub const EDITABLE: [(&str, &str); 20] = [
+pub const EDITABLE: [(&str, &str); 21] = [
     ("toggle_editor", "show/hide editor"),
     ("toggle_shell", "show/hide terminal"),
     ("toggle_ai", "show/hide Claude"),
@@ -137,6 +141,7 @@ pub const EDITABLE: [(&str, &str); 20] = [
     ("tab_next", "next tab (focused slot)"),
     ("tab_prev", "prev tab (focused slot)"),
     ("tab_close", "close tab (focused slot)"),
+    ("copy", "copy/scroll mode"),
     ("focus_left", "focus left"),
     ("focus_down", "focus down"),
     ("focus_up", "focus up"),
@@ -176,6 +181,7 @@ impl Keys {
             "tab_next" => self.tab_next,
             "tab_prev" => self.tab_prev,
             "tab_close" => self.tab_close,
+            "copy" => self.copy,
             _ => return None,
         })
     }
@@ -203,6 +209,7 @@ impl Keys {
             "tab_next" => self.tab_next = ch,
             "tab_prev" => self.tab_prev = ch,
             "tab_close" => self.tab_close = ch,
+            "copy" => self.copy = ch,
             _ => return false,
         }
         true
@@ -232,7 +239,7 @@ impl Keys {
     }
 
     /// All (action, key) bindings, for help display and conflict checking.
-    fn bindings(&self) -> [(&'static str, char); 20] {
+    fn bindings(&self) -> [(&'static str, char); 21] {
         [
             ("focus_left", self.focus_left),
             ("focus_down", self.focus_down),
@@ -254,6 +261,7 @@ impl Keys {
             ("tab_next", self.tab_next),
             ("tab_prev", self.tab_prev),
             ("tab_close", self.tab_close),
+            ("copy", self.copy),
         ]
     }
 
@@ -431,6 +439,7 @@ tab_new = "s"    # new terminal / Claude tab in the focused slot
 tab_next = "]"   # next tab in the focused slot
 tab_prev = "["   # prev tab in the focused slot
 tab_close = "w"  # close the active tab in the focused slot
+copy = "v"       # copy/scroll mode on the focused pane (scroll, select, copy)
 # also: prefix + 1..9 jumps to that window
 "#;
 
