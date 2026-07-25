@@ -7,6 +7,9 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 NVIM_CFG="$HOME/.config/codeforge"
 
+echo "==> Ensuring runtime deps (nvim, tree-sitter)"
+BIN_DIR="$BIN_DIR" bash "$REPO/scripts/bootstrap-deps.sh"
+
 echo "==> Building forge (release)"
 ( cd "$REPO" && cargo build --release )
 
