@@ -29,6 +29,9 @@
 //!   Ctrl-a a     send a literal Ctrl-a to the child
 //! Click a pane to focus it; mouse events pass through to the child (nvim mouse
 //! works). Every other key is forwarded to the focused pane's child unchanged.
+//! A child that exits (Ctrl-D / `exit` / `:q`) is respawned in place — the AI
+//! pane returns on `claude --resume`; only Ctrl-a x removes a pane. Split a pane
+//! (Ctrl-a | / -) for a second terminal in the same window.
 
 mod config;
 mod layout;
@@ -244,40 +247,8 @@ fn spawn_ide(
 ) -> Result<(Vec<Pane>, Layout)> {
     let dir = &spec.dir;
 
-    // Editor.
-    let mut etoks = cfg.editor.split_whitespace();
-    let editor_prog = etoks.next().unwrap_or("nvim");
-    let is_nvim = editor_prog.ends_with("nvim");
-    let editor_title = editor_prog
-        .rsplit('/')
-        .next()
-        .unwrap_or(editor_prog)
-        .to_string();
-    let mut editor = command(editor_prog, dir);
-    for a in etoks {
-        if a != "." {
-            editor.arg(a);
-        }
-    }
-    if is_nvim {
-        editor.env("NVIM_APPNAME", "codeforge");
-        let sock = nvim_sock(base);
-        let _ = std::fs::remove_file(&sock); // stale socket blocks --listen
-        editor.arg("--listen");
-        editor.arg(&sock);
-    }
-    if spec.files.is_empty() {
-        editor.arg(".");
-    } else {
-        for f in &spec.files {
-            editor.arg(f);
-        }
-    }
-
-    // Shell (in its saved cwd when known).
+    let (editor, editor_title) = build_editor(cfg, dir, base, &spec.files);
     let shell_cwd = spec.shell_cwd.as_deref().unwrap_or(dir);
-
-    // AI.
     let (ai, ai_title) = command_line(&cfg.ai, dir);
 
     let panes = vec![
@@ -323,6 +294,79 @@ fn command(program: &str, cwd: &Path) -> CommandBuilder {
     c.cwd(cwd);
     c.env("TERM", "xterm-256color");
     c
+}
+
+/// Build the editor command for a pane (id `id`), opening `files` (or the dir).
+/// nvim gets NVIM_APPNAME + an RPC socket so its buffers can be captured later.
+fn build_editor(
+    cfg: &Config,
+    dir: &Path,
+    id: usize,
+    files: &[PathBuf],
+) -> (CommandBuilder, String) {
+    let mut toks = cfg.editor.split_whitespace();
+    let prog = toks.next().unwrap_or("nvim");
+    let is_nvim = prog.ends_with("nvim");
+    let title = prog.rsplit('/').next().unwrap_or(prog).to_string();
+    let mut c = command(prog, dir);
+    for a in toks {
+        if a != "." {
+            c.arg(a);
+        }
+    }
+    if is_nvim {
+        c.env("NVIM_APPNAME", "codeforge");
+        let sock = nvim_sock(id);
+        let _ = std::fs::remove_file(&sock); // stale socket blocks --listen
+        c.arg("--listen");
+        c.arg(&sock);
+    }
+    if files.is_empty() {
+        c.arg(".");
+    } else {
+        for f in files {
+            c.arg(f);
+        }
+    }
+    (c, title)
+}
+
+/// Respawn a pane's child after it exits (Ctrl-D / `exit` / `:q`), keeping the
+/// pane and its id in place. The editor reopens the dir, the shell restarts, and
+/// the AI pane comes back on the resume picker (`claude --resume`).
+fn respawn_pane(
+    role: PaneRole,
+    dir: &Path,
+    id: usize,
+    cfg: &Config,
+    shell: &str,
+    tx: &Sender<Msg>,
+) -> Result<Pane> {
+    match role {
+        PaneRole::Editor => {
+            let (cmd, title) = build_editor(cfg, dir, id, &[]);
+            Pane::spawn(cmd, title, role, 1, 1, id, tx.clone())
+        }
+        PaneRole::Shell => Pane::spawn(
+            command(shell, dir),
+            "shell".into(),
+            role,
+            1,
+            1,
+            id,
+            tx.clone(),
+        ),
+        PaneRole::Ai => {
+            // Bring claude back on its session-resume picker.
+            let line = if cfg.ai.trim_start().starts_with("claude") {
+                "claude --resume".to_string()
+            } else {
+                cfg.ai.clone()
+            };
+            let (cmd, title) = command_line(&line, dir);
+            Pane::spawn(cmd, title, role, 1, 1, id, tx.clone())
+        }
+    }
 }
 
 /// Build a command from a whitespace-separated command line (program + args),
@@ -969,16 +1013,40 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
             break;
         }
 
-        // Reap dead panes across all windows; drop any window left empty.
+        // A child that exited (Ctrl-D / `exit` / `:q`) is respawned in place so
+        // the pane never vanishes — only Ctrl-a x removes a pane. A child that
+        // keeps dying quickly is given up on (crash-loop guard).
+        let (c, r) = size;
+        let area = r.saturating_sub(1);
         let mut wi = 0;
         while wi < windows.len() {
-            let mut dead = Vec::new();
+            // Decide respawn vs give-up for each dead pane.
+            let mut respawn: Vec<(usize, PaneRole, u32)> = Vec::new();
+            let mut give_up: Vec<usize> = Vec::new();
             for p in windows[wi].panes.iter_mut() {
                 if p.is_dead() {
-                    dead.push(p.id);
+                    let fast = p.age() < Duration::from_millis(1500);
+                    let fails = if fast { p.respawns() + 1 } else { 0 };
+                    if fails >= 4 {
+                        give_up.push(p.id);
+                    } else {
+                        respawn.push((p.id, p.role, fails));
+                    }
                 }
             }
-            for id in dead {
+            for (id, role, fails) in respawn {
+                let dir = windows[wi].dir.clone();
+                let mut newp = respawn_pane(role, &dir, id, &cfg, &shell, &tx)?;
+                newp.set_respawns(fails);
+                if let Some(slot) = windows[wi].panes.iter_mut().find(|p| p.id == id) {
+                    *slot = newp;
+                }
+                if wi == cur {
+                    needs_clear = true;
+                }
+                dirty = true;
+            }
+            for id in give_up {
                 let w = &mut windows[wi];
                 close_leaf(&mut w.panes, &mut w.layout, id);
                 if wi == cur {
@@ -1000,6 +1068,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         w.focus_id = f;
                     }
                 }
+                relayout(&mut w.panes, &w.layout, c, area)?;
                 wi += 1;
             }
         }

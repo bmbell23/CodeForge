@@ -109,7 +109,10 @@ the first of `~/projects` or `~/work/projects` that exists.
 | `Ctrl-a a`  | Send a literal `Ctrl-a` to the child |
 | **Click a pane** | Focus it (clicks reach nvim too) |
 
-Every other key goes to the focused pane's process.
+Every other key goes to the focused pane's process. **Exiting a pane's program**
+(`exit`, Ctrl-D, `:q`) **respawns it** — the terminal comes back, the editor
+reopens, the AI pane returns on `claude --resume`. Only `Ctrl-a x` removes a
+pane. Split (`Ctrl-a |` / `-`) for **multiple terminals in one window**.
 
 > **Running inside tmux?** Don't — CodeForge is itself a multiplexer, and tmux
 > will intercept `Ctrl-a`. Run `forge` in a plain terminal. (If you must nest it,

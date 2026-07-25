@@ -5,6 +5,7 @@
 use std::io::{Read, Write};
 use std::sync::mpsc::Sender;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
@@ -36,6 +37,11 @@ pub struct Pane {
     parser: vt100::Parser,
     /// How many rows we're scrolled back into history (0 = live bottom).
     scroll: usize,
+    /// When this child was spawned (to distinguish a quick crash from a normal
+    /// exit when deciding whether to respawn).
+    spawned_at: Instant,
+    /// Consecutive fast respawns, to break a crash loop.
+    respawns: u32,
     /// Shown in the pane's border.
     pub title: String,
 }
@@ -99,6 +105,8 @@ impl Pane {
             child,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK),
             scroll: 0,
+            spawned_at: Instant::now(),
+            respawns: 0,
             title,
         })
     }
@@ -106,6 +114,21 @@ impl Pane {
     /// The child's process id, if known (used to read its cwd via /proc).
     pub fn pid(&self) -> Option<u32> {
         self.child.process_id()
+    }
+
+    /// How long this child has been alive.
+    pub fn age(&self) -> Duration {
+        self.spawned_at.elapsed()
+    }
+
+    /// Consecutive fast respawns (crash-loop guard).
+    pub fn respawns(&self) -> u32 {
+        self.respawns
+    }
+
+    /// Carry the respawn counter onto a freshly respawned pane.
+    pub fn set_respawns(&mut self, n: u32) {
+        self.respawns = n;
     }
 
     /// Feed child output into the emulator.
