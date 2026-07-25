@@ -126,13 +126,16 @@ fn fetch_weather(city: &str) -> Option<String> {
 }
 
 /// Ask a running nvim (via its RPC socket) for its listed, named buffers.
+/// Bounded by `timeout` so a busy/starting nvim can never hang the server.
 fn query_nvim_files(sock: &Path) -> Vec<PathBuf> {
     if !sock.exists() {
         return Vec::new();
     }
     let expr =
         r#"join(filter(map(getbufinfo({"buflisted":1}), "v:val.name"), "v:val != \"\""), "\n")"#;
-    let out = Command::new("nvim")
+    let out = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
         .arg("--server")
         .arg(sock)
         .arg("--remote-expr")
@@ -869,10 +872,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // Whether to keep persisting the session (Ctrl-a fresh turns this off).
     let mut save_enabled = true;
 
-    // Persist the session so a fresh `forge` can restore it. Re-captured when the
-    // window set changes and on teardown (reload/quit).
+    // Persist the session so a fresh `forge` can restore it. Save the specs we
+    // started from (don't query the just-launched nvim yet — it's still loading,
+    // and its RPC would block); richer capture happens on change / teardown.
     let mut last_dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
-    save_snapshot(&capture_specs(&windows));
+    save_snapshot(&specs);
 
     {
         let w = &mut windows[cur];
