@@ -29,6 +29,8 @@ pub struct Config {
     pub right_ratio: f32,
     /// Location for the status-bar temperature (empty disables it).
     pub weather: String,
+    /// Editor line wrapping. When false, CodeForge starts nvim with `nowrap`.
+    pub wrap: bool,
     /// Per-action keybindings (single chars, pressed after the prefix).
     pub keys: Keys,
 }
@@ -80,6 +82,7 @@ impl Default for Config {
             editor_ratio: 0.5,
             right_ratio: 0.5,
             weather: "Colorado Springs".into(),
+            wrap: true,
             keys: Keys::default(),
         }
     }
@@ -381,6 +384,10 @@ right_ratio  = 0.5   # terminal height fraction of the right column
 
 # Status-bar temperature location (empty "" disables it).
 weather = "Colorado Springs"
+
+# Editor line wrapping. true wraps long lines (default); false starts nvim with
+# `nowrap` so long lines run off-screen instead.
+wrap = true
 
 # Keybindings — single characters pressed after the prefix. Each must be unique;
 # digits 1-9 are reserved for switching windows. Warnings print on startup.

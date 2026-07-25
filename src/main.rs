@@ -494,6 +494,10 @@ fn build_editor(
         let _ = std::fs::remove_file(&sock); // stale socket blocks --listen
         c.arg("--listen");
         c.arg(&sock);
+        if !cfg.wrap {
+            c.arg("-c");
+            c.arg("set nowrap");
+        }
     }
     if files.is_empty() {
         c.arg(".");
@@ -1246,7 +1250,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     let (c, r) = size;
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
-                    if let Some(role) = w.focus_role() {
+                    // The editor is a single nvim; close its buffers with nvim's
+                    // own keys (<leader>bd), never by killing the whole pane.
+                    if let Some(role) = w.focus_role().filter(|r| *r != PaneRole::Editor) {
                         let ids = w.slot_ids(role);
                         if ids.len() > 1 {
                             // Kill + drop the active child, activate a neighbour.
