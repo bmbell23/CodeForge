@@ -1236,11 +1236,18 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         if dirty {
             if let Some(cl) = client.as_mut() {
                 let now = chrono::Local::now();
-                let temp = weather.lock().unwrap().clone();
+                // weather, then date, then clock (drop wttr.in's leading '+').
+                let temp = weather
+                    .lock()
+                    .unwrap()
+                    .trim_start_matches('+')
+                    .trim()
+                    .to_string();
+                let dt = now.format("%a %b %-d  %H:%M");
                 let right_info = if temp.is_empty() {
-                    now.format("%a %b %-d  %H:%M").to_string()
+                    dt.to_string()
                 } else {
-                    format!("{}  {temp}", now.format("%a %b %-d  %H:%M"))
+                    format!("{temp}  {dt}")
                 };
                 framebuf.clear();
                 render(
