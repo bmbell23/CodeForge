@@ -131,9 +131,12 @@ impl Pane {
         self.respawns = n;
     }
 
-    /// Feed child output into the emulator.
+    /// Feed child output into the emulator. vt100 can panic on internal edge
+    /// cases (e.g. wrapping a wide glyph in a degenerate grid); contain it so a
+    /// single pane's bad byte stream can never take down the whole server.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.process(bytes);
+        let parser = &mut self.parser;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(bytes)));
     }
 
     /// Forward user input to the child.
@@ -201,7 +204,9 @@ impl Pane {
     }
 }
 
-/// A PTY of zero rows/cols is invalid and vt100 panics on it; keep at least 1x1.
+/// vt100 panics on a 0-sized grid, and its wrap/scroll math underflows on a
+/// 1-row or 1-col grid (grid.rs col_wrap), so keep every emulator at least 2x2.
+/// Panes drawn smaller than that have no inner area and aren't blitted anyway.
 fn clamp_size(rows: u16, cols: u16) -> (u16, u16) {
-    (rows.max(1), cols.max(1))
+    (rows.max(2), cols.max(2))
 }
