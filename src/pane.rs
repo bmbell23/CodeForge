@@ -161,6 +161,12 @@ impl Pane {
         self.parser.screen()
     }
 
+    /// Cumulative count of audible bells (BEL) the child has emitted. Claude
+    /// rings the bell when it wants input, so a rising count means "attention".
+    pub fn bell_count(&self) -> usize {
+        self.parser.screen().audible_bell_count()
+    }
+
     /// Whether the child has enabled a mouse reporting mode. Forwarding mouse
     /// events to a child that hasn't (e.g. a bare shell) just prints junk.
     pub fn wants_mouse(&self) -> bool {

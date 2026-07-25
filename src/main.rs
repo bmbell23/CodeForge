@@ -103,6 +103,28 @@ fn proc_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
+/// Fetch the current temperature for `city` from wttr.in (best-effort, via curl).
+fn fetch_weather(city: &str) -> Option<String> {
+    let q = city.trim().replace(' ', "+");
+    let url = format!("https://wttr.in/{q}?format=%t&u");
+    let out = Command::new("curl")
+        .arg("-s")
+        .arg("--max-time")
+        .arg("4")
+        .arg(&url)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    // wttr.in returns e.g. "+72°F"; reject error pages / junk.
+    if s.is_empty() || s.len() > 12 || s.contains("Unknown") || s.contains("html") {
+        return None;
+    }
+    Some(s)
+}
+
 /// Ask a running nvim (via its RPC socket) for its listed, named buffers.
 fn query_nvim_files(sock: &Path) -> Vec<PathBuf> {
     if !sock.exists() {
@@ -187,10 +209,10 @@ pub enum Msg {
     NewWindow,
     /// Close the current window (kills its panes).
     CloseWindow,
-    /// Switch to the next window.
-    NextWindow,
     /// Switch to window `n` (0-based).
     SelectWindow(usize),
+    /// Periodic tick to refresh the status-bar clock.
+    Tick,
     /// Reload: restart the server on the latest build, reopening the same dirs.
     Reload,
     /// Forget the saved session (next `forge` starts fresh).
@@ -211,6 +233,10 @@ struct Window {
     show_editor: bool,
     show_shell: bool,
     show_ai: bool,
+    /// The AI pane wants attention (bell rang while this window was unfocused).
+    attention: bool,
+    /// Last-seen AI-pane bell count, to detect new bells.
+    last_ai_bell: usize,
 }
 
 /// Find the id of the pane with a given role (all three always exist).
@@ -338,6 +364,8 @@ fn new_window(
         show_editor: true,
         show_shell: true,
         show_ai: true,
+        attention: false,
+        last_ai_bell: 0,
     })
 }
 
@@ -534,6 +562,9 @@ fn main() -> Result<()> {
     let (cfg, warn) = Config::load();
     if let Some(w) = warn {
         eprintln!("codeforge: {w}");
+    }
+    for c in cfg.keys.conflicts() {
+        eprintln!("codeforge: keybind warning: {c}");
     }
     let proot = cfg
         .projects_root
@@ -795,6 +826,32 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         });
     }
 
+    // Status-bar clock tick.
+    {
+        let tx = tx.clone();
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_secs(15));
+            if tx.send(Msg::Tick).is_err() {
+                break;
+            }
+        });
+    }
+
+    // Status-bar weather (best-effort, refreshed every 10 minutes).
+    let weather = Arc::new(Mutex::new(String::new()));
+    if !cfg.weather.trim().is_empty() {
+        let weather = weather.clone();
+        let city = cfg.weather.clone();
+        let tx = tx.clone();
+        thread::spawn(move || loop {
+            if let Some(t) = fetch_weather(&city) {
+                *weather.lock().unwrap() = t;
+                let _ = tx.send(Msg::Tick);
+            }
+            thread::sleep(Duration::from_secs(600));
+        });
+    }
+
     let mut windows: Vec<Window> = Vec::new();
     let mut next_id: usize = 0;
     for spec in &specs {
@@ -917,7 +974,12 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         PaneRole::Ai => (&mut w.show_ai, w.show_editor || w.show_shell),
                     };
                     if !*flag || others {
+                        let now_shown = !*flag;
                         *flag = !*flag;
+                        // Showing a pane focuses it.
+                        if now_shown {
+                            w.focus_id = role_id(&w.panes, role);
+                        }
                         refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
                         relayout(&mut w.panes, &w.layout, c, area)?;
                         dirty = true;
@@ -1053,19 +1115,16 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     let w = &mut windows[cur];
                     relayout(&mut w.panes, &w.layout, c, area)?;
                 }
-                Msg::NextWindow => {
-                    if !windows.is_empty() {
-                        cur = (cur + 1) % windows.len();
-                        dirty = true;
-                        needs_clear = true;
-                    }
-                }
                 Msg::SelectWindow(n) => {
                     if n < windows.len() && n != cur {
                         cur = n;
                         dirty = true;
                         needs_clear = true;
                     }
+                }
+                Msg::Tick => {
+                    // Just refresh the status-bar clock.
+                    dirty = true;
                 }
                 Msg::Reload => {
                     // Restart the server on the latest build, restoring the same
@@ -1149,8 +1208,36 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
             last_dirs = now_dirs;
         }
 
+        // Flag a background window whose Claude pane rang the bell (wants input).
+        for (idx, w) in windows.iter_mut().enumerate() {
+            if let Some(ai) = w.panes.iter().find(|p| p.role == PaneRole::Ai) {
+                let bc = ai.bell_count();
+                if bc > w.last_ai_bell {
+                    w.last_ai_bell = bc;
+                    if idx != cur {
+                        w.attention = true;
+                        dirty = true;
+                    }
+                }
+            }
+        }
+        // Viewing a window clears its attention flag.
+        if let Some(w) = windows.get_mut(cur) {
+            if w.attention {
+                w.attention = false;
+                dirty = true;
+            }
+        }
+
         if dirty {
             if let Some(cl) = client.as_mut() {
+                let now = chrono::Local::now();
+                let temp = weather.lock().unwrap().clone();
+                let right_info = if temp.is_empty() {
+                    now.format("%a %b %-d  %H:%M").to_string()
+                } else {
+                    format!("{}  {temp}", now.format("%a %b %-d  %H:%M"))
+                };
                 framebuf.clear();
                 render(
                     &mut framebuf,
@@ -1161,6 +1248,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     needs_clear,
                     show_help,
                     picker.as_ref(),
+                    &right_info,
+                    keys,
                 )?;
                 if protocol::write_frame(cl, protocol::OUTPUT, &framebuf).is_err() {
                     client = None;
@@ -1404,8 +1493,6 @@ impl InputParser {
                         Some(Msg::NewWindow)
                     } else if c == k.win_close {
                         Some(Msg::CloseWindow)
-                    } else if c == k.win_next {
-                        Some(Msg::NextWindow)
                     } else if c == k.detach {
                         Some(Msg::Detach)
                     } else if c == k.reload {
@@ -1491,6 +1578,8 @@ fn render(
     clear: bool,
     show_help: bool,
     picker: Option<&Picker>,
+    right_info: &str,
+    keys: Keys,
 ) -> Result<()> {
     let w = &windows[cur];
     let area = rows.saturating_sub(1);
@@ -1521,7 +1610,7 @@ fn render(
         }
     }
 
-    draw_status(out, cols, rows, windows, cur)?;
+    draw_status(out, cols, rows, windows, cur, right_info)?;
 
     // Position the real cursor inside the focused pane.
     if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == w.focus_id) {
@@ -1540,7 +1629,7 @@ fn render(
     }
 
     if show_help {
-        draw_help(out, cols, rows)?;
+        draw_help(out, cols, rows, keys)?;
     }
     if let Some(pk) = picker {
         pk.render(out, cols, rows)?;
@@ -1549,14 +1638,16 @@ fn render(
     Ok(())
 }
 
-/// Draw the bottom status bar: window tabs (1:name …) with the current one
-/// highlighted, plus a hint.
+/// Draw the bottom status bar: window tabs on the left (current highlighted,
+/// orange when a window wants attention), and the date/clock/temperature on the
+/// right. Keybinds live in the `Ctrl-a ?` overlay, not here.
 fn draw_status(
     out: &mut Vec<u8>,
     cols: u16,
     rows: u16,
     windows: &[Window],
     cur: usize,
+    right_info: &str,
 ) -> Result<()> {
     let y = rows.saturating_sub(1);
     // Fill the row so old content is covered.
@@ -1570,55 +1661,72 @@ fn draw_status(
         Print(" forge "),
     )?;
     for (i, w) in windows.iter().enumerate() {
-        if i == cur {
-            queue!(
-                out,
-                SetBackgroundColor(Color::Cyan),
-                SetForegroundColor(Color::Black)
-            )?;
+        let (bg, fg) = if i == cur {
+            (Color::Cyan, Color::Black)
+        } else if w.attention {
+            (
+                Color::Rgb {
+                    r: 230,
+                    g: 130,
+                    b: 20,
+                },
+                Color::Black,
+            ) // orange: wants input
         } else {
-            queue!(
-                out,
-                SetBackgroundColor(Color::DarkGrey),
-                SetForegroundColor(Color::White)
-            )?;
-        }
+            (Color::DarkGrey, Color::White)
+        };
+        queue!(out, SetBackgroundColor(bg), SetForegroundColor(fg))?;
         queue!(out, Print(format!(" {}:{} ", i + 1, w.title)))?;
     }
-    queue!(
-        out,
-        SetBackgroundColor(Color::DarkGrey),
-        SetForegroundColor(Color::Grey),
-        Print("  ^a c:new  ^a n:next  ^a ?:help"),
-        ResetColor,
-    )?;
+
+    // Right-aligned date / clock / temperature.
+    if !right_info.is_empty() {
+        let text = format!(" {right_info} ");
+        let w = text.chars().count() as u16;
+        if w + 1 < cols {
+            queue!(
+                out,
+                cursor::MoveTo(cols - w, y),
+                SetBackgroundColor(Color::DarkGrey),
+                SetForegroundColor(Color::White),
+                Print(text),
+            )?;
+        }
+    }
+    queue!(out, ResetColor)?;
     Ok(())
 }
 
-/// Draw a centered overlay listing the CodeForge keybindings.
-fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
-    let lines = [
-        "  CodeForge — keys (prefix Ctrl-a)  ",
-        "",
-        "  Ctrl-a e      show/hide editor     ",
-        "  Ctrl-a t      show/hide terminal   ",
-        "  Ctrl-a a      show/hide Claude     ",
-        "  Ctrl-a hjkl   move focus           ",
-        "  Ctrl-a o      cycle focus          ",
-        "  Ctrl-a p      switch project       ",
-        "  Ctrl-a c      new window           ",
-        "  Ctrl-a X      close window         ",
-        "  Ctrl-a n      next window          ",
-        "  Ctrl-a 1..9   jump to window       ",
-        "  Ctrl-a d      detach (stays alive) ",
-        "  Ctrl-a r      reload (new build)   ",
-        "  Ctrl-a F      forget saved session ",
-        "  Ctrl-a q      quit (ends session)  ",
-        "  Ctrl-a ?      toggle this help     ",
-        "  click / wheel  focus / scroll      ",
-        "",
-        "  edit ~/.config/codeforge/config.toml",
+/// Draw a centered overlay listing the CodeForge keybindings, built from the
+/// live config so it reflects any customizations.
+fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16, k: Keys) -> Result<()> {
+    // (key display, label). Ctrl-a is the prefix for all of these.
+    let binds: [(String, &str); 15] = [
+        (k.toggle_editor.to_string(), "show/hide editor"),
+        (k.toggle_shell.to_string(), "show/hide terminal"),
+        (k.toggle_ai.to_string(), "show/hide Claude"),
+        ("hjkl".into(), "move focus"),
+        (k.cycle.to_string(), "cycle focus"),
+        (k.picker.to_string(), "switch project"),
+        (k.win_new.to_string(), "new window"),
+        (k.win_close.to_string(), "close window"),
+        ("1..9".into(), "jump to window"),
+        (k.detach.to_string(), "detach (stays alive)"),
+        (k.reload.to_string(), "reload (new build)"),
+        (k.fresh.to_string(), "forget saved session"),
+        (k.quit.to_string(), "quit (ends session)"),
+        (k.help.to_string(), "toggle this help"),
+        ("click".into(), "focus / wheel scrolls"),
     ];
+    let mut lines: Vec<String> = Vec::new();
+    lines.push("  CodeForge — keys (prefix Ctrl-a)  ".to_string());
+    lines.push(String::new());
+    for (key, label) in &binds {
+        lines.push(format!("  Ctrl-a {key:<5}  {label}"));
+    }
+    lines.push(String::new());
+    lines.push("  edit ~/.config/codeforge/config.toml  ".to_string());
+
     let w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 2;
     let h = lines.len() as u16 + 2;
     if w > cols || h > rows {

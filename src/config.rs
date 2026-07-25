@@ -27,6 +27,8 @@ pub struct Config {
     pub editor_ratio: f32,
     /// Fraction of the right column given to the shell (vs the AI) pane.
     pub right_ratio: f32,
+    /// Location for the status-bar temperature (empty disables it).
+    pub weather: String,
     /// Per-action keybindings (single chars, pressed after the prefix).
     pub keys: Keys,
 }
@@ -51,8 +53,6 @@ pub struct Keys {
     pub win_new: char,
     /// Close the current window (kills all its panes).
     pub win_close: char,
-    /// Switch to the next window.
-    pub win_next: char,
     /// Detach the client (leaves the server running in the background).
     pub detach: char,
     /// Reload: restart the server on the latest build, reopening the same
@@ -72,6 +72,7 @@ impl Default for Config {
             ai: "claude".into(),
             editor_ratio: 0.5,
             right_ratio: 0.5,
+            weather: "Colorado Springs".into(),
             keys: Keys::default(),
         }
     }
@@ -87,17 +88,65 @@ impl Default for Keys {
             cycle: 'o',
             toggle_editor: 'e',
             toggle_shell: 't',
-            toggle_ai: 'a',
+            toggle_ai: 'c',
             picker: 'p',
             help: '?',
             quit: 'q',
-            win_new: 'c',
+            win_new: 'n',
             win_close: 'X',
-            win_next: 'n',
             detach: 'd',
             reload: 'r',
             fresh: 'F',
         }
+    }
+}
+
+impl Keys {
+    /// All (action, key) bindings, for help display and conflict checking.
+    fn bindings(&self) -> [(&'static str, char); 16] {
+        [
+            ("focus_left", self.focus_left),
+            ("focus_down", self.focus_down),
+            ("focus_up", self.focus_up),
+            ("focus_right", self.focus_right),
+            ("cycle", self.cycle),
+            ("toggle_editor", self.toggle_editor),
+            ("toggle_shell", self.toggle_shell),
+            ("toggle_ai", self.toggle_ai),
+            ("picker", self.picker),
+            ("help", self.help),
+            ("quit", self.quit),
+            ("win_new", self.win_new),
+            ("win_close", self.win_close),
+            ("detach", self.detach),
+            ("reload", self.reload),
+            ("fresh", self.fresh),
+        ]
+    }
+
+    /// Human-readable warnings about the keybindings: two actions on the same
+    /// key (one would be dead), or a digit key (reserved for window switching).
+    pub fn conflicts(&self) -> Vec<String> {
+        let b = self.bindings();
+        let mut msgs = Vec::new();
+        for i in 0..b.len() {
+            for j in (i + 1)..b.len() {
+                if b[i].1 == b[j].1 {
+                    msgs.push(format!(
+                        "keys '{}' and '{}' both use '{}' (one will be ignored)",
+                        b[i].0, b[j].0, b[i].1
+                    ));
+                }
+            }
+        }
+        for (name, ch) in b {
+            if ch.is_ascii_digit() {
+                msgs.push(format!(
+                    "key '{name}' uses digit '{ch}', reserved for window switching (prefix 1..9)"
+                ));
+            }
+        }
+        msgs
     }
 }
 
@@ -177,7 +226,11 @@ ai = "claude"
 editor_ratio = 0.5   # editor width fraction (left column)
 right_ratio  = 0.5   # terminal height fraction of the right column
 
-# Keybindings — single characters pressed after the prefix.
+# Status-bar temperature location (empty "" disables it).
+weather = "Colorado Springs"
+
+# Keybindings — single characters pressed after the prefix. Each must be unique;
+# digits 1-9 are reserved for switching windows. Warnings print on startup.
 [keys]
 focus_left = "h"
 focus_down = "j"
@@ -186,13 +239,12 @@ focus_right = "l"
 cycle = "o"
 toggle_editor = "e"   # show/hide the editor pane
 toggle_shell  = "t"   # show/hide the terminal pane
-toggle_ai     = "a"   # show/hide the Claude pane
+toggle_ai     = "c"   # show/hide the Claude pane
 picker = "p"
 help = "?"
 quit = "q"
-win_new = "c"    # new window (choose its project)
+win_new = "n"    # new window (choose its project)
 win_close = "X"  # close the current window (kills its panes)
-win_next = "n"   # switch to next window
 detach = "d"     # detach client; server keeps running (reattach: forge)
 reload = "r"     # restart server on latest build, reopen same windows
 fresh = "F"      # forget saved session (next forge starts from the picker)
