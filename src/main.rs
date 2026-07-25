@@ -212,6 +212,12 @@ pub enum Msg {
     NewWindow,
     /// Close the current window (kills its panes).
     CloseWindow,
+    /// New child (tab) in the focused slot.
+    TabNew,
+    /// Cycle the focused slot's active child (+1 next, -1 prev).
+    TabCycle(i32),
+    /// Close the focused slot's active child.
+    TabClose,
     /// Switch to window `n` (0-based).
     SelectWindow(usize),
     /// Periodic tick to refresh the status-bar clock.
@@ -228,9 +234,13 @@ pub enum Msg {
 /// The layout is derived from which panes are visible (no arbitrary splits): the
 /// editor is a full-height left column; the terminal and AI stack on the right.
 struct Window {
+    /// All child panes across the three slots. A slot (terminal or Claude) can
+    /// hold several children (tabs, #12); only its active one is laid out.
     panes: Vec<Pane>,
     layout: Layout,
     focus_id: usize,
+    /// Active child id per slot, indexed by `role_index` (editor, shell, ai).
+    active: [usize; 3],
     dir: PathBuf,
     title: String,
     show_editor: bool,
@@ -242,31 +252,57 @@ struct Window {
     last_ai_bell: usize,
 }
 
-/// Find the id of the pane with a given role (all three always exist).
-fn role_id(panes: &[Pane], role: PaneRole) -> usize {
-    panes
-        .iter()
-        .find(|p| p.role == role)
-        .map(|p| p.id)
-        .unwrap_or(0)
+/// Slot index for a role: editor 0, shell 1, ai 2. Used to index `Window.active`.
+fn role_index(role: PaneRole) -> usize {
+    match role {
+        PaneRole::Editor => 0,
+        PaneRole::Shell => 1,
+        PaneRole::Ai => 2,
+    }
+}
+
+impl Window {
+    /// Ids of this slot's children, in tab order.
+    fn slot_ids(&self, role: PaneRole) -> Vec<usize> {
+        self.panes
+            .iter()
+            .filter(|p| p.role == role)
+            .map(|p| p.id)
+            .collect()
+    }
+
+    /// (position of the active child, total children) for a slot.
+    fn slot_pos(&self, role: PaneRole) -> (usize, usize) {
+        let ids = self.slot_ids(role);
+        let active = self.active[role_index(role)];
+        let pos = ids.iter().position(|&i| i == active).unwrap_or(0);
+        (pos, ids.len())
+    }
+
+    /// The role of the currently focused child.
+    fn focus_role(&self) -> Option<PaneRole> {
+        self.panes
+            .iter()
+            .find(|p| p.id == self.focus_id)
+            .map(|p| p.role)
+    }
 }
 
 /// Derive the layout tree from which panes are visible. Editor (when shown) is a
 /// full-height left column; terminal-over-AI stack on the right. With the editor
 /// hidden, the remaining panes go side by side (AI left, terminal right). Returns
 /// `None` if nothing is visible.
+#[allow(clippy::too_many_arguments)]
 fn compute_layout(
-    panes: &[Pane],
+    e: usize,
+    s: usize,
+    a: usize,
     show_editor: bool,
     show_shell: bool,
     show_ai: bool,
     editor_ratio: f32,
     right_ratio: f32,
 ) -> Option<Layout> {
-    let e = role_id(panes, PaneRole::Editor);
-    let s = role_id(panes, PaneRole::Shell);
-    let a = role_id(panes, PaneRole::Ai);
-
     if show_editor {
         let mut right = Vec::new();
         if show_shell {
@@ -321,7 +357,9 @@ fn compute_layout(
 /// focused pane became hidden.
 fn refresh_layout(w: &mut Window, editor_ratio: f32, right_ratio: f32) {
     if let Some(l) = compute_layout(
-        &w.panes,
+        w.active[0],
+        w.active[1],
+        w.active[2],
         w.show_editor,
         w.show_shell,
         w.show_ai,
@@ -355,13 +393,25 @@ fn new_window(
     tx: &Sender<Msg>,
 ) -> Result<Window> {
     let panes = spawn_ide(spec, cfg, shell, base, tx)?;
-    let layout = compute_layout(&panes, true, true, true, cfg.editor_ratio, cfg.right_ratio)
-        .unwrap_or(Layout::Leaf(base));
+    // spawn_ide assigns editor=base, shell=base+1, ai=base+2.
+    let active = [base, base + 1, base + 2];
+    let layout = compute_layout(
+        active[0],
+        active[1],
+        active[2],
+        true,
+        true,
+        true,
+        cfg.editor_ratio,
+        cfg.right_ratio,
+    )
+    .unwrap_or(Layout::Leaf(base));
     let title = dir_title(&spec.dir);
     Ok(Window {
         panes,
         layout,
         focus_id: base,
+        active,
         dir: spec.dir.clone(),
         title,
         show_editor: true,
@@ -992,9 +1042,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     if !*flag || others {
                         let now_shown = !*flag;
                         *flag = !*flag;
-                        // Showing a pane focuses it.
+                        // Showing a pane focuses its active child.
                         if now_shown {
-                            w.focus_id = role_id(&w.panes, role);
+                            w.focus_id = w.active[role_index(role)];
                         }
                         refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
                         relayout(&mut w.panes, &w.layout, c, area)?;
@@ -1136,6 +1186,93 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
                     relayout(&mut w.panes, &w.layout, c, area)?;
+                }
+                Msg::TabNew => {
+                    // Add another child to the focused slot. The editor stays a
+                    // single nvim (use its native buffers/tabs), so this only
+                    // applies to the terminal and Claude slots.
+                    let (c, r) = size;
+                    let area = r.saturating_sub(1);
+                    let w = &mut windows[cur];
+                    if let Some(role) = w.focus_role() {
+                        if role != PaneRole::Editor {
+                            let id = next_id;
+                            next_id += 1;
+                            let dir = w.dir.clone();
+                            let pane = if role == PaneRole::Shell {
+                                Pane::spawn(
+                                    command(&shell, &dir),
+                                    "shell".into(),
+                                    PaneRole::Shell,
+                                    1,
+                                    1,
+                                    id,
+                                    tx.clone(),
+                                )?
+                            } else {
+                                let (cmd, title) = command_line(&cfg.ai, &dir);
+                                Pane::spawn(cmd, title, PaneRole::Ai, 1, 1, id, tx.clone())?
+                            };
+                            w.panes.push(pane);
+                            w.active[role_index(role)] = id;
+                            w.focus_id = id;
+                            refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                            relayout(&mut w.panes, &w.layout, c, area)?;
+                            dirty = true;
+                            needs_clear = true;
+                        }
+                    }
+                }
+                Msg::TabCycle(delta) => {
+                    let (c, r) = size;
+                    let area = r.saturating_sub(1);
+                    let w = &mut windows[cur];
+                    if let Some(role) = w.focus_role() {
+                        let ids = w.slot_ids(role);
+                        if ids.len() > 1 {
+                            let (pos, n) = w.slot_pos(role);
+                            let next = (pos as i32 + delta).rem_euclid(n as i32) as usize;
+                            let nid = ids[next];
+                            w.active[role_index(role)] = nid;
+                            w.focus_id = nid;
+                            refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                            relayout(&mut w.panes, &w.layout, c, area)?;
+                            dirty = true;
+                            needs_clear = true;
+                        }
+                    }
+                }
+                Msg::TabClose => {
+                    let (c, r) = size;
+                    let area = r.saturating_sub(1);
+                    let w = &mut windows[cur];
+                    if let Some(role) = w.focus_role() {
+                        let ids = w.slot_ids(role);
+                        if ids.len() > 1 {
+                            // Kill + drop the active child, activate a neighbour.
+                            let active = w.active[role_index(role)];
+                            let (pos, _) = w.slot_pos(role);
+                            if let Some(idx) = w.panes.iter().position(|p| p.id == active) {
+                                w.panes[idx].kill();
+                                w.panes.remove(idx);
+                            }
+                            let remaining = w.slot_ids(role);
+                            let nid = remaining[pos.min(remaining.len() - 1)];
+                            w.active[role_index(role)] = nid;
+                            w.focus_id = nid;
+                            refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                            relayout(&mut w.panes, &w.layout, c, area)?;
+                            dirty = true;
+                            needs_clear = true;
+                        } else {
+                            // Last child of the slot: kill it and let the respawn
+                            // loop bring a fresh one back (like typing `exit`).
+                            let active = w.active[role_index(role)];
+                            if let Some(p) = w.panes.iter_mut().find(|p| p.id == active) {
+                                p.kill();
+                            }
+                        }
+                    }
                 }
                 Msg::SelectWindow(n) => {
                     if n < windows.len() && n != cur {
@@ -1534,6 +1671,14 @@ impl InputParser {
                         Some(Msg::NewWindow)
                     } else if c == k.win_close {
                         Some(Msg::CloseWindow)
+                    } else if c == k.tab_new {
+                        Some(Msg::TabNew)
+                    } else if c == k.tab_next {
+                        Some(Msg::TabCycle(1))
+                    } else if c == k.tab_prev {
+                        Some(Msg::TabCycle(-1))
+                    } else if c == k.tab_close {
+                        Some(Msg::TabClose)
                     } else if c == k.detach {
                         Some(Msg::Detach)
                     } else if c == k.reload {
@@ -1644,7 +1789,15 @@ fn render(
 
     for (id, rect) in &rects {
         if let Some(p) = w.panes.iter().find(|p| p.id == *id) {
-            draw_border(out, rect, &p.title, *id == w.focus_id)?;
+            // Show a tab counter in the border when a slot has more than one
+            // child (e.g. "shell 2/3"), so stacked terminals/Claude are visible.
+            let (pos, n) = w.slot_pos(p.role);
+            let title = if n > 1 {
+                format!("{} {}/{}", p.title, pos + 1, n)
+            } else {
+                p.title.clone()
+            };
+            draw_border(out, rect, &title, *id == w.focus_id)?;
             if let Some(inner) = rect.inner() {
                 blit_pane(out, p.screen(), inner)?;
             }

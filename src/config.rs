@@ -60,6 +60,13 @@ pub struct Keys {
     pub reload: char,
     /// Forget the saved session so the next `forge` starts fresh (the picker).
     pub fresh: char,
+    /// New child in the focused slot (another terminal / Claude session).
+    pub tab_new: char,
+    /// Cycle to the next / previous child in the focused slot.
+    pub tab_next: char,
+    pub tab_prev: char,
+    /// Close the active child in the focused slot.
+    pub tab_close: char,
 }
 
 impl Default for Config {
@@ -97,6 +104,10 @@ impl Default for Keys {
             detach: 'd',
             reload: 'r',
             fresh: 'F',
+            tab_new: 's',
+            tab_next: ']',
+            tab_prev: '[',
+            tab_close: 'w',
         }
     }
 }
@@ -104,10 +115,14 @@ impl Default for Keys {
 /// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
 /// `(config field, human label)`. Focus keys are listed individually so each
 /// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
-pub const EDITABLE: [(&str, &str); 16] = [
+pub const EDITABLE: [(&str, &str); 20] = [
     ("toggle_editor", "show/hide editor"),
     ("toggle_shell", "show/hide terminal"),
     ("toggle_ai", "show/hide Claude"),
+    ("tab_new", "new terminal/Claude tab"),
+    ("tab_next", "next tab (focused slot)"),
+    ("tab_prev", "prev tab (focused slot)"),
+    ("tab_close", "close tab (focused slot)"),
     ("focus_left", "focus left"),
     ("focus_down", "focus down"),
     ("focus_up", "focus up"),
@@ -143,6 +158,10 @@ impl Keys {
             "detach" => self.detach,
             "reload" => self.reload,
             "fresh" => self.fresh,
+            "tab_new" => self.tab_new,
+            "tab_next" => self.tab_next,
+            "tab_prev" => self.tab_prev,
+            "tab_close" => self.tab_close,
             _ => return None,
         })
     }
@@ -166,6 +185,10 @@ impl Keys {
             "detach" => self.detach = ch,
             "reload" => self.reload = ch,
             "fresh" => self.fresh = ch,
+            "tab_new" => self.tab_new = ch,
+            "tab_next" => self.tab_next = ch,
+            "tab_prev" => self.tab_prev = ch,
+            "tab_close" => self.tab_close = ch,
             _ => return false,
         }
         true
@@ -195,7 +218,7 @@ impl Keys {
     }
 
     /// All (action, key) bindings, for help display and conflict checking.
-    fn bindings(&self) -> [(&'static str, char); 16] {
+    fn bindings(&self) -> [(&'static str, char); 20] {
         [
             ("focus_left", self.focus_left),
             ("focus_down", self.focus_down),
@@ -213,6 +236,10 @@ impl Keys {
             ("detach", self.detach),
             ("reload", self.reload),
             ("fresh", self.fresh),
+            ("tab_new", self.tab_new),
+            ("tab_next", self.tab_next),
+            ("tab_prev", self.tab_prev),
+            ("tab_close", self.tab_close),
         ]
     }
 
@@ -374,6 +401,10 @@ win_close = "X"  # close the current window (kills its panes)
 detach = "d"     # detach client; server keeps running (reattach: forge)
 reload = "r"     # restart server on latest build, reopen same windows
 fresh = "F"      # forget saved session (next forge starts from the picker)
+tab_new = "s"    # new terminal / Claude tab in the focused slot
+tab_next = "]"   # next tab in the focused slot
+tab_prev = "["   # prev tab in the focused slot
+tab_close = "w"  # close the active tab in the focused slot
 # also: prefix + 1..9 jumps to that window
 "#;
 

@@ -128,26 +128,33 @@ the first of `~/projects` or `~/work/projects` that exists.
 |-------------|--------------------------------------|
 | `Ctrl-a e`  | Show/hide the **editor** pane        |
 | `Ctrl-a t`  | Show/hide the **terminal** pane      |
-| `Ctrl-a a`  | Show/hide the **Claude** pane        |
+| `Ctrl-a c`  | Show/hide the **Claude** pane        |
+| `Ctrl-a s`  | New tab in the focused slot (terminal/Claude) |
+| `Ctrl-a ]` / `[` | Next / prev tab in the focused slot |
+| `Ctrl-a w`  | Close the active tab in the focused slot |
 | `Ctrl-a h/j/k/l` | Move focus left/down/up/right   |
 | `Ctrl-a o`  | Cycle focus                          |
 | `Ctrl-a p`  | Switch project (re-home window)      |
-| `Ctrl-a c`  | New window (pick its project)        |
+| `Ctrl-a n`  | New window (pick its project)        |
 | `Ctrl-a X`  | Close current window                 |
-| `Ctrl-a n`  | Next window                          |
 | `Ctrl-a 1`–`9` | Jump to window                    |
 | `Ctrl-a d`  | Detach (server keeps running)        |
 | `Ctrl-a r`  | Reload server on latest build        |
 | `Ctrl-a F`  | Forget saved session (fresh next run)|
-| `Ctrl-a ?`  | Toggle keybinding help               |
+| `Ctrl-a ?`  | Keybinding help + live editor        |
 | `Ctrl-a q`  | Quit CodeForge (ends session)        |
-| `Ctrl-a a`  | Send a literal `Ctrl-a` to the child |
+| `Ctrl-a Ctrl-a` | Send a literal `Ctrl-a` to the child |
 | **Click a pane** | Focus it (clicks reach nvim too) |
+
+Keys are rebindable live in the `Ctrl-a ?` overlay (press `e`), no file editing
+needed. Each slot (terminal, Claude) can hold several **tabs**; the border shows
+`shell 2/3` when a slot is stacked. The editor stays a single nvim — use its
+native buffers/tabs (see below) for multiple files.
 
 Every other key goes to the focused pane's process. **Exiting a pane's program**
 (`exit`, Ctrl-D, `:q`) **respawns it** — the terminal comes back, the editor
 reopens, the AI pane returns on `claude --resume`. Panes are never destroyed,
-only **shown/hidden**: `Ctrl-a e` / `t` / `a`. The editor is a full-height left
+only **shown/hidden**: `Ctrl-a e` / `t` / `c`. The editor is a full-height left
 column with the terminal + Claude stacked on the right; hide the editor and the
 other two go side by side.
 
