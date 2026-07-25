@@ -52,6 +52,9 @@ pub struct Keys {
     pub win_next: char,
     /// Detach the client (leaves the server running in the background).
     pub detach: char,
+    /// Reload: restart the server on the latest build, reopening the same
+    /// project windows (pane contents reset).
+    pub reload: char,
 }
 
 impl Default for Config {
@@ -86,6 +89,7 @@ impl Default for Keys {
             win_new: 'c',
             win_next: 'n',
             detach: 'd',
+            reload: 'r',
         }
     }
 }
@@ -181,5 +185,6 @@ quit = "q"
 win_new = "c"    # new window (choose its project)
 win_next = "n"   # switch to next window
 detach = "d"     # detach client; server keeps running (reattach: forge)
+reload = "r"     # restart server on latest build, reopen same windows
 # also: prefix + 1..9 jumps to that window
 "#;

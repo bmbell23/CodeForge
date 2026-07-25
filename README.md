@@ -89,6 +89,7 @@ the first of `~/projects` or `~/work/projects` that exists.
 | `Ctrl-a n`  | Next window                          |
 | `Ctrl-a 1`–`9` | Jump to window                    |
 | `Ctrl-a d`  | Detach (server keeps running)        |
+| `Ctrl-a r`  | Reload server on latest build        |
 | `Ctrl-a ?`  | Toggle keybinding help               |
 | `Ctrl-a q`  | Quit CodeForge (ends session)        |
 | `Ctrl-a a`  | Send a literal `Ctrl-a` to the child |

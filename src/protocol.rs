@@ -17,6 +17,9 @@ pub const RESIZE: u8 = 3;
 pub const DETACH: u8 = 4;
 /// server -> client: terminal bytes to write to stdout. Payload: the bytes.
 pub const OUTPUT: u8 = 5;
+/// server -> client: the server is reloading; drop this connection and
+/// reconnect to the socket shortly. No payload.
+pub const RECONNECT: u8 = 6;
 
 /// Write one framed message.
 pub fn write_frame(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {

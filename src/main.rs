@@ -22,6 +22,7 @@
 //!   Ctrl-a c     new window (its own editor/shell/AI for another project)
 //!   Ctrl-a n     next window   ·   Ctrl-a 1..9  jump to window
 //!   Ctrl-a d     detach (server keeps running; reattach with `forge`)
+//!   Ctrl-a r     reload the server on the latest build (reopens same windows)
 //!   Ctrl-a ?     toggle the keybinding help overlay
 //!   Ctrl-a q     quit CodeForge (ends the session)
 //!   Ctrl-a a     send a literal Ctrl-a to the child
@@ -99,6 +100,8 @@ pub enum Msg {
     NextWindow,
     /// Switch to window `n` (0-based).
     SelectWindow(usize),
+    /// Reload: restart the server on the latest build, reopening the same dirs.
+    Reload,
     /// User asked to quit.
     Quit,
 }
@@ -241,9 +244,10 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let sock = socket_path();
 
-    // Server mode (spawned detached): `forge --server <project>`.
+    // Server mode (spawned detached): `forge --server <dir>...` — one window
+    // per directory (none = current dir).
     if args.get(1).map(|s| s == "--server").unwrap_or(false) {
-        return run_server(&sock, args.get(2).cloned());
+        return run_server(&sock, args[2..].to_vec());
     }
 
     // A session already running? Attach to it.
@@ -271,7 +275,7 @@ fn main() -> Result<()> {
         None => choose_project_interactive(&proot)?,
     };
 
-    spawn_server(&project)?;
+    spawn_server(&[project])?;
     wait_for_socket(&sock, Duration::from_secs(5))?;
     run_client(&sock)
 }
@@ -286,15 +290,16 @@ fn socket_path() -> PathBuf {
     base.join(format!("codeforge-{user}.sock"))
 }
 
-/// Spawn the server detached from the controlling terminal (via `setsid`) so it
-/// survives the client exiting / the SSH connection dropping.
-fn spawn_server(project: &Path) -> Result<()> {
+/// Spawn a server detached from the controlling terminal (via `setsid`) with one
+/// window per directory, so it survives the client exiting / the SSH drop.
+fn spawn_server(dirs: &[PathBuf]) -> Result<()> {
     let exe = std::env::current_exe().context("finding own executable")?;
-    Command::new("setsid")
-        .arg(exe)
-        .arg("--server")
-        .arg(project)
-        .stdin(Stdio::null())
+    let mut cmd = Command::new("setsid");
+    cmd.arg(exe).arg("--server");
+    for d in dirs {
+        cmd.arg(d);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -330,7 +335,7 @@ fn choose_project_interactive(proot: &Path) -> Result<PathBuf> {
 
 /// The persistent server: owns all windows/PTYs, renders to whatever client is
 /// attached, and keeps running across detaches/disconnects.
-fn run_server(sock: &Path, project: Option<String>) -> Result<()> {
+fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let _ = std::fs::remove_file(sock); // clear any stale socket
     let listener = UnixListener::bind(sock).context("binding server socket")?;
 
@@ -346,9 +351,13 @@ fn run_server(sock: &Path, project: Option<String>) -> Result<()> {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(projects_root);
-    let project_dir = project
-        .map(|p| resolve_arg_dir(&p, &proot))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // One window per directory (none = current dir).
+    let dir_list: Vec<PathBuf> = if dirs.is_empty() {
+        vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+    } else {
+        dirs.iter().map(|d| resolve_arg_dir(d, &proot)).collect()
+    };
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
@@ -408,9 +417,13 @@ fn run_server(sock: &Path, project: Option<String>) -> Result<()> {
         });
     }
 
-    let mut windows = vec![new_window(project_dir, &cfg, &shell, 0, &tx)?];
+    let mut windows: Vec<Window> = Vec::new();
+    let mut next_id: usize = 0;
+    for d in dir_list {
+        windows.push(new_window(d, &cfg, &shell, next_id, &tx)?);
+        next_id += 3;
+    }
     let mut cur = 0usize;
-    let mut next_id: usize = 3;
     let mut show_help = false;
     let mut picker: Option<Picker> = None;
     let mut picker_new_window = false;
@@ -666,6 +679,23 @@ fn run_server(sock: &Path, project: Option<String>) -> Result<()> {
                         needs_clear = true;
                     }
                 }
+                Msg::Reload => {
+                    // Restart the server on the latest build, reopening the same
+                    // project windows. Tell the client to reconnect, tear down,
+                    // and hand the window dirs to a fresh detached server.
+                    let dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
+                    if let Some(cl) = client.as_mut() {
+                        let _ = protocol::write_frame(cl, protocol::RECONNECT, &[]);
+                    }
+                    for w in &mut windows {
+                        for p in &mut w.panes {
+                            p.kill();
+                        }
+                    }
+                    let _ = std::fs::remove_file(sock);
+                    spawn_server(&dirs)?;
+                    return Ok(());
+                }
                 Msg::Quit => {
                     quit = true;
                     break;
@@ -753,28 +783,33 @@ fn run_server(sock: &Path, project: Option<String>) -> Result<()> {
     Ok(())
 }
 
-/// The thin client: owns the real terminal, forwards keystrokes and resizes to
-/// the server, and writes whatever the server sends back to stdout.
-fn run_client(sock: &Path) -> Result<()> {
-    let stream = UnixStream::connect(sock).context("connecting to server")?;
-    let (cols, rows) = terminal::size().context("querying terminal size")?;
+/// Connect to the socket, retrying until it succeeds or `timeout` elapses.
+fn connect_retry(sock: &Path, timeout: Duration) -> Option<UnixStream> {
+    let start = Instant::now();
+    loop {
+        if let Ok(s) = UnixStream::connect(sock) {
+            return Some(s);
+        }
+        if start.elapsed() > timeout {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
 
+/// The thin client: owns the real terminal, forwards keystrokes and resizes to
+/// the server, and writes whatever the server sends back to stdout. Survives a
+/// server reload by reconnecting; exits on detach/quit.
+fn run_client(sock: &Path) -> Result<()> {
     let mut out = io::stdout();
     enable_raw_mode().context("enabling raw mode")?;
     queue!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
     out.flush()?;
     let _guard = TerminalGuard;
 
-    // Shared write half: stdin and SIGWINCH threads both send frames.
-    let write = Arc::new(Mutex::new(stream.try_clone().context("cloning socket")?));
-    {
-        let mut w = write.lock().unwrap();
-        protocol::write_frame(
-            &mut *w,
-            protocol::ATTACH,
-            &protocol::size_payload(rows, cols),
-        )?;
-    }
+    // Current write half; swapped out during a reconnect. The input/resize
+    // threads below hold this and write only while a connection is present.
+    let write: Arc<Mutex<Option<UnixStream>>> = Arc::new(Mutex::new(None));
 
     // stdin -> server (raw bytes).
     {
@@ -786,9 +821,9 @@ fn run_client(sock: &Path) -> Result<()> {
                 match stdin.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let mut w = write.lock().unwrap();
-                        if protocol::write_frame(&mut *w, protocol::INPUT, &buf[..n]).is_err() {
-                            break;
+                        let mut g = write.lock().unwrap();
+                        if let Some(s) = g.as_mut() {
+                            let _ = protocol::write_frame(s, protocol::INPUT, &buf[..n]);
                         }
                     }
                 }
@@ -803,33 +838,62 @@ fn run_client(sock: &Path) -> Result<()> {
         thread::spawn(move || {
             for _ in signals.forever() {
                 if let Ok((c, r)) = terminal::size() {
-                    let mut w = write.lock().unwrap();
-                    if protocol::write_frame(
-                        &mut *w,
-                        protocol::RESIZE,
-                        &protocol::size_payload(r, c),
-                    )
-                    .is_err()
-                    {
-                        break;
+                    let mut g = write.lock().unwrap();
+                    if let Some(s) = g.as_mut() {
+                        let _ = protocol::write_frame(
+                            s,
+                            protocol::RESIZE,
+                            &protocol::size_payload(r, c),
+                        );
                     }
                 }
             }
         });
     }
 
-    // server -> stdout (main thread). Ends on detach or server exit.
-    let mut rd = stream;
+    // Connect / reconnect loop.
     loop {
-        match protocol::read_frame(&mut rd) {
-            Ok((protocol::OUTPUT, p)) => {
-                out.write_all(&p)?;
-                out.flush()?;
+        let stream = match connect_retry(sock, Duration::from_secs(5)) {
+            Some(s) => s,
+            None => break, // server gone for good
+        };
+        {
+            let (c, r) = terminal::size().unwrap_or((80, 24));
+            let mut g = write.lock().unwrap();
+            *g = Some(stream.try_clone().context("cloning socket")?);
+            if let Some(s) = g.as_mut() {
+                let _ = protocol::write_frame(s, protocol::ATTACH, &protocol::size_payload(r, c));
             }
-            Ok((protocol::DETACH, _)) => break,
-            Ok(_) => {}
-            Err(_) => break,
         }
+
+        let mut rd = stream;
+        let reconnect;
+        loop {
+            match protocol::read_frame(&mut rd) {
+                Ok((protocol::OUTPUT, p)) => {
+                    out.write_all(&p)?;
+                    out.flush()?;
+                }
+                Ok((protocol::RECONNECT, _)) => {
+                    reconnect = true;
+                    break;
+                }
+                Ok((protocol::DETACH, _)) => {
+                    *write.lock().unwrap() = None;
+                    return Ok(()); // clean detach/quit
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    reconnect = true; // unexpected drop: try to reconnect briefly
+                    break;
+                }
+            }
+        }
+        *write.lock().unwrap() = None;
+        if !reconnect {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
     }
     Ok(())
 }
@@ -957,6 +1021,8 @@ impl InputParser {
                         Some(Msg::NextWindow)
                     } else if c == k.detach {
                         Some(Msg::Detach)
+                    } else if c == k.reload {
+                        Some(Msg::Reload)
                     } else if b.is_ascii_digit() && b != b'0' {
                         Some(Msg::SelectWindow((b - b'1') as usize))
                     } else if b == b'a' || b == self.prefix {
@@ -1154,6 +1220,7 @@ fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
         "  Ctrl-a n      next window          ",
         "  Ctrl-a 1..9   jump to window       ",
         "  Ctrl-a d      detach (stays alive) ",
+        "  Ctrl-a r      reload (new build)   ",
         "  Ctrl-a q      quit (ends session)  ",
         "  Ctrl-a ?      toggle this help     ",
         "  click / wheel  focus / scroll      ",
