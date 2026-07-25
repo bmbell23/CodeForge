@@ -54,14 +54,48 @@ for the roadmap.
 
 ## Install
 
+**One shared clone serves everyone** — you don't clone it yourself. It lives on
+the shared filesystem at `/home/bbell/projects/CodeForge`. To enroll (once per
+user), just run its installer:
+
 ```bash
-./scripts/install.sh
+/home/bbell/projects/CodeForge/scripts/install.sh
 ```
 
-This builds `forge`, links it into `~/.local/bin`, and installs the Neovim
-config under `~/.config/codeforge` (isolated via `NVIM_APPNAME` — it never
-touches your personal `~/.config/nvim`). First `forge` launch auto-installs the
-Neovim plugins (needs network).
+That one idempotent command:
+
+- **bootstraps your runtime deps** (`scripts/bootstrap-deps.sh`) — installs the
+  fragile ones that aren't OS packages and live under your `$HOME`: **nvim**
+  (release tarball → `~/.local/nvim`) and the **tree-sitter CLI** (npm global,
+  needed by nvim-treesitter to compile parsers). Warns if a system dep is
+  missing (`rg git cc make curl node npm tar setsid`);
+- installs the **`forge` launcher** at `~/.local/bin/forge` (pointed at the
+  shared clone);
+- installs the Neovim config under `~/.config/codeforge` (isolated via
+  `NVIM_APPNAME` — never touches your personal `~/.config/nvim`; it's a symlink
+  into the shared clone, so config updates reach you automatically).
+
+Make sure `~/.local/bin` is on your `PATH`, then run `forge`. First launch also
+auto-installs your Neovim plugins (needs network).
+
+**Always up to date, no per-user builds.** `~/.local/bin/forge` is a thin
+wrapper, not a bare symlink. Two roles, decided automatically by whether you can
+write the shared clone:
+
+- **Owner** (writable clone): a *fresh* `forge` `git pull --ff-only`s and
+  rebuilds the shared binary — so the whole team then rides the latest.
+- **Consumer** (read-only clone, i.e. everyone else): `forge` just runs the
+  shared binary the owner keeps built. It never tries to pull or compile.
+
+Both roles heal their *own* per-user deps on a fresh launch; attaching to a
+running session skips all of it. Every step is time-bounded and best-effort — no
+network, no problem, it launches what's there. The owner can force a refresh
+without relaunching: `git -C /home/bbell/projects/CodeForge pull` then `Ctrl-a r`.
+
+> Because there's one clone and one binary, a coworker on another VM
+> (`cforry@co-sf-pe-050`) does nothing but run the installer once and `forge` —
+> no clone, no toolchain, no build. Their config, session, and socket stay
+> per-user under their own `$HOME`.
 
 Recommended tools for full IDE features: **ripgrep (`rg`)** for grep, **`fd`**
 for faster file finding, and LSP servers via `:Mason` inside nvim.
