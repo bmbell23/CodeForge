@@ -27,13 +27,19 @@ if ! pgrep -u "$(id -u)" -f 'forge --server' >/dev/null 2>&1; then
   # Only a writable clone (the owner) updates the shared binary. A lock
   # serializes the owner's concurrent launches; the branch is unreachable for
   # read-only consumers, so no build race between users.
-  if [ -w "$REPO/.git" ]; then
+  if [ -w "$REPO/.git" ] && command -v git >/dev/null 2>&1; then
     (
       flock -n 9 || exit 0
-      command -v git >/dev/null 2>&1 \
-        && timeout 15 git -C "$REPO" pull --ff-only -q 2>/dev/null || true
-      command -v cargo >/dev/null 2>&1 \
-        && ( cd "$REPO" && cargo build --release -q ) 2>/dev/null || true
+      before=$(git -C "$REPO" rev-parse HEAD 2>/dev/null)
+      timeout 15 git -C "$REPO" pull --ff-only -q 2>/dev/null || true
+      after=$(git -C "$REPO" rev-parse HEAD 2>/dev/null)
+      # Only rebuild when the pull actually advanced HEAD (or the binary is
+      # missing). A release build has LTO and takes tens of seconds; doing it on
+      # every launch made a cold start look hung. Local dev builds with cargo
+      # directly, so this never masks your own edits.
+      if command -v cargo >/dev/null 2>&1 && { [ "$before" != "$after" ] || [ ! -x "$BIN" ]; }; then
+        ( cd "$REPO" && cargo build --release -q ) 2>/dev/null || true
+      fi
     ) 9>"${XDG_RUNTIME_DIR:-/tmp}/codeforge-update.lock"
   fi
 fi
