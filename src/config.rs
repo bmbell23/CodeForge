@@ -48,6 +48,8 @@ pub struct Keys {
     pub quit: char,
     /// New window (opens the picker to choose its project).
     pub win_new: char,
+    /// Close the current window (kills all its panes).
+    pub win_close: char,
     /// Switch to the next window.
     pub win_next: char,
     /// Detach the client (leaves the server running in the background).
@@ -89,6 +91,7 @@ impl Default for Keys {
             help: '?',
             quit: 'q',
             win_new: 'c',
+            win_close: 'X',
             win_next: 'n',
             detach: 'd',
             reload: 'r',
@@ -187,6 +190,7 @@ picker = "p"
 help = "?"
 quit = "q"
 win_new = "c"    # new window (choose its project)
+win_close = "X"  # close the current window (kills its panes)
 win_next = "n"   # switch to next window
 detach = "d"     # detach client; server keeps running (reattach: forge)
 reload = "r"     # restart server on latest build, reopen same windows

@@ -99,6 +99,7 @@ the first of `~/projects` or `~/work/projects` that exists.
 | `Ctrl-a x`  | Close focused pane                   |
 | `Ctrl-a p`  | Switch project (re-home window)      |
 | `Ctrl-a c`  | New window (pick its project)        |
+| `Ctrl-a X`  | Close current window                 |
 | `Ctrl-a n`  | Next window                          |
 | `Ctrl-a 1`–`9` | Jump to window                    |
 | `Ctrl-a d`  | Detach (server keeps running)        |
@@ -123,8 +124,13 @@ pane. Split (`Ctrl-a |` / `-`) for **multiple terminals in one window**.
 
 ### Open a file
 
-Click the nvim pane (or `Ctrl-a h`), then either `Space ff` and type a filename,
-`Space fg` to grep the repo, or `Space e` / `-` for the file explorer (Enter opens).
+Click the nvim pane (or `Ctrl-a h`), then (VS Code style):
+
+- **`Ctrl-P`** — open a file by name (fuzzy)
+- **`Ctrl-F`** — search within the current file
+- **`Ctrl-Shift-F`** — search the whole repo (falls back to `Space fg` if your
+  terminal doesn't send the Shift chord)
+- **`Space e`** / **`-`** — file explorer (Enter opens)
 
 ### Neovim (leader = `Space`)
 

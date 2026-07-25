@@ -20,6 +20,7 @@
 //!   Ctrl-a x     close the focused pane
 //!   Ctrl-a p     open the project picker (re-home the current window)
 //!   Ctrl-a c     new window (its own editor/shell/AI for another project)
+//!   Ctrl-a X     close the current window (kills its panes)
 //!   Ctrl-a n     next window   ·   Ctrl-a 1..9  jump to window
 //!   Ctrl-a d     detach (server keeps running; reattach with `forge`)
 //!   Ctrl-a r     reload the server on the latest build (reopens same windows)
@@ -184,6 +185,8 @@ pub enum Msg {
     OpenPicker,
     /// Open the picker to create a new window.
     NewWindow,
+    /// Close the current window (kills its panes).
+    CloseWindow,
     /// Switch to the next window.
     NextWindow,
     /// Switch to window `n` (0-based).
@@ -959,6 +962,25 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                     needs_clear = true;
                 }
+                Msg::CloseWindow => {
+                    for p in &mut windows[cur].panes {
+                        p.kill();
+                    }
+                    windows.remove(cur);
+                    needs_clear = true;
+                    dirty = true;
+                    if windows.is_empty() {
+                        quit = true;
+                        break;
+                    }
+                    if cur >= windows.len() {
+                        cur = windows.len() - 1;
+                    }
+                    let (c, r) = size;
+                    let area = r.saturating_sub(1);
+                    let w = &mut windows[cur];
+                    relayout(&mut w.panes, &w.layout, c, area)?;
+                }
                 Msg::NextWindow => {
                     if !windows.is_empty() {
                         cur = (cur + 1) % windows.len();
@@ -1355,6 +1377,8 @@ impl InputParser {
                         Some(Msg::OpenPicker)
                     } else if c == k.win_new {
                         Some(Msg::NewWindow)
+                    } else if c == k.win_close {
+                        Some(Msg::CloseWindow)
                     } else if c == k.win_next {
                         Some(Msg::NextWindow)
                     } else if c == k.detach {
@@ -1557,6 +1581,7 @@ fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
         "  Ctrl-a x      close pane           ",
         "  Ctrl-a p      switch project       ",
         "  Ctrl-a c      new window           ",
+        "  Ctrl-a X      close window         ",
         "  Ctrl-a n      next window          ",
         "  Ctrl-a 1..9   jump to window       ",
         "  Ctrl-a d      detach (stays alive) ",

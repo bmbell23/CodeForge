@@ -57,8 +57,14 @@ require("lazy").setup({
     dependencies = { "nvim-lua/plenary.nvim" },
     config = function()
       local t = require("telescope.builtin")
-      -- Ctrl-P: open a file by name (VS Code style), same as <leader>ff.
-      vim.keymap.set("n", "<C-p>", t.find_files, { desc = "Open file (find files)" })
+      -- VS Code-style (work in normal & insert):
+      --   Ctrl-P        open file by name
+      --   Ctrl-F        search within the current file
+      --   Ctrl-Shift-F  search the whole repo (needs a terminal that sends the
+      --                 Shift chord; <leader>fg always works as a fallback)
+      vim.keymap.set({ "n", "i" }, "<C-p>", t.find_files, { desc = "Open file" })
+      vim.keymap.set({ "n", "i" }, "<C-f>", t.current_buffer_fuzzy_find, { desc = "Search in file" })
+      vim.keymap.set({ "n", "i" }, "<C-S-f>", t.live_grep, { desc = "Search repo" })
       vim.keymap.set("n", "<leader>ff", t.find_files, { desc = "Find files" })
       vim.keymap.set("n", "<leader>fg", t.live_grep, { desc = "Find all (grep repo)" })
       vim.keymap.set("n", "<leader>fb", t.buffers, { desc = "Find buffers" })
