@@ -244,10 +244,13 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let sock = socket_path();
 
-    // Server mode (spawned detached): `forge --server <dir>...` — one window
-    // per directory (none = current dir).
+    // Server mode (spawned detached): `forge --server [--resume] <dir>...` — one
+    // window per directory (none = current dir). `--resume` (a reload) resumes
+    // the AI conversation in each window.
     if args.get(1).map(|s| s == "--server").unwrap_or(false) {
-        return run_server(&sock, args[2..].to_vec());
+        let resume = args.get(2).map(|s| s == "--resume").unwrap_or(false);
+        let start = if resume { 3 } else { 2 };
+        return run_server(&sock, args[start..].to_vec(), resume);
     }
 
     // A session already running? Attach to it.
@@ -275,7 +278,7 @@ fn main() -> Result<()> {
         None => choose_project_interactive(&proot)?,
     };
 
-    spawn_server(&[project])?;
+    spawn_server(&[project], false)?;
     wait_for_socket(&sock, Duration::from_secs(5))?;
     run_client(&sock)
 }
@@ -291,11 +294,15 @@ fn socket_path() -> PathBuf {
 }
 
 /// Spawn a server detached from the controlling terminal (via `setsid`) with one
-/// window per directory, so it survives the client exiting / the SSH drop.
-fn spawn_server(dirs: &[PathBuf]) -> Result<()> {
+/// window per directory, so it survives the client exiting / the SSH drop. When
+/// `resume` is set (a reload), the AI pane resumes its previous conversation.
+fn spawn_server(dirs: &[PathBuf], resume: bool) -> Result<()> {
     let exe = std::env::current_exe().context("finding own executable")?;
     let mut cmd = Command::new("setsid");
     cmd.arg(exe).arg("--server");
+    if resume {
+        cmd.arg("--resume");
+    }
     for d in dirs {
         cmd.arg(d);
     }
@@ -335,11 +342,15 @@ fn choose_project_interactive(proot: &Path) -> Result<PathBuf> {
 
 /// The persistent server: owns all windows/PTYs, renders to whatever client is
 /// attached, and keeps running across detaches/disconnects.
-fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
+fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
     let _ = std::fs::remove_file(sock); // clear any stale socket
     let listener = UnixListener::bind(sock).context("binding server socket")?;
 
-    let (cfg, _) = Config::load();
+    let (mut cfg, _) = Config::load();
+    // On a reload, resume the previous AI conversation in each window's dir.
+    if resume {
+        cfg.ai = format!("{} --continue", cfg.ai.trim());
+    }
     let prefix = cfg.prefix_byte();
     let keys = cfg.keys;
     let shell = cfg
@@ -693,7 +704,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         }
                     }
                     let _ = std::fs::remove_file(sock);
-                    spawn_server(&dirs)?;
+                    spawn_server(&dirs, true)?;
                     return Ok(());
                 }
                 Msg::Quit => {
