@@ -21,18 +21,20 @@ forge            # reattach — same windows, same state
 forge attach     # attach only (error if nothing is running)
 ```
 
-**Across quit / reboot.** CodeForge saves your open **window directories** to
-disk. After `Ctrl-a q` or a reboot, a bare `forge` **restores** those windows
-(fresh panes, but each AI pane resumes its conversation via `claude --continue`).
-Live pane contents (terminal history, editor buffers) don't survive a full
-teardown — that needs process/fd handoff.
+**Across quit / reboot.** CodeForge snapshots each window to disk: its project
+dir, the **shell's working directory**, and the **editor's open files**. After
+`Ctrl-a q` or a reboot, a bare `forge` **restores** those windows — nvim reopens
+the same files, the shell starts in the same dir, and the AI pane resumes its
+conversation via `claude --continue`. (Terminal *scrollback* and editor undo
+history don't survive a full teardown — that needs live process/fd handoff.)
 
 - `forge` — restore the last session (or the picker on first run)
 - `forge <project>` — start a *fresh* single-window session
-- `Ctrl-a r` — reload the server on a newly-built binary, same windows
+- `Ctrl-a r` — reload the server on a newly-built binary, restoring the windows
+- `Ctrl-a F` — forget the saved session (next `forge` starts fresh)
 
 The server socket lives at `$XDG_RUNTIME_DIR/codeforge-<user>.sock`; the saved
-session at `$XDG_STATE_HOME/codeforge/session` (delete it to start clean).
+session at `$XDG_STATE_HOME/codeforge/session`.
 
 ## Status
 
@@ -101,6 +103,7 @@ the first of `~/projects` or `~/work/projects` that exists.
 | `Ctrl-a 1`–`9` | Jump to window                    |
 | `Ctrl-a d`  | Detach (server keeps running)        |
 | `Ctrl-a r`  | Reload server on latest build        |
+| `Ctrl-a F`  | Forget saved session (fresh next run)|
 | `Ctrl-a ?`  | Toggle keybinding help               |
 | `Ctrl-a q`  | Quit CodeForge (ends session)        |
 | `Ctrl-a a`  | Send a literal `Ctrl-a` to the child |

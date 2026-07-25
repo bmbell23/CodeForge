@@ -11,11 +11,21 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 
 use crate::Msg;
 
+/// What a pane runs, for session capture/restore.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum PaneRole {
+    Editor,
+    Shell,
+    Ai,
+}
+
 /// Owns the PTY, the emulator, and the child for one pane.
 pub struct Pane {
     /// Stable id, assigned at spawn and never reused. Used to route the child's
     /// output stream back to this pane regardless of its position in the list.
     pub id: usize,
+    /// What this pane runs (editor / shell / AI).
+    pub role: PaneRole,
     /// PTY master — kept so we can resize it as the pane geometry changes.
     master: Box<dyn MasterPty + Send>,
     /// Write side of the PTY: user keystrokes go here.
@@ -39,6 +49,7 @@ impl Pane {
     pub fn spawn(
         cmd: CommandBuilder,
         title: String,
+        role: PaneRole,
         rows: u16,
         cols: u16,
         id: usize,
@@ -82,6 +93,7 @@ impl Pane {
 
         Ok(Pane {
             id,
+            role,
             master: pair.master,
             writer,
             child,
@@ -89,6 +101,11 @@ impl Pane {
             scroll: 0,
             title,
         })
+    }
+
+    /// The child's process id, if known (used to read its cwd via /proc).
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
     }
 
     /// Feed child output into the emulator.

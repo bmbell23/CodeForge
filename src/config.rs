@@ -55,6 +55,8 @@ pub struct Keys {
     /// Reload: restart the server on the latest build, reopening the same
     /// project windows (pane contents reset).
     pub reload: char,
+    /// Forget the saved session so the next `forge` starts fresh (the picker).
+    pub fresh: char,
 }
 
 impl Default for Config {
@@ -62,7 +64,7 @@ impl Default for Config {
         Config {
             prefix: "C-a".into(),
             projects_root: None,
-            editor: "nvim .".into(),
+            editor: "nvim".into(),
             shell: None,
             ai: "claude".into(),
             editor_ratio: 0.5,
@@ -90,6 +92,7 @@ impl Default for Keys {
             win_next: 'n',
             detach: 'd',
             reload: 'r',
+            fresh: 'F',
         }
     }
 }
@@ -161,7 +164,8 @@ prefix = "C-a"
 # projects_root = "/home/you/projects"
 
 # Startup panes. `editor` and `ai` are command lines (split on spaces).
-editor = "nvim ."
+# The editor opens the project dir (or, on restore, your previously open files).
+editor = "nvim"
 ai = "claude"
 # shell = "/bin/bash"   # defaults to $SHELL
 
@@ -186,5 +190,6 @@ win_new = "c"    # new window (choose its project)
 win_next = "n"   # switch to next window
 detach = "d"     # detach client; server keeps running (reattach: forge)
 reload = "r"     # restart server on latest build, reopen same windows
+fresh = "F"      # forget saved session (next forge starts from the picker)
 # also: prefix + 1..9 jumps to that window
 "#;

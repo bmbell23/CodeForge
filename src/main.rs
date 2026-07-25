@@ -23,6 +23,7 @@
 //!   Ctrl-a n     next window   ·   Ctrl-a 1..9  jump to window
 //!   Ctrl-a d     detach (server keeps running; reattach with `forge`)
 //!   Ctrl-a r     reload the server on the latest build (reopens same windows)
+//!   Ctrl-a F     forget the saved session (next `forge` starts fresh)
 //!   Ctrl-a ?     toggle the keybinding help overlay
 //!   Ctrl-a q     quit CodeForge (ends the session)
 //!   Ctrl-a a     send a literal Ctrl-a to the child
@@ -59,8 +60,92 @@ use signal_hook::iterator::Signals;
 
 use config::{Config, Keys};
 use layout::{Dir, FocusDir, Layout, Rect};
-use pane::Pane;
+use pane::{Pane, PaneRole};
 use picker::{Picker, PickerAction};
+
+/// A restorable description of one window: its project dir, the shell's working
+/// directory, and the editor's open files.
+#[derive(Clone)]
+struct WindowSpec {
+    dir: PathBuf,
+    shell_cwd: Option<PathBuf>,
+    files: Vec<PathBuf>,
+}
+
+impl WindowSpec {
+    fn bare(dir: PathBuf) -> WindowSpec {
+        WindowSpec {
+            dir,
+            shell_cwd: None,
+            files: Vec::new(),
+        }
+    }
+}
+
+/// The nvim RPC socket for the editor pane with the given id, so we can query
+/// its open files at capture time.
+fn nvim_sock(id: usize) -> PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("codeforge-nvim-{id}.sock"))
+}
+
+/// Read a process's current working directory via /proc.
+fn proc_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// Ask a running nvim (via its RPC socket) for its listed, named buffers.
+fn query_nvim_files(sock: &Path) -> Vec<PathBuf> {
+    if !sock.exists() {
+        return Vec::new();
+    }
+    let expr =
+        r#"join(filter(map(getbufinfo({"buflisted":1}), "v:val.name"), "v:val != \"\""), "\n")"#;
+    let out = Command::new("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg(expr)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Capture a restorable spec for every window (open files + shell cwd).
+fn capture_specs(windows: &[Window]) -> Vec<WindowSpec> {
+    windows
+        .iter()
+        .map(|w| {
+            let files = w
+                .panes
+                .iter()
+                .find(|p| p.role == PaneRole::Editor)
+                .map(|p| query_nvim_files(&nvim_sock(p.id)))
+                .unwrap_or_default();
+            let shell_cwd = w
+                .panes
+                .iter()
+                .find(|p| p.role == PaneRole::Shell)
+                .and_then(|p| p.pid())
+                .and_then(proc_cwd);
+            WindowSpec {
+                dir: w.dir.clone(),
+                shell_cwd,
+                files,
+            }
+        })
+        .collect()
+}
 
 /// Messages funneled into the single-threaded event loop from producer threads.
 pub enum Msg {
@@ -102,6 +187,8 @@ pub enum Msg {
     SelectWindow(usize),
     /// Reload: restart the server on the latest build, reopening the same dirs.
     Reload,
+    /// Forget the saved session (next `forge` starts fresh).
+    ClearSession,
     /// User asked to quit.
     Quit,
 }
@@ -124,49 +211,95 @@ fn dir_title(dir: &Path) -> String {
         .to_string()
 }
 
-/// Build a new window: the configured IDE layout in `dir`, ids from `base`.
+/// Build a new window from a spec (dir + optional shell cwd + open files), with
+/// pane ids from `base`. The editor is focused.
 fn new_window(
-    dir: PathBuf,
+    spec: &WindowSpec,
     cfg: &Config,
     shell: &str,
     base: usize,
     tx: &Sender<Msg>,
 ) -> Result<Window> {
-    let (panes, layout) = spawn_ide(&dir, cfg, shell, base, tx)?;
-    let title = dir_title(&dir);
+    let (panes, layout) = spawn_ide(spec, cfg, shell, base, tx)?;
+    let title = dir_title(&spec.dir);
     Ok(Window {
         panes,
         layout,
         focus_id: base,
-        dir,
+        dir: spec.dir.clone(),
         title,
     })
 }
 
-/// Spawn the configured IDE layout (editor + shell + AI) in `project_dir`, with
-/// pane ids starting at `base`. Returns the panes and the layout tree; the
-/// focused pane is `base` (the editor).
+/// Spawn the configured IDE layout (editor + shell + AI) for `spec`, with pane
+/// ids starting at `base`. The editor opens `spec.files` (or the dir) and, if
+/// it's nvim, listens on an RPC socket so its buffers can be captured later. The
+/// shell starts in `spec.shell_cwd` when known.
 fn spawn_ide(
-    project_dir: &Path,
+    spec: &WindowSpec,
     cfg: &Config,
     shell: &str,
     base: usize,
     tx: &Sender<Msg>,
 ) -> Result<(Vec<Pane>, Layout)> {
-    let (editor, editor_title) = command_line(&cfg.editor, project_dir);
-    let (ai, ai_title) = command_line(&cfg.ai, project_dir);
+    let dir = &spec.dir;
+
+    // Editor.
+    let mut etoks = cfg.editor.split_whitespace();
+    let editor_prog = etoks.next().unwrap_or("nvim");
+    let is_nvim = editor_prog.ends_with("nvim");
+    let editor_title = editor_prog
+        .rsplit('/')
+        .next()
+        .unwrap_or(editor_prog)
+        .to_string();
+    let mut editor = command(editor_prog, dir);
+    for a in etoks {
+        if a != "." {
+            editor.arg(a);
+        }
+    }
+    if is_nvim {
+        editor.env("NVIM_APPNAME", "codeforge");
+        let sock = nvim_sock(base);
+        let _ = std::fs::remove_file(&sock); // stale socket blocks --listen
+        editor.arg("--listen");
+        editor.arg(&sock);
+    }
+    if spec.files.is_empty() {
+        editor.arg(".");
+    } else {
+        for f in &spec.files {
+            editor.arg(f);
+        }
+    }
+
+    // Shell (in its saved cwd when known).
+    let shell_cwd = spec.shell_cwd.as_deref().unwrap_or(dir);
+
+    // AI.
+    let (ai, ai_title) = command_line(&cfg.ai, dir);
 
     let panes = vec![
-        Pane::spawn(editor, editor_title, 1, 1, base, tx.clone())?,
         Pane::spawn(
-            command(shell, project_dir),
+            editor,
+            editor_title,
+            PaneRole::Editor,
+            1,
+            1,
+            base,
+            tx.clone(),
+        )?,
+        Pane::spawn(
+            command(shell, shell_cwd),
             "shell".into(),
+            PaneRole::Shell,
             1,
             1,
             base + 1,
             tx.clone(),
         )?,
-        Pane::spawn(ai, ai_title, 1, 1, base + 2, tx.clone())?,
+        Pane::spawn(ai, ai_title, PaneRole::Ai, 1, 1, base + 2, tx.clone())?,
     ];
 
     let layout = Layout::Split {
@@ -244,13 +377,10 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let sock = socket_path();
 
-    // Server mode (spawned detached): `forge --server [--resume] <dir>...` — one
-    // window per directory (none = current dir). `--resume` (a reload) resumes
-    // the AI conversation in each window.
+    // Server mode (spawned detached): `forge --server <dir>...` opens one window
+    // per directory; `forge --server` (no dirs) restores the saved session.
     if args.get(1).map(|s| s == "--server").unwrap_or(false) {
-        let resume = args.get(2).map(|s| s == "--resume").unwrap_or(false);
-        let start = if resume { 3 } else { 2 };
-        return run_server(&sock, args[start..].to_vec(), resume);
+        return run_server(&sock, args[2..].to_vec());
     }
 
     // A session already running? Attach to it.
@@ -276,19 +406,18 @@ fn main() -> Result<()> {
 
     // A CLI arg starts a fresh single-window session. Bare `forge` restores the
     // last saved session (resuming AI conversations); if none, shows the picker.
-    let (dirs, resume) = match args.get(1) {
-        Some(arg) => (vec![resolve_arg_dir(arg, &proot)], false),
+    match args.get(1) {
+        Some(arg) => spawn_server(&[resolve_arg_dir(arg, &proot)])?,
         None => {
-            let saved = load_snapshot();
-            if saved.is_empty() {
-                (vec![choose_project_interactive(&proot)?], false)
+            if load_snapshot().is_empty() {
+                let picked = choose_project_interactive(&proot)?;
+                spawn_server(&[picked])?;
             } else {
-                (saved, true)
+                spawn_server(&[])?; // restore
             }
         }
-    };
+    }
 
-    spawn_server(&dirs, resume)?;
     wait_for_socket(&sock, Duration::from_secs(5))?;
     run_client(&sock)
 }
@@ -305,32 +434,78 @@ fn snapshot_path() -> PathBuf {
     base.join("codeforge").join("session")
 }
 
-/// Save the current window directories (one per line), best-effort.
-fn save_snapshot(dirs: &[PathBuf]) {
+/// Save window specs, best-effort. One window per line, tab-separated:
+/// `dir \t shell_cwd \t file1,file2,...`.
+fn save_snapshot(specs: &[WindowSpec]) {
     let path = snapshot_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let body: String = dirs
+    let body: String = specs
         .iter()
-        .map(|d| d.to_string_lossy().into_owned())
+        .map(|s| {
+            let dir = s.dir.to_string_lossy();
+            let cwd = s
+                .shell_cwd
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let files = s
+                .files
+                .iter()
+                .map(|f| f.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{dir}\t{cwd}\t{files}")
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let _ = std::fs::write(&path, body);
 }
 
-/// Load the saved window directories that still exist.
-fn load_snapshot() -> Vec<PathBuf> {
-    match std::fs::read_to_string(snapshot_path()) {
-        Ok(s) => s
-            .lines()
+/// Load saved window specs whose project dir still exists.
+fn load_snapshot() -> Vec<WindowSpec> {
+    let text = match std::fs::read_to_string(snapshot_path()) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let mut specs = Vec::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split('\t');
+        let dir = PathBuf::from(fields.next().unwrap_or("").trim());
+        if !dir.is_dir() {
+            continue;
+        }
+        let cwd = fields.next().unwrap_or("").trim();
+        let shell_cwd = if cwd.is_empty() {
+            None
+        } else {
+            let p = PathBuf::from(cwd);
+            p.is_dir().then_some(p)
+        };
+        let files = fields
+            .next()
+            .unwrap_or("")
+            .split(',')
             .map(str::trim)
-            .filter(|l| !l.is_empty())
+            .filter(|f| !f.is_empty())
             .map(PathBuf::from)
-            .filter(|p| p.is_dir())
-            .collect(),
-        Err(_) => Vec::new(),
+            .collect();
+        specs.push(WindowSpec {
+            dir,
+            shell_cwd,
+            files,
+        });
     }
+    specs
+}
+
+/// Delete the saved session so the next `forge` starts fresh.
+fn clear_snapshot() {
+    let _ = std::fs::remove_file(snapshot_path());
 }
 
 /// Unix socket for the per-user server: `$XDG_RUNTIME_DIR/codeforge-<user>.sock`.
@@ -343,16 +518,14 @@ fn socket_path() -> PathBuf {
     base.join(format!("codeforge-{user}.sock"))
 }
 
-/// Spawn a server detached from the controlling terminal (via `setsid`) with one
-/// window per directory, so it survives the client exiting / the SSH drop. When
-/// `resume` is set (a reload), the AI pane resumes its previous conversation.
-fn spawn_server(dirs: &[PathBuf], resume: bool) -> Result<()> {
+/// Spawn a server detached from the controlling terminal (via `setsid`) so it
+/// survives the client exiting / the SSH drop. With directories, it opens one
+/// fresh window each; with none, it restores the saved session (resuming AI
+/// conversations).
+fn spawn_server(dirs: &[PathBuf]) -> Result<()> {
     let exe = std::env::current_exe().context("finding own executable")?;
     let mut cmd = Command::new("setsid");
     cmd.arg(exe).arg("--server");
-    if resume {
-        cmd.arg("--resume");
-    }
     for d in dirs {
         cmd.arg(d);
     }
@@ -392,15 +565,11 @@ fn choose_project_interactive(proot: &Path) -> Result<PathBuf> {
 
 /// The persistent server: owns all windows/PTYs, renders to whatever client is
 /// attached, and keeps running across detaches/disconnects.
-fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
+fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let _ = std::fs::remove_file(sock); // clear any stale socket
     let listener = UnixListener::bind(sock).context("binding server socket")?;
 
     let (mut cfg, _) = Config::load();
-    // On a reload, resume the previous AI conversation in each window's dir.
-    if resume {
-        cfg.ai = format!("{} --continue", cfg.ai.trim());
-    }
     let prefix = cfg.prefix_byte();
     let keys = cfg.keys;
     let shell = cfg
@@ -413,11 +582,22 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(projects_root);
 
-    // One window per directory (none = current dir).
-    let dir_list: Vec<PathBuf> = if dirs.is_empty() {
-        vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))]
+    // With dirs: one fresh window each. Without: restore the saved session and
+    // resume each AI conversation.
+    let specs: Vec<WindowSpec> = if dirs.is_empty() {
+        let saved = load_snapshot();
+        cfg.ai = format!("{} --continue", cfg.ai.trim());
+        if saved.is_empty() {
+            vec![WindowSpec::bare(
+                std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            )]
+        } else {
+            saved
+        }
     } else {
-        dirs.iter().map(|d| resolve_arg_dir(d, &proot)).collect()
+        dirs.iter()
+            .map(|d| WindowSpec::bare(resolve_arg_dir(d, &proot)))
+            .collect()
     };
 
     let (tx, rx) = mpsc::channel::<Msg>();
@@ -480,8 +660,8 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
 
     let mut windows: Vec<Window> = Vec::new();
     let mut next_id: usize = 0;
-    for d in dir_list {
-        windows.push(new_window(d, &cfg, &shell, next_id, &tx)?);
+    for spec in &specs {
+        windows.push(new_window(spec, &cfg, &shell, next_id, &tx)?);
         next_id += 3;
     }
     let mut cur = 0usize;
@@ -492,10 +672,13 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
     let mut size = (80u16, 24u16);
     let mut client: Option<UnixStream> = None;
     let mut framebuf: Vec<u8> = Vec::new();
+    // Whether to keep persisting the session (Ctrl-a fresh turns this off).
+    let mut save_enabled = true;
 
-    // Persist the window directories so a fresh `forge` can restore them.
+    // Persist the session so a fresh `forge` can restore it. Re-captured when the
+    // window set changes and on teardown (reload/quit).
     let mut last_dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
-    save_snapshot(&last_dirs);
+    save_snapshot(&capture_specs(&windows));
 
     {
         let w = &mut windows[cur];
@@ -539,14 +722,15 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
                                 let area = r.saturating_sub(1);
                                 let base = next_id;
                                 next_id = base + 3;
+                                let spec = WindowSpec::bare(dir);
                                 if picker_new_window {
-                                    windows.push(new_window(dir, &cfg, &shell, base, &tx)?);
+                                    windows.push(new_window(&spec, &cfg, &shell, base, &tx)?);
                                     cur = windows.len() - 1;
                                 } else {
                                     for p in &mut windows[cur].panes {
                                         p.kill();
                                     }
-                                    windows[cur] = new_window(dir, &cfg, &shell, base, &tx)?;
+                                    windows[cur] = new_window(&spec, &cfg, &shell, base, &tx)?;
                                 }
                                 let w = &mut windows[cur];
                                 relayout(&mut w.panes, &w.layout, c, area)?;
@@ -594,6 +778,7 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
                     let pane = Pane::spawn(
                         command(&shell, &w.dir),
                         "shell".into(),
+                        PaneRole::Shell,
                         1,
                         1,
                         new_id,
@@ -745,10 +930,11 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
                     }
                 }
                 Msg::Reload => {
-                    // Restart the server on the latest build, reopening the same
-                    // project windows. Tell the client to reconnect, tear down,
-                    // and hand the window dirs to a fresh detached server.
-                    let dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
+                    // Restart the server on the latest build, restoring the same
+                    // windows (open files, shell cwd, resumed AI). Capture state,
+                    // tell the client to reconnect, tear down, and hand off to a
+                    // fresh detached server that restores from the snapshot.
+                    save_snapshot(&capture_specs(&windows));
                     if let Some(cl) = client.as_mut() {
                         let _ = protocol::write_frame(cl, protocol::RECONNECT, &[]);
                     }
@@ -758,8 +944,12 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
                         }
                     }
                     let _ = std::fs::remove_file(sock);
-                    spawn_server(&dirs, true)?;
+                    spawn_server(&[])?; // restore from the snapshot just saved
                     return Ok(());
+                }
+                Msg::ClearSession => {
+                    clear_snapshot();
+                    save_enabled = false;
                 }
                 Msg::Quit => {
                     quit = true;
@@ -769,6 +959,10 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
         }
 
         if quit {
+            // Capture a rich snapshot so a later `forge` restores files + cwd.
+            if save_enabled {
+                save_snapshot(&capture_specs(&windows));
+            }
             if let Some(mut cl) = client.take() {
                 let _ = protocol::write_frame(&mut cl, protocol::DETACH, &[]);
             }
@@ -819,10 +1013,13 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
             cur = windows.len() - 1;
         }
 
-        // Re-save the snapshot when the set of window directories changes.
+        // Re-capture the snapshot when the set of window directories changes
+        // (window added/removed) — cheap enough at that cadence.
         let now_dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
         if now_dirs != last_dirs {
-            save_snapshot(&now_dirs);
+            if save_enabled {
+                save_snapshot(&capture_specs(&windows));
+            }
             last_dirs = now_dirs;
         }
 
@@ -1095,6 +1292,8 @@ impl InputParser {
                         Some(Msg::Detach)
                     } else if c == k.reload {
                         Some(Msg::Reload)
+                    } else if c == k.fresh {
+                        Some(Msg::ClearSession)
                     } else if b.is_ascii_digit() && b != b'0' {
                         Some(Msg::SelectWindow((b - b'1') as usize))
                     } else if b == b'a' || b == self.prefix {
@@ -1293,6 +1492,7 @@ fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
         "  Ctrl-a 1..9   jump to window       ",
         "  Ctrl-a d      detach (stays alive) ",
         "  Ctrl-a r      reload (new build)   ",
+        "  Ctrl-a F      forget saved session ",
         "  Ctrl-a q      quit (ends session)  ",
         "  Ctrl-a ?      toggle this help     ",
         "  click / wheel  focus / scroll      ",
