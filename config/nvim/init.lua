@@ -95,6 +95,40 @@ require("lazy").setup({
     end,
   },
 
+  -- Visible buffer tabs across the top, so several open files (e.g. one opened
+  -- by go-to-definition) are tabbable like an editor (Story #11 / #12 editor
+  -- side). CodeForge keeps the editor as a single nvim; these are nvim buffers.
+  {
+    "akinsho/bufferline.nvim",
+    dependencies = { "nvim-tree/nvim-web-devicons" },
+    config = function()
+      vim.opt.termguicolors = true
+      require("bufferline").setup({
+        options = {
+          diagnostics = "nvim_lsp",
+          show_close_icon = false,
+          separator_style = "thin",
+        },
+      })
+      -- Cycle / reorder / close buffers. ]b [b move; <leader>bp pins a picker.
+      vim.keymap.set("n", "]b", "<cmd>BufferLineCycleNext<cr>", { desc = "Next buffer/tab" })
+      vim.keymap.set("n", "[b", "<cmd>BufferLineCyclePrev<cr>", { desc = "Prev buffer/tab" })
+      vim.keymap.set("n", "<S-l>", "<cmd>BufferLineCycleNext<cr>", { desc = "Next buffer/tab" })
+      vim.keymap.set("n", "<S-h>", "<cmd>BufferLineCyclePrev<cr>", { desc = "Prev buffer/tab" })
+      vim.keymap.set("n", "<leader>bp", "<cmd>BufferLinePick<cr>", { desc = "Pick a buffer/tab" })
+      vim.keymap.set("n", "<leader>bd", "<cmd>bdelete<cr>", { desc = "Close buffer/tab" })
+      -- Jump straight to tab N.
+      for i = 1, 9 do
+        vim.keymap.set(
+          "n",
+          "<leader>" .. i,
+          "<cmd>BufferLineGoToBuffer " .. i .. "<cr>",
+          { desc = "Go to buffer/tab " .. i }
+        )
+      end
+    end,
+  },
+
   -- Syntax + structural editing. nvim-treesitter rewrote its API: the old
   -- `nvim-treesitter.configs` module is gone. New API: setup(), install(), and
   -- highlighting via vim.treesitter.start() per buffer.
