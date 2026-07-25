@@ -21,7 +21,18 @@ forge            # reattach — same windows, same state
 forge attach     # attach only (error if nothing is running)
 ```
 
-The server socket lives at `$XDG_RUNTIME_DIR/codeforge-<user>.sock`.
+**Across quit / reboot.** CodeForge saves your open **window directories** to
+disk. After `Ctrl-a q` or a reboot, a bare `forge` **restores** those windows
+(fresh panes, but each AI pane resumes its conversation via `claude --continue`).
+Live pane contents (terminal history, editor buffers) don't survive a full
+teardown — that needs process/fd handoff.
+
+- `forge` — restore the last session (or the picker on first run)
+- `forge <project>` — start a *fresh* single-window session
+- `Ctrl-a r` — reload the server on a newly-built binary, same windows
+
+The server socket lives at `$XDG_RUNTIME_DIR/codeforge-<user>.sock`; the saved
+session at `$XDG_STATE_HOME/codeforge/session` (delete it to start clean).
 
 ## Status
 

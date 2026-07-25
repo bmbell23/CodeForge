@@ -273,14 +273,64 @@ fn main() -> Result<()> {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(projects_root);
-    let project = match args.get(1) {
-        Some(arg) => resolve_arg_dir(arg, &proot),
-        None => choose_project_interactive(&proot)?,
+
+    // A CLI arg starts a fresh single-window session. Bare `forge` restores the
+    // last saved session (resuming AI conversations); if none, shows the picker.
+    let (dirs, resume) = match args.get(1) {
+        Some(arg) => (vec![resolve_arg_dir(arg, &proot)], false),
+        None => {
+            let saved = load_snapshot();
+            if saved.is_empty() {
+                (vec![choose_project_interactive(&proot)?], false)
+            } else {
+                (saved, true)
+            }
+        }
     };
 
-    spawn_server(&[project], false)?;
+    spawn_server(&dirs, resume)?;
     wait_for_socket(&sock, Duration::from_secs(5))?;
     run_client(&sock)
+}
+
+/// Where the last session's window directories are saved, so a fresh `forge`
+/// (after quit or reboot) can restore the layout: `$XDG_STATE_HOME/codeforge/session`.
+fn snapshot_path() -> PathBuf {
+    let base = std::env::var("XDG_STATE_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
+        });
+    base.join("codeforge").join("session")
+}
+
+/// Save the current window directories (one per line), best-effort.
+fn save_snapshot(dirs: &[PathBuf]) {
+    let path = snapshot_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body: String = dirs
+        .iter()
+        .map(|d| d.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(&path, body);
+}
+
+/// Load the saved window directories that still exist.
+fn load_snapshot() -> Vec<PathBuf> {
+    match std::fs::read_to_string(snapshot_path()) {
+        Ok(s) => s
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Unix socket for the per-user server: `$XDG_RUNTIME_DIR/codeforge-<user>.sock`.
@@ -442,6 +492,10 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
     let mut size = (80u16, 24u16);
     let mut client: Option<UnixStream> = None;
     let mut framebuf: Vec<u8> = Vec::new();
+
+    // Persist the window directories so a fresh `forge` can restore them.
+    let mut last_dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
+    save_snapshot(&last_dirs);
 
     {
         let w = &mut windows[cur];
@@ -763,6 +817,13 @@ fn run_server(sock: &Path, dirs: Vec<String>, resume: bool) -> Result<()> {
         }
         if cur >= windows.len() {
             cur = windows.len() - 1;
+        }
+
+        // Re-save the snapshot when the set of window directories changes.
+        let now_dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
+        if now_dirs != last_dirs {
+            save_snapshot(&now_dirs);
+            last_dirs = now_dirs;
         }
 
         if dirty {
