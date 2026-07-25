@@ -410,30 +410,37 @@ fn new_window(
     tx: &Sender<Msg>,
 ) -> Result<Window> {
     let panes = spawn_ide(spec, cfg, shell, base, tx)?;
-    // spawn_ide assigns editor=base, shell=base+1, ai=base+2.
+    // spawn_ide assigns editor=base, shell=base+1, ai=base+2. All three always
+    // exist; config only chooses which start visible (#17). Never zero visible.
     let active = [base, base + 1, base + 2];
+    let (mut se, ss, sa) = (cfg.start_editor, cfg.start_terminal, cfg.start_ai);
+    if !se && !ss && !sa {
+        se = true;
+    }
     let layout = compute_layout(
         active[0],
         active[1],
         active[2],
-        true,
-        true,
-        true,
+        se,
+        ss,
+        sa,
         cfg.editor_ratio,
         cfg.right_ratio,
     )
     .unwrap_or(Layout::Leaf(base));
+    // Focus the first visible pane.
+    let focus_id = layout.first_leaf().unwrap_or(base);
     let title = dir_title(&spec.dir);
     Ok(Window {
         panes,
         layout,
-        focus_id: base,
+        focus_id,
         active,
         dir: spec.dir.clone(),
         title,
-        show_editor: true,
-        show_shell: true,
-        show_ai: true,
+        show_editor: se,
+        show_shell: ss,
+        show_ai: sa,
         attention: false,
         last_ai_bell: 0,
     })
@@ -514,6 +521,11 @@ fn build_editor(
         if !cfg.wrap {
             c.arg("-c");
             c.arg("set nowrap");
+        }
+        // init.lua autosaves unless this global is 0 (#19).
+        if !cfg.autosave {
+            c.arg("-c");
+            c.arg("let g:codeforge_autosave=0");
         }
     }
     if !files.is_empty() {
@@ -834,7 +846,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // resume each AI conversation.
     let specs: Vec<WindowSpec> = if dirs.is_empty() {
         let saved = load_snapshot();
-        cfg.ai = format!("{} --continue", cfg.ai.trim());
+        // Resume the previous AI conversation on restore. `--continue` is
+        // claude-specific; other AI CLIs (e.g. augment, #13) just relaunch.
+        if cfg.ai.trim_start().starts_with("claude") {
+            cfg.ai = format!("{} --continue", cfg.ai.trim());
+        }
         if saved.is_empty() {
             vec![WindowSpec::bare(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),

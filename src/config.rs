@@ -31,6 +31,13 @@ pub struct Config {
     pub weather: String,
     /// Editor line wrapping. When false, CodeForge starts nvim with `nowrap`.
     pub wrap: bool,
+    /// Autosave edits in the editor (nvim writes on change). Default on.
+    pub autosave: bool,
+    /// Which panes open when a project window is first created (#17). At least
+    /// one must be true; if all are false the editor is forced on.
+    pub start_editor: bool,
+    pub start_terminal: bool,
+    pub start_ai: bool,
     /// Per-action keybindings (single chars, pressed after the prefix).
     pub keys: Keys,
 }
@@ -83,6 +90,10 @@ impl Default for Config {
             right_ratio: 0.5,
             weather: "Colorado Springs".into(),
             wrap: true,
+            autosave: true,
+            start_editor: true,
+            start_terminal: true,
+            start_ai: true,
             keys: Keys::default(),
         }
     }
@@ -375,8 +386,16 @@ prefix = "C-a"
 # Startup panes. `editor` and `ai` are command lines (split on spaces).
 # The editor opens the project dir (or, on restore, your previously open files).
 editor = "nvim"
-ai = "claude"
+ai = "claude"           # any AI CLI, e.g. "augment"; claude gets --continue/--resume
 # shell = "/bin/bash"   # defaults to $SHELL
+
+# Which panes open when a project window is first created. At least one true.
+start_editor = true
+start_terminal = true
+start_ai = true
+
+# Autosave editor changes (nvim writes on edit). false = save manually (:w).
+autosave = true
 
 # Layout ratios.
 editor_ratio = 0.5   # editor width fraction (left column)

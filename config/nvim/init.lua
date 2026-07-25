@@ -330,3 +330,24 @@ vim.keymap.set("n", "<leader>rr", ":%s//g<Left><Left>", { desc = "Replace in fil
 -- Quick write/quit.
 vim.keymap.set("n", "<leader>w", "<cmd>write<cr>", { desc = "Write" })
 vim.keymap.set("n", "<leader>q", "<cmd>quit<cr>", { desc = "Quit window" })
+
+-- Autosave (#19): write real file buffers on change / leaving insert, unless
+-- CodeForge disabled it via `g:codeforge_autosave = 0` (config `autosave = false`).
+if vim.g.codeforge_autosave ~= 0 then
+  vim.api.nvim_create_autocmd({ "TextChanged", "InsertLeave", "FocusLost", "BufLeave" }, {
+    callback = function(ev)
+      local bo = vim.bo[ev.buf]
+      if
+        bo.buftype == "" -- a normal file buffer (not oil, alpha, terminal, …)
+        and bo.modifiable
+        and bo.modified
+        and not bo.readonly
+        and vim.api.nvim_buf_get_name(ev.buf) ~= ""
+      then
+        -- `silent!` so a no-write situation (e.g. a new no-name split) is quiet.
+        vim.cmd("silent! noautocmd write")
+      end
+    end,
+    desc = "Autosave",
+  })
+end
