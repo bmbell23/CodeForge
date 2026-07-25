@@ -56,6 +56,12 @@ require("lazy").setup({
     branch = "0.1.x",
     dependencies = { "nvim-lua/plenary.nvim" },
     config = function()
+      -- Telescope 0.1.x calls nvim-treesitter's old `ft_to_lang`, which the
+      -- rewritten nvim-treesitter removed — turn off treesitter in the preview
+      -- so live_grep/find_files don't crash.
+      require("telescope").setup({
+        defaults = { preview = { treesitter = false } },
+      })
       local t = require("telescope.builtin")
       -- VS Code-style (work in normal & insert):
       --   Ctrl-P        open file by name
