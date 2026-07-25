@@ -107,7 +107,7 @@ require("lazy").setup({
       -- Install parsers asynchronously (no-op if already present).
       pcall(function()
         require("nvim-treesitter").install({
-          "lua", "rust", "python", "bash", "markdown", "json", "toml", "c",
+          "lua", "rust", "python", "bash", "markdown", "json", "toml", "c", "perl",
         })
       end)
       -- Enable treesitter highlighting + indentation when a parser exists.
@@ -120,6 +120,28 @@ require("lazy").setup({
         end,
       })
     end,
+  },
+
+  -- Peek window for LSP locations (Story #11): a VS Code-style popup showing
+  -- the definition/references with a live preview, and Enter to jump there.
+  -- Wired to gd/gr/gi/gt in the LspAttach block below.
+  {
+    "dnlhc/glance.nvim",
+    cmd = "Glance",
+    opts = {
+      border = { enable = true },
+      hooks = {
+        -- If there's exactly one definition, jump straight there instead of
+        -- opening a one-item popup.
+        before_open = function(results, open, jump, method)
+          if #results == 1 and method == "definitions" then
+            jump(results[1])
+          else
+            open(results)
+          end
+        end,
+      },
+    },
   },
 
   -- LSP: go-to-definition, references (find callers), rename, etc.
@@ -136,21 +158,39 @@ require("lazy").setup({
     config = function()
       require("mason").setup()
       require("mason-lspconfig").setup({
-        -- Installed on demand; add servers here or via :Mason.
-        ensure_installed = {},
+        -- The languages we want working out of the box (Story #11). Mason
+        -- installs these servers on first launch; add more here or via :Mason.
+        --   rust  -> rust_analyzer   python -> pyright     C -> clangd
+        --   bash  -> bashls          perl   -> perlnavigator
+        ensure_installed = {
+          "rust_analyzer",
+          "pyright",
+          "clangd",
+          "bashls",
+          "perlnavigator",
+        },
       })
 
-      -- Buffer-local LSP keymaps, set when a server attaches.
+      -- Buffer-local LSP keymaps, set when a server attaches. Definition /
+      -- references / implementation / type open in Glance's peek window (a
+      -- preview popup you can jump from, per Story #11); <leader>-prefixed
+      -- Telescope pickers remain as a list-style alternative.
       vim.api.nvim_create_autocmd("LspAttach", {
         callback = function(ev)
           local map = function(keys, fn, desc)
             vim.keymap.set("n", keys, fn, { buffer = ev.buf, desc = "LSP: " .. desc })
           end
           local tb = require("telescope.builtin")
-          map("gd", tb.lsp_definitions, "Go to definition")
-          map("gr", tb.lsp_references, "Find references (callers)")
-          map("gi", tb.lsp_implementations, "Go to implementation")
-          map("gt", tb.lsp_type_definitions, "Go to type definition")
+          local has_glance = pcall(require, "glance")
+          local peek = function(scope, fallback)
+            return has_glance and ("<cmd>Glance " .. scope .. "<cr>") or fallback
+          end
+          map("gd", peek("definitions", tb.lsp_definitions), "Peek / go to definition")
+          map("gr", peek("references", tb.lsp_references), "Peek references (callers)")
+          map("gi", peek("implementations", tb.lsp_implementations), "Peek implementations")
+          map("gt", peek("type_definitions", tb.lsp_type_definitions), "Peek type definition")
+          -- Direct jump (no popup), for when you know where you're going.
+          map("gD", vim.lsp.buf.definition, "Jump to definition")
           map("<leader>ds", tb.lsp_document_symbols, "Document symbols")
           map("<leader>ws", tb.lsp_dynamic_workspace_symbols, "Workspace symbols")
           map("K", vim.lsp.buf.hover, "Hover docs")
