@@ -132,6 +132,69 @@ require("lazy").setup({
     end,
   },
 
+  -- Start screen (#14): a CodeForge splash when the editor opens with no file.
+  -- Shows ASCII art + key hints, and — the point — you can just start typing to
+  -- fuzzy-open a file (the first key seeds a Telescope find_files search).
+  {
+    "goolord/alpha-nvim",
+    event = "VimEnter",
+    config = function()
+      local ok, alpha = pcall(require, "alpha")
+      if not ok then
+        return
+      end
+      local header = {
+        [[   ______          __     ______                     ]],
+        [[  / ____/___  ____/ /__  / ____/___  _________ ____   ]],
+        [[ / /   / __ \/ __  / _ \/ /_  / __ \/ ___/ __ `/ _ \  ]],
+        [[/ /___/ /_/ / /_/ /  __/ __/ / /_/ / /  / /_/ /  __/  ]],
+        [[\____/\____/\__,_/\___/_/    \____/_/   \__, /\___/   ]],
+        [[                                       /____/         ]],
+      }
+      local info = {
+        "terminal-native IDE — nvim + shell + Claude in managed panes",
+        "",
+        "‹ just start typing to open a file ›",
+        "",
+        "Ctrl-P  find file        Ctrl-Shift-F  grep the project",
+        "<leader>e  file explorer     ]b / [b  switch buffer tabs",
+        "<leader>bd  close buffer      gd  peek definition",
+        "",
+        "Ctrl-a ?  keys + live editor    Ctrl-a s  new terminal/Claude tab",
+        "Ctrl-a h/j/k/l  focus panes     Ctrl-a n  new window",
+      }
+      local function text(lines, hl)
+        return { type = "text", val = lines, opts = { position = "center", hl = hl } }
+      end
+      alpha.setup({
+        layout = {
+          { type = "padding", val = 4 },
+          text(header, "Keyword"),
+          { type = "padding", val = 2 },
+          text(info, "Comment"),
+        },
+        opts = { margin = 5 },
+      })
+
+      -- On the splash, any printable key opens the fuzzy file finder seeded with
+      -- that character — so you "just start typing" to open a file.
+      vim.api.nvim_create_autocmd("FileType", {
+        pattern = "alpha",
+        callback = function(ev)
+          local tb = require("telescope.builtin")
+          local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+          for i = 1, #chars do
+            local ch = chars:sub(i, i)
+            vim.keymap.set("n", ch, function()
+              tb.find_files({ default_text = ch })
+            end, { buffer = ev.buf, nowait = true, silent = true })
+          end
+          vim.keymap.set("n", "<CR>", tb.find_files, { buffer = ev.buf, nowait = true })
+        end,
+      })
+    end,
+  },
+
   -- Syntax + structural editing. nvim-treesitter rewrote its API: the old
   -- `nvim-treesitter.configs` module is gone. New API: setup(), install(), and
   -- highlighting via vim.treesitter.start() per buffer.

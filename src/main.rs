@@ -152,6 +152,23 @@ fn query_nvim_files(sock: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// Close nvim's current buffer (an editor "tab") over its RPC socket, keeping
+/// the window/nvim alive. `bp|bd#` switches to the previous buffer then deletes
+/// the one we left; `silent!` swallows the last-buffer case. Best-effort.
+fn nvim_close_buffer(sock: &Path) {
+    if !sock.exists() {
+        return;
+    }
+    let _ = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg("execute('silent! bp|bd#')")
+        .output();
+}
+
 /// Capture a restorable spec for every window (open files + shell cwd).
 fn capture_specs(windows: &[Window]) -> Vec<WindowSpec> {
     windows
@@ -499,13 +516,17 @@ fn build_editor(
             c.arg("set nowrap");
         }
     }
-    if files.is_empty() {
-        c.arg(".");
-    } else {
+    if !files.is_empty() {
         for f in files {
             c.arg(f);
         }
+    } else if !is_nvim {
+        // A generic editor opens the project dir.
+        c.arg(".");
     }
+    // nvim with no files: start on an empty buffer (its cwd is the project dir),
+    // so a directory explorer isn't opened over which Ctrl-P would stack (#14).
+    // Ctrl-P / live-grep still work because telescope searches the cwd.
     (c, title)
 }
 
@@ -1250,9 +1271,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     let (c, r) = size;
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
-                    // The editor is a single nvim; close its buffers with nvim's
-                    // own keys (<leader>bd), never by killing the whole pane.
-                    if let Some(role) = w.focus_role().filter(|r| *r != PaneRole::Editor) {
+                    if let Some(PaneRole::Editor) = w.focus_role() {
+                        // Editor is a single nvim: close the current buffer (tab)
+                        // over RPC, leaving nvim alive.
+                        nvim_close_buffer(&nvim_sock(w.focus_id));
+                    } else if let Some(role) = w.focus_role() {
                         let ids = w.slot_ids(role);
                         if ids.len() > 1 {
                             // Kill + drop the active child, activate a neighbour.
