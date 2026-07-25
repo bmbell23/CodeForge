@@ -742,7 +742,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
 
     let (mut cfg, _) = Config::load();
     let prefix = cfg.prefix_byte();
-    let keys = cfg.keys;
+    // Shared so the `Ctrl-a ?` editor can rebind keys live: reader-thread
+    // parsers and the event loop all see the same mapping.
+    let keys = Arc::new(Mutex::new(cfg.keys));
     let shell = cfg
         .shell
         .clone()
@@ -777,6 +779,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // into messages (input is parsed for prefix commands / mouse).
     {
         let tx = tx.clone();
+        let keys = keys.clone();
         thread::spawn(move || {
             for conn in listener.incoming() {
                 let stream = match conn {
@@ -784,6 +787,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     Err(_) => continue,
                 };
                 let tx = tx.clone();
+                let keys = keys.clone();
                 thread::spawn(move || {
                     let mut rd = match stream.try_clone() {
                         Ok(r) => r,
@@ -862,7 +866,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         next_id += 3;
     }
     let mut cur = 0usize;
-    let mut show_help = false;
+    let mut help: Option<HelpState> = None;
     let mut picker: Option<Picker> = None;
     let mut picker_new_window = false;
     // (cols, rows) of the attached client; updated on attach/resize.
@@ -906,7 +910,15 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     }
                 }
                 Msg::Input(bytes) => {
-                    if let Some(pk) = picker.as_mut() {
+                    if let Some(h) = help.as_mut() {
+                        // The help overlay is modal: it captures keystrokes for
+                        // navigation / live rebinding instead of the focused pane.
+                        if help_input(h, &bytes, &keys) {
+                            help = None;
+                            needs_clear = true;
+                        }
+                        dirty = true;
+                    } else if let Some(pk) = picker.as_mut() {
                         match pk.feed_bytes(&bytes) {
                             PickerAction::None => {}
                             PickerAction::Cancel => {
@@ -1080,11 +1092,16 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                 }
                 Msg::ToggleHelp => {
-                    show_help = !show_help;
+                    help = if help.is_some() {
+                        None
+                    } else {
+                        Some(HelpState::new())
+                    };
                     dirty = true;
                     needs_clear = true;
                 }
                 Msg::OpenPicker => {
+                    help = None;
                     picker = if picker.is_some() {
                         None
                     } else {
@@ -1095,6 +1112,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     needs_clear = true;
                 }
                 Msg::NewWindow => {
+                    help = None;
                     picker = Some(Picker::new(proot.clone()));
                     picker_new_window = true;
                     dirty = true;
@@ -1250,6 +1268,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     format!("{temp}  {dt}")
                 };
                 framebuf.clear();
+                let ksnap = *keys.lock().unwrap();
                 render(
                     &mut framebuf,
                     &windows,
@@ -1257,10 +1276,10 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     size.0,
                     size.1,
                     needs_clear,
-                    show_help,
+                    help.as_ref(),
                     picker.as_ref(),
                     &right_info,
-                    keys,
+                    ksnap,
                 )?;
                 if protocol::write_frame(cl, protocol::OUTPUT, &framebuf).is_err() {
                     client = None;
@@ -1444,11 +1463,13 @@ struct InputParser {
     mouse: Vec<u8>,
     passthrough: Vec<u8>,
     prefix: u8,
-    keys: Keys,
+    /// Shared with the event loop so live rebinds (the `Ctrl-a ?` editor) take
+    /// effect immediately: the parser reads the current mapping on each prefix.
+    keys: Arc<Mutex<Keys>>,
 }
 
 impl InputParser {
-    fn new(prefix: u8, keys: Keys) -> InputParser {
+    fn new(prefix: u8, keys: Arc<Mutex<Keys>>) -> InputParser {
         InputParser {
             state: InState::Normal,
             mouse: Vec::new(),
@@ -1467,16 +1488,25 @@ impl InputParser {
 
     /// Feed a chunk of input bytes, appending resulting messages to `out`.
     fn feed(&mut self, bytes: &[u8], out: &mut Vec<Msg>) {
-        for &b in bytes {
+        let n = bytes.len();
+        for (i, &b) in bytes.iter().enumerate() {
+            let last = i + 1 == n;
             match self.state {
                 InState::Normal => match b {
                     _ if b == self.prefix => self.state = InState::Prefix,
+                    // A bare ESC (last byte of the chunk) is a real Esc keypress:
+                    // pass it straight through. Terminals deliver escape
+                    // sequences (arrows, mouse) atomically, so an ESC that isn't
+                    // the last byte begins a sequence -> collect it instead. This
+                    // both fixes the previously-swallowed lone ESC and lets the
+                    // help overlay close on Esc.
+                    0x1b if last => self.passthrough.push(0x1b),
                     0x1b => self.state = InState::Esc,
                     _ => self.passthrough.push(b),
                 },
                 InState::Prefix => {
                     self.state = InState::Normal;
-                    let k = self.keys;
+                    let k = *self.keys.lock().unwrap();
                     let c = b as char;
                     let cmd = if c == k.quit {
                         Some(Msg::Quit)
@@ -1587,7 +1617,7 @@ fn render(
     cols: u16,
     rows: u16,
     clear: bool,
-    show_help: bool,
+    help: Option<&HelpState>,
     picker: Option<&Picker>,
     right_info: &str,
     keys: Keys,
@@ -1639,8 +1669,8 @@ fn render(
         }
     }
 
-    if show_help {
-        draw_help(out, cols, rows, keys)?;
+    if let Some(h) = help {
+        draw_help(out, cols, rows, keys, h)?;
     }
     if let Some(pk) = picker {
         pk.render(out, cols, rows)?;
@@ -1708,43 +1738,181 @@ fn draw_status(
     Ok(())
 }
 
-/// Draw a centered overlay listing the CodeForge keybindings, built from the
-/// live config so it reflects any customizations.
-fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16, k: Keys) -> Result<()> {
-    // (key display, label). Ctrl-a is the prefix for all of these.
-    let binds: [(String, &str); 15] = [
-        (k.toggle_editor.to_string(), "show/hide editor"),
-        (k.toggle_shell.to_string(), "show/hide terminal"),
-        (k.toggle_ai.to_string(), "show/hide Claude"),
-        ("hjkl".into(), "move focus"),
-        (k.cycle.to_string(), "cycle focus"),
-        (k.picker.to_string(), "switch project"),
-        (k.win_new.to_string(), "new window"),
-        (k.win_close.to_string(), "close window"),
-        ("1..9".into(), "jump to window"),
-        (k.detach.to_string(), "detach (stays alive)"),
-        (k.reload.to_string(), "reload (new build)"),
-        (k.fresh.to_string(), "forget saved session"),
-        (k.quit.to_string(), "quit (ends session)"),
-        (k.help.to_string(), "toggle this help"),
-        ("click".into(), "focus / wheel scrolls"),
-    ];
-    let mut lines: Vec<String> = Vec::new();
-    lines.push("  CodeForge — keys (prefix Ctrl-a)  ".to_string());
-    lines.push(String::new());
-    for (key, label) in &binds {
-        lines.push(format!("  Ctrl-a {key:<5}  {label}"));
-    }
-    lines.push(String::new());
-    lines.push("  edit ~/.config/codeforge/config.toml  ".to_string());
+/// State of the `Ctrl-a ?` overlay. It starts as a read-only key reference and
+/// can flip into an inline editor that rebinds keys live (Story #10).
+struct HelpState {
+    /// In the editor (rows selectable) vs. just viewing the reference.
+    editing: bool,
+    /// Selected row, an index into `config::EDITABLE`.
+    sel: usize,
+    /// Waiting to capture the next printable keypress as the new binding.
+    capturing: bool,
+    /// Transient status / error line shown at the bottom.
+    msg: String,
+}
 
-    let w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16 + 2;
-    let h = lines.len() as u16 + 2;
-    if w > cols || h > rows {
+impl HelpState {
+    fn new() -> HelpState {
+        HelpState {
+            editing: false,
+            sel: 0,
+            capturing: false,
+            msg: String::new(),
+        }
+    }
+}
+
+/// A decoded overlay keypress (raw bytes -> intent).
+enum HelpKey {
+    Up,
+    Down,
+    Enter,
+    Esc,
+    Char(char),
+}
+
+/// Decode raw input bytes into overlay keypresses, resolving arrow escape
+/// sequences (`ESC [ A/B`) and a bare `ESC`.
+fn decode_help_keys(bytes: &[u8]) -> Vec<HelpKey> {
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'[' {
+                match bytes[i + 2] {
+                    b'A' => v.push(HelpKey::Up),
+                    b'B' => v.push(HelpKey::Down),
+                    _ => {}
+                }
+                i += 3;
+                continue;
+            }
+            v.push(HelpKey::Esc);
+            i += 1;
+            continue;
+        }
+        match b {
+            b'\r' | b'\n' => v.push(HelpKey::Enter),
+            0x20..=0x7e => v.push(HelpKey::Char(b as char)),
+            _ => {}
+        }
+        i += 1;
+    }
+    v
+}
+
+/// Drive the help overlay from user input. Mutates `h`, applies committed
+/// rebinds to the shared `keys` (effective immediately) and persists them.
+/// Returns true when the overlay should close.
+fn help_input(h: &mut HelpState, bytes: &[u8], keys: &Arc<Mutex<Keys>>) -> bool {
+    for ev in decode_help_keys(bytes) {
+        if h.capturing {
+            match ev {
+                HelpKey::Esc => {
+                    h.capturing = false;
+                    h.msg = "cancelled".into();
+                }
+                HelpKey::Char(c) => {
+                    let field = config::EDITABLE[h.sel].0;
+                    let cur = *keys.lock().unwrap();
+                    match cur.with_bind(field, c) {
+                        Ok(nk) => {
+                            *keys.lock().unwrap() = nk; // live: reader threads see it
+                            config::persist_keybind(field, c); // survive restart
+                            h.capturing = false;
+                            h.msg = format!("bound {field} to '{c}'");
+                        }
+                        Err(e) => h.msg = e, // stay capturing so they can retry
+                    }
+                }
+                _ => h.msg = "press a printable key (Esc to cancel)".into(),
+            }
+            continue;
+        }
+        if !h.editing {
+            match ev {
+                HelpKey::Esc => return true,
+                HelpKey::Char('e') | HelpKey::Char('E') => {
+                    h.editing = true;
+                    h.msg.clear();
+                }
+                HelpKey::Char(c) => {
+                    // 'q' or the (current) help key also closes.
+                    if c == 'q' || c == keys.lock().unwrap().help {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            let n = config::EDITABLE.len();
+            match ev {
+                HelpKey::Esc => {
+                    h.editing = false;
+                    h.msg.clear();
+                }
+                HelpKey::Up | HelpKey::Char('k') => h.sel = (h.sel + n - 1) % n,
+                HelpKey::Down | HelpKey::Char('j') => h.sel = (h.sel + 1) % n,
+                HelpKey::Enter => {
+                    h.capturing = true;
+                    h.msg = format!("press new key for {}", config::EDITABLE[h.sel].1);
+                }
+                HelpKey::Char('q') => return true,
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
+/// Draw the centered `Ctrl-a ?` overlay — a key reference, or the inline key
+/// editor when `h.editing`. Keys come from the live (possibly just-rebound)
+/// config so the display always reflects the current mapping.
+fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16, k: Keys, h: &HelpState) -> Result<()> {
+    // (text, is-the-selected-editor-row).
+    let mut lines: Vec<(String, bool)> = Vec::new();
+    let title = if h.editing {
+        "  CodeForge — edit keys (prefix Ctrl-a)"
+    } else {
+        "  CodeForge — keys (prefix Ctrl-a)"
+    };
+    lines.push((title.to_string(), false));
+    lines.push((String::new(), false));
+    for (i, (field, label)) in config::EDITABLE.iter().enumerate() {
+        let key = k.get(field).map(|c| c.to_string()).unwrap_or_default();
+        let marker = if h.editing && i == h.sel { "›" } else { " " };
+        let selected = h.editing && i == h.sel;
+        lines.push((format!(" {marker} Ctrl-a {key:<3}  {label}"), selected));
+    }
+    lines.push((String::new(), false));
+    lines.push(("   Ctrl-a 1..9  jump to window".to_string(), false));
+    lines.push(("   click / wheel focus / scroll".to_string(), false));
+    lines.push((String::new(), false));
+    let footer = if h.capturing {
+        format!("  {}", h.msg)
+    } else if h.editing {
+        "  ↑/↓ select · Enter rebind · Esc back".to_string()
+    } else {
+        "  e edit keys · Esc/q close".to_string()
+    };
+    lines.push((footer, false));
+    if !h.msg.is_empty() && !h.capturing {
+        lines.push((format!("  {}", h.msg), false));
+    }
+
+    let w = lines
+        .iter()
+        .map(|(l, _)| l.chars().count())
+        .max()
+        .unwrap_or(0) as u16
+        + 2;
+    let bh = lines.len() as u16 + 2;
+    if w > cols || bh > rows {
         return Ok(());
     }
     let x = (cols - w) / 2;
-    let y = (rows - h) / 2;
+    let y = (rows - bh) / 2;
 
     queue!(
         out,
@@ -1752,23 +1920,32 @@ fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16, k: Keys) -> Result<()> {
         SetForegroundColor(Color::Black),
         SetBackgroundColor(Color::Cyan)
     )?;
-    // Top/bottom borders and body.
     queue!(
         out,
         cursor::MoveTo(x, y),
         Print(format!("┌{}┐", "─".repeat((w - 2) as usize)))
     )?;
-    for (i, line) in lines.iter().enumerate() {
+    for (i, (line, selected)) in lines.iter().enumerate() {
         let padded = format!("{line:<width$}", width = (w - 2) as usize);
-        queue!(
-            out,
-            cursor::MoveTo(x, y + 1 + i as u16),
-            Print(format!("│{padded}│"))
-        )?;
+        queue!(out, cursor::MoveTo(x, y + 1 + i as u16), Print("│"))?;
+        if *selected {
+            // Invert (black-on-cyan -> cyan-on-black) to mark the selected row.
+            queue!(
+                out,
+                SetAttribute(Attribute::Reverse),
+                Print(&padded),
+                SetAttribute(Attribute::Reset),
+                SetForegroundColor(Color::Black),
+                SetBackgroundColor(Color::Cyan)
+            )?;
+        } else {
+            queue!(out, Print(&padded))?;
+        }
+        queue!(out, Print("│"))?;
     }
     queue!(
         out,
-        cursor::MoveTo(x, y + h - 1),
+        cursor::MoveTo(x, y + bh - 1),
         Print(format!("└{}┘", "─".repeat((w - 2) as usize)))
     )?;
     queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
@@ -1895,5 +2072,86 @@ mod tests {
             _ => panic!("expected a mouse event"),
         }
         assert!(parse_mouse(b"garbage", true).is_none());
+    }
+
+    fn parser() -> InputParser {
+        InputParser::new(0x01, Arc::new(Mutex::new(Keys::default())))
+    }
+
+    #[test]
+    fn lone_esc_passes_through() {
+        // A bare ESC (last byte of the chunk) must reach the client as input,
+        // so the help overlay can close on Esc.
+        let mut out = Vec::new();
+        parser().feed(&[0x1b], &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == &[0x1b]));
+    }
+
+    #[test]
+    fn esc_sequence_not_split() {
+        // An arrow key (ESC [ A) arrives atomically and passes through intact,
+        // not mistaken for a lone Esc.
+        let mut out = Vec::new();
+        parser().feed(b"\x1b[A", &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == b"\x1b[A"));
+    }
+
+    #[test]
+    fn prefix_command_dispatch() {
+        // Ctrl-a then default toggle_ai ('c') -> toggle the AI pane.
+        let mut out = Vec::new();
+        parser().feed(&[0x01, b'c'], &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Toggle(PaneRole::Ai)]));
+    }
+
+    #[test]
+    fn decodes_overlay_keys() {
+        assert!(matches!(
+            decode_help_keys(&[0x1b]).as_slice(),
+            [HelpKey::Esc]
+        ));
+        assert!(matches!(
+            decode_help_keys(b"\x1b[A").as_slice(),
+            [HelpKey::Up]
+        ));
+        assert!(matches!(
+            decode_help_keys(b"\x1b[B").as_slice(),
+            [HelpKey::Down]
+        ));
+        assert!(matches!(
+            decode_help_keys(b"\r").as_slice(),
+            [HelpKey::Enter]
+        ));
+        assert!(matches!(
+            decode_help_keys(b"e").as_slice(),
+            [HelpKey::Char('e')]
+        ));
+    }
+
+    #[test]
+    fn rebind_validation() {
+        let k = Keys::default();
+        // A free key is accepted and applied.
+        assert_eq!(k.with_bind("toggle_ai", 'x').unwrap().toggle_ai, 'x');
+        // Colliding with another action is rejected.
+        assert!(k.with_bind("toggle_ai", k.quit).is_err());
+        // Digits and TOML-unsafe keys are rejected.
+        assert!(k.with_bind("toggle_ai", '1').is_err());
+        assert!(k.with_bind("toggle_ai", '"').is_err());
+    }
+
+    #[test]
+    fn help_overlay_navigation() {
+        let keys = Arc::new(Mutex::new(Keys::default()));
+        let mut h = HelpState::new();
+        // 'e' enters edit mode; Down moves the selection; Esc leaves edit mode.
+        assert!(!help_input(&mut h, b"e", &keys));
+        assert!(h.editing);
+        assert!(!help_input(&mut h, b"\x1b[B", &keys));
+        assert_eq!(h.sel, 1);
+        assert!(!help_input(&mut h, &[0x1b], &keys));
+        assert!(!h.editing);
+        // Esc in view mode closes the overlay.
+        assert!(help_input(&mut h, &[0x1b], &keys));
     }
 }

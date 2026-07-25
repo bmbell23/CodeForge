@@ -101,7 +101,99 @@ impl Default for Keys {
     }
 }
 
+/// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
+/// `(config field, human label)`. Focus keys are listed individually so each
+/// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
+pub const EDITABLE: [(&str, &str); 16] = [
+    ("toggle_editor", "show/hide editor"),
+    ("toggle_shell", "show/hide terminal"),
+    ("toggle_ai", "show/hide Claude"),
+    ("focus_left", "focus left"),
+    ("focus_down", "focus down"),
+    ("focus_up", "focus up"),
+    ("focus_right", "focus right"),
+    ("cycle", "cycle focus"),
+    ("picker", "switch project"),
+    ("win_new", "new window"),
+    ("win_close", "close window"),
+    ("detach", "detach (stays alive)"),
+    ("reload", "reload (new build)"),
+    ("fresh", "forget saved session"),
+    ("quit", "quit (ends session)"),
+    ("help", "toggle this help"),
+];
+
 impl Keys {
+    /// Current key bound to `field`, if `field` names an action.
+    pub fn get(&self, field: &str) -> Option<char> {
+        Some(match field {
+            "focus_left" => self.focus_left,
+            "focus_down" => self.focus_down,
+            "focus_up" => self.focus_up,
+            "focus_right" => self.focus_right,
+            "cycle" => self.cycle,
+            "toggle_editor" => self.toggle_editor,
+            "toggle_shell" => self.toggle_shell,
+            "toggle_ai" => self.toggle_ai,
+            "picker" => self.picker,
+            "help" => self.help,
+            "quit" => self.quit,
+            "win_new" => self.win_new,
+            "win_close" => self.win_close,
+            "detach" => self.detach,
+            "reload" => self.reload,
+            "fresh" => self.fresh,
+            _ => return None,
+        })
+    }
+
+    /// Set `field`'s key. Returns false if `field` isn't a known action.
+    pub fn set(&mut self, field: &str, ch: char) -> bool {
+        match field {
+            "focus_left" => self.focus_left = ch,
+            "focus_down" => self.focus_down = ch,
+            "focus_up" => self.focus_up = ch,
+            "focus_right" => self.focus_right = ch,
+            "cycle" => self.cycle = ch,
+            "toggle_editor" => self.toggle_editor = ch,
+            "toggle_shell" => self.toggle_shell = ch,
+            "toggle_ai" => self.toggle_ai = ch,
+            "picker" => self.picker = ch,
+            "help" => self.help = ch,
+            "quit" => self.quit = ch,
+            "win_new" => self.win_new = ch,
+            "win_close" => self.win_close = ch,
+            "detach" => self.detach = ch,
+            "reload" => self.reload = ch,
+            "fresh" => self.fresh = ch,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Validate binding `field` -> `ch` and return the resulting key set.
+    /// Rejects reserved/unsafe keys and anything that would collide with
+    /// another action (which would leave one of them dead).
+    pub fn with_bind(&self, field: &str, ch: char) -> Result<Keys, String> {
+        if ch.is_ascii_digit() {
+            return Err("digits 1-9 are reserved for window switching".into());
+        }
+        // `"` and `\` would break the TOML string we persist; space is invisible.
+        if !ch.is_ascii_graphic() || ch == '"' || ch == '\\' {
+            return Err("pick a visible key (no space, quote, or backslash)".into());
+        }
+        let mut k = *self;
+        if !k.set(field, ch) {
+            return Err(format!("unknown action '{field}'"));
+        }
+        for (name, c) in k.bindings() {
+            if name != field && c == ch {
+                return Err(format!("'{ch}' is already bound to {name}"));
+            }
+        }
+        Ok(k)
+    }
+
     /// All (action, key) bindings, for help display and conflict checking.
     fn bindings(&self) -> [(&'static str, char); 16] {
         [
@@ -194,6 +286,40 @@ pub fn config_path() -> PathBuf {
     base.join("codeforge").join("config.toml")
 }
 
+/// Rewrite one `field = "x"` line in `config.toml` so a live rebind survives a
+/// restart. Best-effort: preserves the rest of the file (other keys, comments);
+/// the edited line loses any inline comment. No-op if the file or line is
+/// absent. `ch` is pre-validated (`Keys::with_bind`) to be TOML-safe.
+pub fn persist_keybind(field: &str, ch: char) {
+    let path = config_path();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut done = false;
+    for line in text.lines() {
+        if !done {
+            let trimmed = line.trim_start();
+            // Match the assignment line for exactly this field: `field <ws> =`.
+            if let Some(rest) = trimmed.strip_prefix(field) {
+                if rest.trim_start().starts_with('=') {
+                    let indent = &line[..line.len() - trimmed.len()];
+                    out.push_str(indent);
+                    out.push_str(field);
+                    out.push_str(" = \"");
+                    out.push(ch);
+                    out.push_str("\"\n");
+                    done = true;
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let _ = std::fs::write(&path, out);
+}
+
 /// Parse a prefix spec: `"C-<c>"` -> Ctrl-<c>, or a single char literally.
 fn parse_prefix(s: &str) -> u8 {
     let s = s.trim();
@@ -250,3 +376,34 @@ reload = "r"     # restart server on latest build, reopen same windows
 fresh = "F"      # forget saved session (next forge starts from the picker)
 # also: prefix + 1..9 jumps to that window
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn persist_rewrites_one_key_and_reloads() {
+        // Isolate config to a temp dir via XDG_CONFIG_HOME.
+        let dir = std::env::temp_dir().join(format!("cf-cfgtest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("XDG_CONFIG_HOME", &dir);
+
+        let path = config_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, DEFAULT_TOML).unwrap();
+
+        persist_keybind("toggle_ai", 'x');
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("toggle_ai = \"x\""));
+        // Other keys and the file structure are preserved.
+        assert!(text.contains("[keys]"));
+        assert!(text.contains("win_new = \"n\"") || text.contains("win_new   = \"n\""));
+        // Reloads cleanly with the new value.
+        let cfg: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg.keys.toggle_ai, 'x');
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
