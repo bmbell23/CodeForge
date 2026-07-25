@@ -8,16 +8,18 @@
 //! the bytes the server sends back. Bare `forge` starts a server (picking a
 //! project) then attaches; a second `forge` attaches to the running one.
 //!
-//! Each window is an editor (Neovim, left) + shell + Claude CLI (stacked, right).
-//! The editor's IDE features (fuzzy find, grep, LSP) come from the Neovim config
-//! in `config/nvim/`, loaded via NVIM_APPNAME=codeforge.
+//! Each window is a fixed editor (Neovim) + terminal + Claude CLI trio; there
+//! are no splits. Hide/show panes to reshape it: editor left (full height) with
+//! terminal + Claude stacked on the right; hide the editor and the other two go
+//! side by side. The editor's IDE features (fuzzy find, grep, LSP) come from the
+//! Neovim config in `config/nvim/`, loaded via NVIM_APPNAME=codeforge.
 //!
 //! Controls (Ctrl-a is the prefix):
-//!   Ctrl-a |     split the focused pane side by side (new $SHELL)
-//!   Ctrl-a -     split the focused pane top/bottom (new $SHELL)
+//!   Ctrl-a e     show/hide the editor pane
+//!   Ctrl-a t     show/hide the terminal pane
+//!   Ctrl-a a     show/hide the Claude pane
 //!   Ctrl-a hjkl  move focus left/down/up/right
 //!   Ctrl-a o     cycle focus to the next pane
-//!   Ctrl-a x     close the focused pane
 //!   Ctrl-a p     open the project picker (re-home the current window)
 //!   Ctrl-a c     new window (its own editor/shell/AI for another project)
 //!   Ctrl-a X     close the current window (kills its panes)
@@ -27,12 +29,12 @@
 //!   Ctrl-a F     forget the saved session (next `forge` starts fresh)
 //!   Ctrl-a ?     toggle the keybinding help overlay
 //!   Ctrl-a q     quit CodeForge (ends the session)
-//!   Ctrl-a a     send a literal Ctrl-a to the child
+//!   Ctrl-a Ctrl-a  send a literal Ctrl-a to the child
 //! Click a pane to focus it; mouse events pass through to the child (nvim mouse
 //! works). Every other key is forwarded to the focused pane's child unchanged.
-//! A child that exits (Ctrl-D / `exit` / `:q`) is respawned in place — the AI
-//! pane returns on `claude --resume`; only Ctrl-a x removes a pane. Split a pane
-//! (Ctrl-a | / -) for a second terminal in the same window.
+//! A child that exits (Ctrl-D / `exit` / `:q`) is respawned in place — the
+//! terminal restarts, the editor reopens, the Claude pane returns on
+//! `claude --resume`. Panes are never destroyed, only hidden.
 
 mod config;
 mod layout;
@@ -163,8 +165,8 @@ pub enum Msg {
     Detach,
     /// The client's terminal was resized (rows, cols).
     Resize(u16, u16),
-    /// Split the focused pane along `Dir`.
-    Split(Dir),
+    /// Show/hide a pane by role.
+    Toggle(PaneRole),
     /// Move focus to the next pane (cycle order).
     FocusNext,
     /// Move focus to the neighbouring pane in a direction.
@@ -177,8 +179,6 @@ pub enum Msg {
         cb: u16,
         press: bool,
     },
-    /// Close the focused pane.
-    ClosePane,
     /// Toggle the keybinding help overlay.
     ToggleHelp,
     /// Toggle the project picker (re-homes the current window).
@@ -199,14 +199,113 @@ pub enum Msg {
     Quit,
 }
 
-/// One workspace: an editor + shell + AI layout for a single directory. The app
-/// holds a list of these (tabs / "windows"); only the current one is drawn.
+/// One workspace: a fixed editor + terminal + AI trio for a single directory.
+/// The layout is derived from which panes are visible (no arbitrary splits): the
+/// editor is a full-height left column; the terminal and AI stack on the right.
 struct Window {
     panes: Vec<Pane>,
     layout: Layout,
     focus_id: usize,
     dir: PathBuf,
     title: String,
+    show_editor: bool,
+    show_shell: bool,
+    show_ai: bool,
+}
+
+/// Find the id of the pane with a given role (all three always exist).
+fn role_id(panes: &[Pane], role: PaneRole) -> usize {
+    panes
+        .iter()
+        .find(|p| p.role == role)
+        .map(|p| p.id)
+        .unwrap_or(0)
+}
+
+/// Derive the layout tree from which panes are visible. Editor (when shown) is a
+/// full-height left column; terminal-over-AI stack on the right. With the editor
+/// hidden, the remaining panes go side by side (AI left, terminal right). Returns
+/// `None` if nothing is visible.
+fn compute_layout(
+    panes: &[Pane],
+    show_editor: bool,
+    show_shell: bool,
+    show_ai: bool,
+    editor_ratio: f32,
+    right_ratio: f32,
+) -> Option<Layout> {
+    let e = role_id(panes, PaneRole::Editor);
+    let s = role_id(panes, PaneRole::Shell);
+    let a = role_id(panes, PaneRole::Ai);
+
+    if show_editor {
+        let mut right = Vec::new();
+        if show_shell {
+            right.push(s);
+        }
+        if show_ai {
+            right.push(a);
+        }
+        Some(match right.len() {
+            0 => Layout::Leaf(e),
+            1 => Layout::Split {
+                dir: Dir::Row,
+                ratio: editor_ratio,
+                a: Box::new(Layout::Leaf(e)),
+                b: Box::new(Layout::Leaf(right[0])),
+            },
+            _ => Layout::Split {
+                dir: Dir::Row,
+                ratio: editor_ratio,
+                a: Box::new(Layout::Leaf(e)),
+                b: Box::new(Layout::Split {
+                    dir: Dir::Col,
+                    ratio: right_ratio,
+                    a: Box::new(Layout::Leaf(right[0])),
+                    b: Box::new(Layout::Leaf(right[1])),
+                }),
+            },
+        })
+    } else {
+        // Editor hidden: AI on the left, terminal on the right.
+        let mut cols = Vec::new();
+        if show_ai {
+            cols.push(a);
+        }
+        if show_shell {
+            cols.push(s);
+        }
+        match cols.len() {
+            0 => None,
+            1 => Some(Layout::Leaf(cols[0])),
+            _ => Some(Layout::Split {
+                dir: Dir::Row,
+                ratio: 0.5,
+                a: Box::new(Layout::Leaf(cols[0])),
+                b: Box::new(Layout::Leaf(cols[1])),
+            }),
+        }
+    }
+}
+
+/// Recompute a window's layout from its visibility flags and fix focus if the
+/// focused pane became hidden.
+fn refresh_layout(w: &mut Window, editor_ratio: f32, right_ratio: f32) {
+    if let Some(l) = compute_layout(
+        &w.panes,
+        w.show_editor,
+        w.show_shell,
+        w.show_ai,
+        editor_ratio,
+        right_ratio,
+    ) {
+        w.layout = l;
+        if !leaf_exists(&w.layout, w.focus_id) {
+            if let Some(f) = w.layout.first_leaf() {
+                w.focus_id = f;
+            }
+        }
+    }
 }
 
 /// The last path component, for the window's status-bar label.
@@ -226,7 +325,9 @@ fn new_window(
     base: usize,
     tx: &Sender<Msg>,
 ) -> Result<Window> {
-    let (panes, layout) = spawn_ide(spec, cfg, shell, base, tx)?;
+    let panes = spawn_ide(spec, cfg, shell, base, tx)?;
+    let layout = compute_layout(&panes, true, true, true, cfg.editor_ratio, cfg.right_ratio)
+        .unwrap_or(Layout::Leaf(base));
     let title = dir_title(&spec.dir);
     Ok(Window {
         panes,
@@ -234,27 +335,29 @@ fn new_window(
         focus_id: base,
         dir: spec.dir.clone(),
         title,
+        show_editor: true,
+        show_shell: true,
+        show_ai: true,
     })
 }
 
-/// Spawn the configured IDE layout (editor + shell + AI) for `spec`, with pane
-/// ids starting at `base`. The editor opens `spec.files` (or the dir) and, if
-/// it's nvim, listens on an RPC socket so its buffers can be captured later. The
-/// shell starts in `spec.shell_cwd` when known.
+/// Spawn the three panes (editor + terminal + AI) for `spec`, ids from `base`.
+/// The editor opens `spec.files` (or the dir) and, if nvim, listens on an RPC
+/// socket so its buffers can be captured. The shell starts in `spec.shell_cwd`.
 fn spawn_ide(
     spec: &WindowSpec,
     cfg: &Config,
     shell: &str,
     base: usize,
     tx: &Sender<Msg>,
-) -> Result<(Vec<Pane>, Layout)> {
+) -> Result<Vec<Pane>> {
     let dir = &spec.dir;
 
     let (editor, editor_title) = build_editor(cfg, dir, base, &spec.files);
     let shell_cwd = spec.shell_cwd.as_deref().unwrap_or(dir);
     let (ai, ai_title) = command_line(&cfg.ai, dir);
 
-    let panes = vec![
+    Ok(vec![
         Pane::spawn(
             editor,
             editor_title,
@@ -274,20 +377,7 @@ fn spawn_ide(
             tx.clone(),
         )?,
         Pane::spawn(ai, ai_title, PaneRole::Ai, 1, 1, base + 2, tx.clone())?,
-    ];
-
-    let layout = Layout::Split {
-        dir: Dir::Row,
-        ratio: cfg.editor_ratio,
-        a: Box::new(Layout::Leaf(base)),
-        b: Box::new(Layout::Split {
-            dir: Dir::Col,
-            ratio: cfg.right_ratio,
-            a: Box::new(Layout::Leaf(base + 1)),
-            b: Box::new(Layout::Leaf(base + 2)),
-        }),
-    };
-    Ok((panes, layout))
+    ])
 }
 
 /// Build a command that inherits our environment, runs in `cwd`, and advertises
@@ -816,27 +906,23 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                     needs_clear = true;
                 }
-                Msg::Split(dir) => {
+                Msg::Toggle(role) => {
                     let (c, r) = size;
                     let area = r.saturating_sub(1);
-                    let new_id = next_id;
-                    next_id += 1;
                     let w = &mut windows[cur];
-                    let pane = Pane::spawn(
-                        command(&shell, &w.dir),
-                        "shell".into(),
-                        PaneRole::Shell,
-                        1,
-                        1,
-                        new_id,
-                        tx.clone(),
-                    )?;
-                    w.panes.push(pane);
-                    w.layout.split(w.focus_id, new_id, dir);
-                    w.focus_id = new_id;
-                    relayout(&mut w.panes, &w.layout, c, area)?;
-                    dirty = true;
-                    needs_clear = true;
+                    // Flip the pane's visibility, but never hide the last one.
+                    let (flag, others) = match role {
+                        PaneRole::Editor => (&mut w.show_editor, w.show_shell || w.show_ai),
+                        PaneRole::Shell => (&mut w.show_shell, w.show_editor || w.show_ai),
+                        PaneRole::Ai => (&mut w.show_ai, w.show_editor || w.show_shell),
+                    };
+                    if !*flag || others {
+                        *flag = !*flag;
+                        refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                        relayout(&mut w.panes, &w.layout, c, area)?;
+                        dirty = true;
+                        needs_clear = true;
+                    }
                 }
                 Msg::FocusNext => {
                     let w = &mut windows[cur];
@@ -926,20 +1012,6 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         w.focus_id = id;
                     }
                     dirty = true;
-                }
-                Msg::ClosePane => {
-                    let (c, r) = size;
-                    let area = r.saturating_sub(1);
-                    let w = &mut windows[cur];
-                    close_leaf(&mut w.panes, &mut w.layout, w.focus_id);
-                    if !w.panes.is_empty() {
-                        if let Some(id) = w.layout.first_leaf() {
-                            w.focus_id = id;
-                        }
-                        relayout(&mut w.panes, &w.layout, c, area)?;
-                    }
-                    dirty = true;
-                    needs_clear = true;
                 }
                 Msg::ToggleHelp => {
                     show_help = !show_help;
@@ -1036,72 +1108,35 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         }
 
         // A child that exited (Ctrl-D / `exit` / `:q`) is respawned in place so
-        // the pane never vanishes — only Ctrl-a x removes a pane. A child that
-        // keeps dying quickly is given up on (crash-loop guard).
+        // the pane never vanishes. A child that keeps dying fast is left dead for
+        // now (crash-loop guard) and retried once it has aged out.
         let (c, r) = size;
         let area = r.saturating_sub(1);
-        let mut wi = 0;
-        while wi < windows.len() {
-            // Decide respawn vs give-up for each dead pane.
+        for w in windows.iter_mut() {
             let mut respawn: Vec<(usize, PaneRole, u32)> = Vec::new();
-            let mut give_up: Vec<usize> = Vec::new();
-            for p in windows[wi].panes.iter_mut() {
+            for p in w.panes.iter_mut() {
                 if p.is_dead() {
                     let fast = p.age() < Duration::from_millis(1500);
                     let fails = if fast { p.respawns() + 1 } else { 0 };
-                    if fails >= 4 {
-                        give_up.push(p.id);
-                    } else {
+                    if fails < 4 {
                         respawn.push((p.id, p.role, fails));
                     }
                 }
             }
+            if respawn.is_empty() {
+                continue;
+            }
+            let dir = w.dir.clone();
             for (id, role, fails) in respawn {
-                let dir = windows[wi].dir.clone();
                 let mut newp = respawn_pane(role, &dir, id, &cfg, &shell, &tx)?;
                 newp.set_respawns(fails);
-                if let Some(slot) = windows[wi].panes.iter_mut().find(|p| p.id == id) {
+                if let Some(slot) = w.panes.iter_mut().find(|p| p.id == id) {
                     *slot = newp;
                 }
-                if wi == cur {
-                    needs_clear = true;
-                }
-                dirty = true;
             }
-            for id in give_up {
-                let w = &mut windows[wi];
-                close_leaf(&mut w.panes, &mut w.layout, id);
-                if wi == cur {
-                    needs_clear = true;
-                }
-                dirty = true;
-            }
-            if windows[wi].panes.is_empty() {
-                windows.remove(wi);
-                if cur > wi || (cur == wi && cur > 0) {
-                    cur -= 1;
-                }
-                needs_clear = true;
-                dirty = true;
-            } else {
-                let w = &mut windows[wi];
-                if !leaf_exists(&w.layout, w.focus_id) {
-                    if let Some(f) = w.layout.first_leaf() {
-                        w.focus_id = f;
-                    }
-                }
-                relayout(&mut w.panes, &w.layout, c, area)?;
-                wi += 1;
-            }
-        }
-        if windows.is_empty() {
-            if let Some(mut cl) = client.take() {
-                let _ = protocol::write_frame(&mut cl, protocol::DETACH, &[]);
-            }
-            break;
-        }
-        if cur >= windows.len() {
-            cur = windows.len() - 1;
+            relayout(&mut w.panes, &w.layout, c, area)?;
+            dirty = true;
+            needs_clear = true;
         }
 
         // Re-capture the snapshot when the set of window directories changes
@@ -1265,16 +1300,6 @@ fn leaf_exists(layout: &Layout, id: usize) -> bool {
     ls.contains(&id)
 }
 
-/// Kill and drop the pane `id`, then prune its leaf from the tree.
-fn close_leaf(panes: &mut Vec<Pane>, layout: &mut Layout, id: usize) {
-    if let Some(pos) = panes.iter().position(|p| p.id == id) {
-        panes.remove(pos).kill();
-    }
-    // `Layout::remove` consumes self; swap a throwaway leaf in to move it out.
-    let taken = std::mem::replace(layout, Layout::Leaf(usize::MAX));
-    *layout = taken.remove(id).unwrap_or(Layout::Leaf(usize::MAX));
-}
-
 /// Resize every pane's PTY to match its current rectangle.
 fn relayout(panes: &mut [Pane], layout: &Layout, cols: u16, rows: u16) -> Result<()> {
     let mut rects = Vec::new();
@@ -1355,12 +1380,14 @@ impl InputParser {
                     let c = b as char;
                     let cmd = if c == k.quit {
                         Some(Msg::Quit)
-                    } else if c == k.split_row {
-                        Some(Msg::Split(Dir::Row))
-                    } else if c == k.split_col {
-                        Some(Msg::Split(Dir::Col))
                     } else if c == k.cycle {
                         Some(Msg::FocusNext)
+                    } else if c == k.toggle_editor {
+                        Some(Msg::Toggle(PaneRole::Editor))
+                    } else if c == k.toggle_shell {
+                        Some(Msg::Toggle(PaneRole::Shell))
+                    } else if c == k.toggle_ai {
+                        Some(Msg::Toggle(PaneRole::Ai))
                     } else if c == k.focus_left {
                         Some(Msg::Focus(FocusDir::Left))
                     } else if c == k.focus_down {
@@ -1369,8 +1396,6 @@ impl InputParser {
                         Some(Msg::Focus(FocusDir::Up))
                     } else if c == k.focus_right {
                         Some(Msg::Focus(FocusDir::Right))
-                    } else if c == k.close {
-                        Some(Msg::ClosePane)
                     } else if c == k.help {
                         Some(Msg::ToggleHelp)
                     } else if c == k.picker {
@@ -1389,7 +1414,8 @@ impl InputParser {
                         Some(Msg::ClearSession)
                     } else if b.is_ascii_digit() && b != b'0' {
                         Some(Msg::SelectWindow((b - b'1') as usize))
-                    } else if b == b'a' || b == self.prefix {
+                    } else if b == self.prefix {
+                        // prefix prefix -> a literal prefix byte to the child.
                         self.passthrough.push(self.prefix);
                         None
                     } else {
@@ -1574,11 +1600,11 @@ fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
     let lines = [
         "  CodeForge — keys (prefix Ctrl-a)  ",
         "",
-        "  Ctrl-a |      split side by side   ",
-        "  Ctrl-a -      split top/bottom     ",
+        "  Ctrl-a e      show/hide editor     ",
+        "  Ctrl-a t      show/hide terminal   ",
+        "  Ctrl-a a      show/hide Claude     ",
         "  Ctrl-a hjkl   move focus           ",
         "  Ctrl-a o      cycle focus          ",
-        "  Ctrl-a x      close pane           ",
         "  Ctrl-a p      switch project       ",
         "  Ctrl-a c      new window           ",
         "  Ctrl-a X      close window         ",

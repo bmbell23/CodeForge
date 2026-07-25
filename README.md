@@ -92,11 +92,11 @@ the first of `~/projects` or `~/work/projects` that exists.
 
 | Keys        | Action                               |
 |-------------|--------------------------------------|
-| `Ctrl-a \|` | Split focused pane side by side      |
-| `Ctrl-a -`  | Split focused pane top/bottom        |
+| `Ctrl-a e`  | Show/hide the **editor** pane        |
+| `Ctrl-a t`  | Show/hide the **terminal** pane      |
+| `Ctrl-a a`  | Show/hide the **Claude** pane        |
 | `Ctrl-a h/j/k/l` | Move focus left/down/up/right   |
 | `Ctrl-a o`  | Cycle focus                          |
-| `Ctrl-a x`  | Close focused pane                   |
 | `Ctrl-a p`  | Switch project (re-home window)      |
 | `Ctrl-a c`  | New window (pick its project)        |
 | `Ctrl-a X`  | Close current window                 |
@@ -112,8 +112,10 @@ the first of `~/projects` or `~/work/projects` that exists.
 
 Every other key goes to the focused pane's process. **Exiting a pane's program**
 (`exit`, Ctrl-D, `:q`) **respawns it** — the terminal comes back, the editor
-reopens, the AI pane returns on `claude --resume`. Only `Ctrl-a x` removes a
-pane. Split (`Ctrl-a |` / `-`) for **multiple terminals in one window**.
+reopens, the AI pane returns on `claude --resume`. Panes are never destroyed,
+only **shown/hidden**: `Ctrl-a e` / `t` / `a`. The editor is a full-height left
+column with the terminal + Claude stacked on the right; hide the editor and the
+other two go side by side.
 
 > **Running inside tmux?** Don't — CodeForge is itself a multiplexer, and tmux
 > will intercept `Ctrl-a`. Run `forge` in a plain terminal. (If you must nest it,

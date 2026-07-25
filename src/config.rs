@@ -35,14 +35,15 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default)]
 pub struct Keys {
-    pub split_row: char,
-    pub split_col: char,
     pub focus_left: char,
     pub focus_down: char,
     pub focus_up: char,
     pub focus_right: char,
     pub cycle: char,
-    pub close: char,
+    /// Show/hide the editor, terminal, and AI panes.
+    pub toggle_editor: char,
+    pub toggle_shell: char,
+    pub toggle_ai: char,
     pub picker: char,
     pub help: char,
     pub quit: char,
@@ -70,7 +71,7 @@ impl Default for Config {
             shell: None,
             ai: "claude".into(),
             editor_ratio: 0.5,
-            right_ratio: 0.55,
+            right_ratio: 0.5,
             keys: Keys::default(),
         }
     }
@@ -79,14 +80,14 @@ impl Default for Config {
 impl Default for Keys {
     fn default() -> Self {
         Keys {
-            split_row: '|',
-            split_col: '-',
             focus_left: 'h',
             focus_down: 'j',
             focus_up: 'k',
             focus_right: 'l',
             cycle: 'o',
-            close: 'x',
+            toggle_editor: 'e',
+            toggle_shell: 't',
+            toggle_ai: 'a',
             picker: 'p',
             help: '?',
             quit: 'q',
@@ -174,18 +175,18 @@ ai = "claude"
 
 # Layout ratios.
 editor_ratio = 0.5   # editor width fraction (left column)
-right_ratio  = 0.55  # shell height fraction of the right column
+right_ratio  = 0.5   # terminal height fraction of the right column
 
 # Keybindings — single characters pressed after the prefix.
 [keys]
-split_row  = "|"
-split_col  = "-"
 focus_left = "h"
 focus_down = "j"
 focus_up   = "k"
 focus_right = "l"
 cycle = "o"
-close = "x"
+toggle_editor = "e"   # show/hide the editor pane
+toggle_shell  = "t"   # show/hide the terminal pane
+toggle_ai     = "a"   # show/hide the Claude pane
 picker = "p"
 help = "?"
 quit = "q"

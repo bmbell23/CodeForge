@@ -144,56 +144,6 @@ impl Layout {
             }
         }
     }
-
-    /// Split the leaf holding `target` into `[target, new_id]` with `dir`.
-    /// Returns true if `target` was found.
-    pub fn split(&mut self, target: usize, new_id: usize, dir: Dir) -> bool {
-        match self {
-            Layout::Leaf(id) => {
-                if *id == target {
-                    let old = *id;
-                    *self = Layout::Split {
-                        dir,
-                        ratio: 0.5,
-                        a: Box::new(Layout::Leaf(old)),
-                        b: Box::new(Layout::Leaf(new_id)),
-                    };
-                    true
-                } else {
-                    false
-                }
-            }
-            Layout::Split { a, b, .. } => {
-                a.split(target, new_id, dir) || b.split(target, new_id, dir)
-            }
-        }
-    }
-
-    /// Remove leaf `target`, collapsing a split into its surviving sibling.
-    /// Returns `None` if the whole tree was just that leaf.
-    pub fn remove(self, target: usize) -> Option<Layout> {
-        match self {
-            Layout::Leaf(id) => {
-                if id == target {
-                    None
-                } else {
-                    Some(Layout::Leaf(id))
-                }
-            }
-            Layout::Split { dir, ratio, a, b } => match a.remove(target) {
-                None => Some(*b),
-                Some(a2) => match b.remove(target) {
-                    None => Some(a2),
-                    Some(b2) => Some(Layout::Split {
-                        dir,
-                        ratio,
-                        a: Box::new(a2),
-                        b: Box::new(b2),
-                    }),
-                },
-            },
-        }
-    }
 }
 
 /// Slice `area` into two rects per `dir`, giving `ratio` of the split axis to
