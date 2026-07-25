@@ -17,13 +17,19 @@ BIN="$REPO/target/release/forge"
 echo "==> Ensuring your runtime deps (nvim, tree-sitter)"
 BIN_DIR="$BIN_DIR" bash "$REPO/scripts/bootstrap-deps.sh"
 
-# Build only if this is your clone to write and you have a toolchain; otherwise
-# ride the shared binary the owner already built.
-if [ -w "$REPO/.git" ] && command -v cargo >/dev/null 2>&1; then
-  echo "==> Building forge (release) — you own this clone"
+# A writable clone is yours to build (a standalone VM with its own clone); a
+# read-only clone is someone else's shared copy, so ride its prebuilt binary.
+if [ -w "$REPO/.git" ]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "==> Installing Rust toolchain (rustup) to build forge"
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    # Use it now; rustup also adds it to your shell profile for future sessions.
+    . "$HOME/.cargo/env" 2>/dev/null || export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  echo "==> Building forge (release)"
   ( cd "$REPO" && cargo build --release )
 else
-  echo "==> Consumer mode: using the shared prebuilt binary (clone is read-only)"
+  echo "==> Consumer mode: read-only clone; using its prebuilt binary"
   if [ ! -x "$BIN" ]; then
     echo "    ERROR: no built binary at $BIN." >&2
     echo "    Ask the clone owner to run scripts/install.sh once to build it." >&2

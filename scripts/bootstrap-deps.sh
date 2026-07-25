@@ -7,8 +7,9 @@
 #   - nvim          the editor pane (installed as a release tarball -> ~/.local/nvim)
 #   - tree-sitter   nvim-treesitter's `main` branch shells out to it to compile
 #                   parsers (installed via npm -g)
+#   - rg (ripgrep)  Telescope live_grep needs it (installed as a static binary)
 #
-# Everything else CodeForge needs (rg git cc make curl node npm unzip tar setsid)
+# Everything else CodeForge needs (git cc make curl node npm unzip tar setsid)
 # comes from the system image; this script only warns if any are missing.
 set -euo pipefail
 
@@ -20,12 +21,12 @@ have() { command -v "$1" >/dev/null 2>&1; }
 
 echo "==> Checking system deps"
 missing=()
-for b in rg git cc make curl node npm tar setsid; do
+for b in git cc make curl node npm tar setsid; do
   have "$b" || missing+=("$b")
 done
 if [ "${#missing[@]}" -gt 0 ]; then
   echo "   WARNING: missing system deps: ${missing[*]}"
-  echo "   install (Debian): sudo apt-get install -y ripgrep git build-essential curl tar util-linux"
+  echo "   install (Debian): sudo apt-get install -y git build-essential curl tar util-linux"
   echo "   node/npm: via nvm"
 fi
 
@@ -49,6 +50,39 @@ else
   ln -sfn "$NVIM_DIR/bin/nvim" "$BIN_DIR/nvim"
   rm -rf "$tmp"
   echo "   installed: $("$BIN_DIR/nvim" --version | head -1)"
+fi
+
+# --- ripgrep (rg) -----------------------------------------------------------
+# Telescope's live_grep (Ctrl-Shift-F) needs it; standalone VMs often lack it.
+if have rg; then
+  echo "==> ripgrep present: $(rg --version | head -1)"
+else
+  echo "==> Installing ripgrep -> $BIN_DIR/rg"
+  rgver="14.1.1"
+  case "$(uname -m)" in
+    x86_64)  rgasset="ripgrep-${rgver}-x86_64-unknown-linux-musl.tar.gz" ;;
+    aarch64) rgasset="ripgrep-${rgver}-aarch64-unknown-linux-gnu.tar.gz" ;;
+    *)       rgasset="" ;;
+  esac
+  if [ -n "$rgasset" ]; then
+    tmp="$(mktemp -d)"
+    if curl -fsSL -o "$tmp/rg.tar.gz" \
+        "https://github.com/BurntSushi/ripgrep/releases/download/${rgver}/${rgasset}"; then
+      tar xzf "$tmp/rg.tar.gz" -C "$tmp"
+      rgbin="$(find "$tmp" -name rg -type f | head -1)"
+      if [ -n "$rgbin" ]; then
+        cp "$rgbin" "$BIN_DIR/rg" && chmod +x "$BIN_DIR/rg"
+        echo "   installed: $("$BIN_DIR/rg" --version | head -1)"
+      else
+        echo "   WARNING: rg not found in the archive; grep will be limited"
+      fi
+    else
+      echo "   WARNING: ripgrep download failed; grep in the editor will be limited"
+    fi
+    rm -rf "$tmp"
+  else
+    echo "   WARNING: no ripgrep build for $(uname -m); install rg manually"
+  fi
 fi
 
 # --- tree-sitter CLI --------------------------------------------------------
