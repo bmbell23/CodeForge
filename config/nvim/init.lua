@@ -204,12 +204,12 @@ require("lazy").setup({
       end
 
       local keys = {
-        "find   Ctrl-P file    Ctrl-Shift-F grep    gd peek def",
-        "edit   ]b / [b tabs    <leader>bd close    autosaved",
-        "panes  Ctrl-a e/t/c show·hide    hjkl focus    v copy/scroll",
-        "more   Ctrl-a s tab    Ctrl-a n window    Ctrl-a ? all keys",
+        "find    Ctrl-P file     Space e explore     Ctrl-Shift-F grep",
+        "edit    ]b / [b tabs     Space bd close     gd peek def",
+        "panes   Ctrl-a e/t/c show·hide     hjkl focus     Ctrl-a v copy/scroll",
+        "more    Ctrl-a s tab     Ctrl-a n window     Ctrl-a ? all keys",
       }
-      local footer = { "‹ type to open a file ›    1-6 recent    Ctrl-a ? keybindings" }
+      local footer = { "‹ type to open a file ›    1-6 recent    Space e explore" }
 
       local function text(lines, hl)
         return { type = "text", val = lines, opts = { position = "center", hl = hl } }
@@ -264,6 +264,35 @@ require("lazy").setup({
             end, { buffer = ev.buf, nowait = true, silent = true })
           end
           vim.keymap.set("n", "<CR>", tb.find_files, { buffer = ev.buf, nowait = true })
+        end,
+      })
+
+      -- When the last real file buffer is closed (e.g. Ctrl-a w on the editor),
+      -- fall back to this splash instead of a blank [No Name] buffer.
+      vim.api.nvim_create_autocmd("BufDelete", {
+        callback = function()
+          vim.schedule(function()
+            local files = 0
+            for _, b in ipairs(vim.api.nvim_list_bufs()) do
+              if
+                vim.api.nvim_buf_is_loaded(b)
+                and vim.bo[b].buflisted
+                and vim.bo[b].buftype == ""
+                and vim.api.nvim_buf_get_name(b) ~= ""
+              then
+                files = files + 1
+              end
+            end
+            -- Only take over an empty scratch buffer, never a terminal/oil/etc.
+            if
+              files == 0
+              and vim.bo.buftype == ""
+              and vim.api.nvim_buf_get_name(0) == ""
+              and vim.bo.filetype ~= "alpha"
+            then
+              require("alpha").start(false)
+            end
+          end)
         end,
       })
     end,
