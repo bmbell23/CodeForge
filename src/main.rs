@@ -1977,6 +1977,13 @@ fn render(
         &mut rects,
     );
 
+    // Synchronized Output (DEC private mode 2026): tell the terminal to buffer
+    // this whole frame and present it atomically, instead of drawing cell-by-cell
+    // as the bytes arrive. This is what kills the scroll/redraw flicker — we
+    // repaint every cell each frame, and without this the terminal shows those
+    // intermediate states (tearing). Terminals that don't support the mode just
+    // ignore the private-mode set/reset, so it's safe everywhere.
+    out.extend_from_slice(b"\x1b[?2026h");
     // The panes tile the whole area and we repaint every cell, so a clear is
     // only needed when the geometry shrank (and could leave stale cells).
     queue!(out, cursor::Hide, ResetColor)?;
@@ -2032,6 +2039,8 @@ fn render(
     if let Some(pk) = picker {
         pk.render(out, cols, rows)?;
     }
+    // End the synchronized frame: present everything queued above at once.
+    out.extend_from_slice(b"\x1b[?2026l");
     out.flush()?;
     Ok(())
 }
