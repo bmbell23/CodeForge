@@ -180,77 +180,193 @@ require("lazy").setup({
         [[         terminal-native IDE · nvim + shell + Claude  ]],
       }
 
-      -- Project + git context line.
-      local function git_bits()
-        local br = vim.fn.systemlist({ "git", "-C", cwd, "branch", "--show-current" })
-        if vim.v.shell_error ~= 0 or not br[1] or br[1] == "" then
-          return nil, 0
+      -- The splash body (git context, changed files, recents) is dynamic and
+      -- must be rebuilt on every draw: at plugin-config time the shada hasn't
+      -- been read yet, so v:oldfiles is still empty and recents would never
+      -- show. Rebuilding also keeps the changed-files list current.
+      local function splash_setup()
+        -- Project + git context line.
+        local function git_bits()
+          local br = vim.fn.systemlist({ "git", "-C", cwd, "branch", "--show-current" })
+          if vim.v.shell_error ~= 0 or not br[1] or br[1] == "" then
+            return nil, {}
+          end
+          local st = vim.fn.systemlist({ "git", "-C", cwd, "status", "--porcelain" })
+          return br[1], (vim.v.shell_error == 0) and st or {}
         end
-        local st = vim.fn.systemlist({ "git", "-C", cwd, "status", "--porcelain" })
-        return br[1], (vim.v.shell_error == 0) and #st or 0
-      end
-      local branch, changed = git_bits()
-      local ctx = "  " .. vim.fn.fnamemodify(cwd, ":t")
-      if branch then
-        ctx = ctx .. "   ⎇ " .. branch
-        if changed > 0 then
-          ctx = ctx .. "   " .. changed .. " changed"
+        local branch, changed = git_bits()
+        local ctx = "  " .. vim.fn.fnamemodify(cwd, ":t")
+        if branch then
+          ctx = ctx .. "   ⎇ " .. branch
+          if #changed > 0 then
+            ctx = ctx .. "   " .. #changed .. " changed"
+          end
         end
-      end
 
-      -- Recent files, project-local first, that still exist.
-      local recent = {}
-      do
-        local under, other, seen = {}, {}, {}
-        for _, f in ipairs(vim.v.oldfiles or {}) do
-          if not seen[f] and vim.fn.filereadable(f) == 1 then
-            seen[f] = true
-            if f:sub(1, #cwd) == cwd then
-              under[#under + 1] = f
-            else
-              other[#other + 1] = f
+        -- Recent files, project-local first, that still exist.
+        local recent = {}
+        do
+          local under, other, seen = {}, {}, {}
+          for _, f in ipairs(vim.v.oldfiles or {}) do
+            if not seen[f] and vim.fn.filereadable(f) == 1 then
+              seen[f] = true
+              if f:sub(1, #cwd) == cwd then
+                under[#under + 1] = f
+              else
+                other[#other + 1] = f
+              end
+            end
+          end
+          vim.list_extend(recent, under)
+          vim.list_extend(recent, other)
+        end
+        -- Everything below the context line is padded to one shared width (W)
+        -- before centering. Alpha centers each line on its own width, so equal
+        -- widths are what give the body a single left edge — unequal lines are
+        -- what made the old cheatsheet read as scattered text.
+        local MAXW = 76
+
+        -- Trim long paths from the left, keeping the informative tail.
+        local function clip(s, w)
+          if vim.fn.strdisplaywidth(s) <= w then
+            return s
+          end
+          while vim.fn.strdisplaywidth(s) > w - 1 do
+            s = vim.fn.strcharpart(s, 1)
+          end
+          return "…" .. s
+        end
+
+        -- Cheatsheet: {category, {key, what}, ...}, laid out two pairs per row
+        -- with per-column widths so keys and descriptions form real columns.
+        local sheet = {
+          { "Files", { "Ctrl-P", "open file" }, { "Space e", "file tree" }, { "Space fg", "search text" } },
+          { "Editor", { "gd", "go to definition" }, { "gr", "references" }, { "]b / [b", "next/prev file" } },
+          { "Git", { "Space gd", "diff view" }, { "Space gh", "file history" } },
+          { "Panes", { "Ctrl-a e/t/c", "editor/term/claude" }, { "Ctrl-a hjkl", "move focus" } },
+          { "Session", { "Ctrl-a n", "new window" }, { "Ctrl-a v", "scroll/copy" }, { "Ctrl-a ?", "all keys" } },
+        }
+        local rows = {}
+        for _, s in ipairs(sheet) do
+          for i = 2, #s, 2 do
+            rows[#rows + 1] = { i == 2 and s[1] or "", s[i], s[i + 1] }
+          end
+        end
+        local catw, kw, dw = 0, { 0, 0 }, { 0, 0 }
+        for _, row in ipairs(rows) do
+          catw = math.max(catw, #row[1])
+          for c = 1, 2 do
+            if row[c + 1] then
+              kw[c] = math.max(kw[c], #row[c + 1][1])
+              dw[c] = math.max(dw[c], #row[c + 1][2])
             end
           end
         end
-        vim.list_extend(recent, under)
-        vim.list_extend(recent, other)
-      end
-      local buttons = {}
-      for i = 1, math.min(#recent, 6) do
-        local f = recent[i]
-        local disp = vim.fn.fnamemodify(f, ":~:.")
-        buttons[i] = db.button(tostring(i), "  " .. disp, "<cmd>edit " .. vim.fn.fnameescape(f) .. "<cr>")
-      end
+        local key_lines, key_hls = {}, {}
+        for _, row in ipairs(rows) do
+          local line = string.format("%-" .. catw .. "s", row[1])
+          local hls = {}
+          if row[1] ~= "" then
+            hls[#hls + 1] = { "Function", 0, #row[1] }
+          end
+          for c = 1, 2 do
+            local p = row[c + 1]
+            if p then
+              local ks = #line + 3
+              line = line
+                .. "   "
+                .. string.format("%-" .. kw[c] .. "s", p[1])
+                .. "  "
+                .. string.format("%-" .. dw[c] .. "s", p[2])
+              hls[#hls + 1] = { "Special", ks, ks + #p[1] }
+              hls[#hls + 1] = { "Comment", ks + kw[c] + 2, ks + kw[c] + 2 + #p[2] }
+            end
+          end
+          key_lines[#key_lines + 1] = line
+          key_hls[#key_hls + 1] = hls
+        end
 
-      -- Grouped, aligned cheatsheet. Space = leader; Ctrl-a = CodeForge prefix.
-      local keys = {
-        "Files    Ctrl-P  open file       Space e   file tree     Space fg  search text",
-        "Editor   gd  go to definition    gr  references          ]b / [b   prev / next file",
-        "Git      Space gd  diff view (changed files, side-by-side, editable)",
-        "Panes    Ctrl-a e/t/c  editor / terminal / claude        Ctrl-a hjkl  move focus",
-        "Session  Ctrl-a n  new window     Ctrl-a v  scroll / copy   Ctrl-a ?  all keys",
-      }
-      local footer = { "just start typing to fuzzy-open a file   ·   Space e for the file tree" }
+        -- Changed files (git status), capped so the splash stays one screen.
+        local changed_rows = {}
+        for i = 1, math.min(#changed, 4) do
+          local l = changed[i]
+          changed_rows[#changed_rows + 1] = { l:sub(1, 2), clip(vim.trim(l:sub(4)), MAXW - 4) }
+        end
+        if #changed > 4 then
+          changed_rows[#changed_rows + 1] = { "", ("+ %d more"):format(#changed - 4) }
+        end
 
-      local function text(lines, hl)
-        return { type = "text", val = lines, opts = { position = "center", hl = hl } }
-      end
-      local layout = {
-        { type = "padding", val = 2 },
-        text(header, "Keyword"),
-        { type = "padding", val = 1 },
-        text({ ctx }, "Identifier"),
-        { type = "padding", val = 1 },
-      }
-      if #buttons > 0 then
-        layout[#layout + 1] = text({ "recent files — press its number to open" }, "Comment")
-        layout[#layout + 1] = { type = "group", val = buttons, opts = { spacing = 0 } }
+        local rec_rows = {}
+        for i = 1, math.min(#recent, 6) do
+          rec_rows[i] = { f = recent[i], disp = clip(vim.fn.fnamemodify(recent[i], ":~:."), MAXW - 3) }
+        end
+
+        local W = 0
+        for _, l in ipairs(key_lines) do
+          W = math.max(W, vim.fn.strdisplaywidth(l))
+        end
+        for _, r in ipairs(changed_rows) do
+          W = math.max(W, 4 + vim.fn.strdisplaywidth(r[2]))
+        end
+        for _, r in ipairs(rec_rows) do
+          W = math.max(W, 3 + vim.fn.strdisplaywidth(r.disp))
+        end
+
+        local function padW(s)
+          return s .. string.rep(" ", math.max(0, W - vim.fn.strdisplaywidth(s)))
+        end
+        local function text(lines, hl)
+          return { type = "text", val = lines, opts = { position = "center", hl = hl } }
+        end
+        -- One body line, padded to W, with {group, byte_start, byte_end} spans.
+        local function line_el(s, spans)
+          return { type = "text", val = padW(s), opts = { position = "center", hl = spans } }
+        end
+
+        local changed_els = {}
+        for _, r in ipairs(changed_rows) do
+          local l = string.format("%-4s%s", r[1], r[2])
+          local grp = (r[1] ~= "") and "WarningMsg" or "Comment"
+          changed_els[#changed_els + 1] = line_el(l, { { grp, 0, (r[1] ~= "") and #r[1] or #l } })
+        end
+
+        local buttons = {}
+        for i, r in ipairs(rec_rows) do
+          local b = db.button(tostring(i), i .. "  " .. r.disp, "<cmd>edit " .. vim.fn.fnameescape(r.f) .. "<cr>")
+          b.opts.width = W
+          b.opts.shortcut = "" -- the number is inline in the label instead
+          b.opts.hl = { { "Special", 0, #tostring(i) } }
+          buttons[i] = b
+        end
+
+        local footer = { padW("just start typing to fuzzy-open a file") }
+
+        local layout = {
+          { type = "padding", val = 2 },
+          text(header, "Keyword"),
+          { type = "padding", val = 1 },
+          text({ ctx }, "Identifier"),
+          { type = "padding", val = 1 },
+        }
+        if #changed_els > 0 then
+          layout[#layout + 1] = line_el("changed now", { { "Comment", 0, 11 } })
+          vim.list_extend(layout, changed_els)
+          layout[#layout + 1] = { type = "padding", val = 1 }
+        end
+        if #buttons > 0 then
+          local h = "recent — press number to open"
+          layout[#layout + 1] = line_el(h, { { "Comment", 0, #h } })
+          layout[#layout + 1] = { type = "group", val = buttons, opts = { spacing = 0 } }
+          layout[#layout + 1] = { type = "padding", val = 1 }
+        end
+        for i, l in ipairs(key_lines) do
+          layout[#layout + 1] = line_el(l, key_hls[i])
+        end
         layout[#layout + 1] = { type = "padding", val = 1 }
+        layout[#layout + 1] = text(footer, "Function")
+        alpha.setup({ layout = layout, opts = { margin = 5 } })
       end
-      layout[#layout + 1] = text(keys, "Comment")
-      layout[#layout + 1] = { type = "padding", val = 1 }
-      layout[#layout + 1] = text(footer, "Function")
-      alpha.setup({ layout = layout, opts = { margin = 5 } })
+      splash_setup()
 
       -- Draw the splash ourselves on an empty start (alpha's built-in autostart
       -- proved unreliable here). Guarded so opening a file never shows it.
@@ -264,8 +380,11 @@ require("lazy").setup({
             and vim.api.nvim_buf_line_count(0) <= 1
             and (vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] or "") == ""
           then
-            -- start(false) forces a draw; start(true) (the on-vimenter path)
-            -- proved to be a no-op with this alpha version.
+            -- Rebuild first: the shada (v:oldfiles → recents) is only read
+            -- after plugin config ran. start(false) forces a draw; start(true)
+            -- (the on-vimenter path) proved to be a no-op with this alpha
+            -- version.
+            splash_setup()
             require("alpha").start(false)
           end
         end,
@@ -311,8 +430,21 @@ require("lazy").setup({
               and vim.api.nvim_buf_get_name(0) == ""
               and vim.bo.filetype ~= "alpha"
             then
+              splash_setup() -- refresh recents + changed files
               require("alpha").start(false)
             end
+          end)
+        end,
+      })
+
+      -- Forge can kill the editor pane without a clean nvim exit, which loses
+      -- the shada update and with it v:oldfiles — the splash's recent list was
+      -- starving because of this. Merge-write the shada on every file open so
+      -- recents survive hard kills.
+      vim.api.nvim_create_autocmd("BufReadPost", {
+        callback = function()
+          vim.schedule(function()
+            pcall(vim.cmd, "wshada")
           end)
         end,
       })
