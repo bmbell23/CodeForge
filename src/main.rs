@@ -228,6 +228,29 @@ fn nvim_close_buffer(sock: &Path) {
         .output();
 }
 
+/// Cycle the editor's open buffers over RPC, so the same prev/next-tab keys that
+/// stack the terminal/Claude slots also flip through nvim's buffers (its "tabs")
+/// when the editor is focused. Uses bufferline's cycle so the order matches the
+/// visible tab bar; `silent!` keeps it quiet if bufferline isn't loaded.
+fn nvim_cycle_buffer(sock: &Path, delta: i32) {
+    if !sock.exists() {
+        return;
+    }
+    let cmd = if delta >= 0 {
+        "BufferLineCycleNext"
+    } else {
+        "BufferLineCyclePrev"
+    };
+    let _ = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg(format!("execute('silent! {cmd}')"))
+        .output();
+}
+
 /// Capture a restorable spec for every window (open files + shell cwd).
 fn capture_specs(windows: &[Window]) -> Vec<WindowSpec> {
     windows
@@ -1046,6 +1069,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let mut cur = 0usize;
     let mut help: Option<HelpState> = None;
     let mut copy: Option<CopyMode> = None;
+    let mut msel: Option<MouseSel> = None;
     let mut picker: Option<Picker> = None;
     let mut picker_new_window = false;
     // (cols, rows) of the attached client; updated on attach/resize.
@@ -1241,8 +1265,12 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         })
                         .copied();
                     if let Some((id, rect)) = hit {
-                        let is_wheel = cb == 64 || cb == 65;
-                        if press && !is_wheel && w.focus_id != id {
+                        // SGR cb bits: low 2 = button (0=left), bit5 (32) = motion
+                        // (drag), bit6 (64) = wheel.
+                        let is_wheel = cb & 64 != 0;
+                        let is_motion = cb & 32 != 0;
+                        let button = cb & 3;
+                        if press && !is_wheel && !is_motion && w.focus_id != id {
                             w.focus_id = id;
                             dirty = true;
                         }
@@ -1251,20 +1279,21 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             .iter()
                             .find(|p| p.id == id)
                             .is_some_and(|p| p.wants_mouse());
-                        if wants_mouse {
-                            if let Some(inner) = rect.inner() {
-                                if px >= inner.x
-                                    && px < inner.x + inner.w
-                                    && py >= inner.y
-                                    && py < inner.y + inner.h
-                                {
-                                    let lx = px - inner.x + 1;
-                                    let ly = py - inner.y + 1;
+                        let inner = rect.inner();
+                        // Cell under the pointer within the pane's content rect.
+                        let cell = inner.and_then(|i| {
+                            (px >= i.x && px < i.x + i.w && py >= i.y && py < i.y + i.h)
+                                .then(|| (py - i.y, px - i.x))
+                        });
+
+                        let forward = |w: &mut Window, cb: u16, press: bool| -> Result<()> {
+                            if let Some(i) = inner {
+                                if px >= i.x && px < i.x + i.w && py >= i.y && py < i.y + i.h {
                                     let seq = format!(
                                         "\x1b[<{};{};{}{}",
                                         cb,
-                                        lx,
-                                        ly,
+                                        px - i.x + 1,
+                                        py - i.y + 1,
                                         if press { 'M' } else { 'm' }
                                     );
                                     if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
@@ -1272,11 +1301,73 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                     }
                                 }
                             }
-                        } else if is_wheel {
-                            if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
-                                p.scroll(if cb == 64 { 3 } else { -3 });
+                            Ok(())
+                        };
+
+                        if is_wheel {
+                            // Wheel: forward to mouse-aware apps, else scroll our
+                            // own scrollback.
+                            if wants_mouse {
+                                forward(w, cb, press)?;
+                            } else if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
+                                p.scroll(if cb & 1 == 0 { 3 } else { -3 });
+                                dirty = true;
                             }
-                            dirty = true;
+                        } else if button == 0 && press && !is_motion {
+                            // Left press: begin a selection at this cell (don't
+                            // forward yet — a click without drag is forwarded on
+                            // release so app buttons still work).
+                            if let Some(c) = cell {
+                                msel = Some(MouseSel {
+                                    pane_id: id,
+                                    anchor: c,
+                                    cur: c,
+                                    moved: false,
+                                });
+                            }
+                        } else if is_motion && button == 0 {
+                            // Left drag: extend the selection.
+                            if let (Some(ms), Some(c)) = (msel.as_mut(), cell) {
+                                if ms.pane_id == id && c != ms.cur {
+                                    ms.cur = c;
+                                    ms.moved = true;
+                                    dirty = true;
+                                }
+                            }
+                        } else if !press {
+                            // Release: finish selection. A real drag copies via
+                            // OSC 52; a plain click is forwarded to the app.
+                            match msel.take() {
+                                Some(ms) if ms.moved => {
+                                    let (s, e) = ms.range();
+                                    let text = w
+                                        .panes
+                                        .iter()
+                                        .find(|p| p.id == ms.pane_id)
+                                        .map(|p| extract_range(p.screen(), s, e))
+                                        .unwrap_or_default();
+                                    if !text.is_empty() {
+                                        if let Some(cl) = client.as_mut() {
+                                            let _ = protocol::write_frame(
+                                                cl,
+                                                protocol::OUTPUT,
+                                                &osc52(&text),
+                                            );
+                                        }
+                                    }
+                                    dirty = true;
+                                }
+                                _ if wants_mouse => {
+                                    // A click (no drag): send press then release
+                                    // so the app registers a full click.
+                                    forward(w, button, true)?;
+                                    forward(w, button, false)?;
+                                }
+                                _ => {}
+                            }
+                        } else if wants_mouse {
+                            // Other buttons (right/middle) go to the app as-is.
+                            forward(w, cb, press)?;
                         }
                     }
                 }
@@ -1401,7 +1492,12 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     let (c, r) = size;
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
-                    if let Some(role) = w.focus_role() {
+                    if let Some(PaneRole::Editor) = w.focus_role() {
+                        // Editor is a single nvim: cycle its buffers (its tabs)
+                        // instead of a slot stack.
+                        nvim_cycle_buffer(&nvim_sock(w.focus_id), delta);
+                        dirty = true;
+                    } else if let Some(role) = w.focus_role() {
                         let ids = w.slot_ids(role);
                         if ids.len() > 1 {
                             let (pos, n) = w.slot_pos(role);
@@ -1611,6 +1707,10 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     picker.as_ref(),
                     &right_info,
                     ksnap,
+                    msel.as_ref().map(|m| {
+                        let (s, e) = m.range();
+                        (m.pane_id, s, e)
+                    }),
                 )?;
                 if protocol::write_frame(cl, protocol::OUTPUT, &framebuf).is_err() {
                     client = None;
@@ -1963,6 +2063,7 @@ fn render(
     picker: Option<&Picker>,
     right_info: &str,
     keys: Keys,
+    msel: Option<Sel>,
 ) -> Result<()> {
     let w = &windows[cur];
     let area = rows.saturating_sub(1);
@@ -2010,6 +2111,12 @@ fn render(
                 // Copy/scroll-mode selection + cursor on this pane.
                 if let Some(cm) = copy.filter(|cm| cm.pane_id == *id) {
                     draw_copy_overlay(out, p.screen(), inner, cm)?;
+                }
+                // Live mouse drag-selection highlight on this pane (#21).
+                if let Some((mid, s, e)) = msel {
+                    if mid == *id {
+                        draw_selection(out, p.screen(), inner, s, e)?;
+                    }
                 }
             }
         }
@@ -2243,6 +2350,35 @@ struct CopyMode {
     anchor: Option<(u16, u16)>,
 }
 
+/// A live mouse drag-selection (#21). CodeForge captures the mouse globally, so
+/// the outer terminal can't do its own selection — we render the highlight and
+/// copy the text (OSC 52) ourselves on button release. Works in any pane,
+/// including alt-screen ones like Claude where the terminal's own copy is dead
+/// over SSH. Coordinates are (row, col) within the pane's inner content rect.
+struct MouseSel {
+    pane_id: usize,
+    anchor: (u16, u16),
+    cur: (u16, u16),
+    /// True once the pointer moved off the anchor cell — distinguishes a
+    /// select-drag from a plain click (which we still forward to the app).
+    moved: bool,
+}
+
+/// A resolved selection to highlight: (pane id, start cell, end cell), in
+/// reading order. Passed to `render` for the mouse drag-selection overlay.
+type Sel = (usize, (u16, u16), (u16, u16));
+
+impl MouseSel {
+    /// Normalized (start, end) in reading order.
+    fn range(&self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.cur {
+            (self.anchor, self.cur)
+        } else {
+            (self.cur, self.anchor)
+        }
+    }
+}
+
 impl CopyMode {
     fn new(pane_id: usize) -> CopyMode {
         CopyMode {
@@ -2412,7 +2548,17 @@ fn copy_input(cm: &mut CopyMode, p: &mut Pane, bytes: &[u8]) -> (bool, Option<St
 fn extract_selection(screen: &vt100::Screen, cm: &CopyMode) -> String {
     let (_, cols) = screen.size();
     let last = cols.saturating_sub(1);
-    let ((sr, sc), (er, ec)) = cm.selection().unwrap_or(((cm.row, 0), (cm.row, last)));
+    let (start, end) = cm.selection().unwrap_or(((cm.row, 0), (cm.row, last)));
+    extract_range(screen, start, end)
+}
+
+/// Extract text between two (row, col) cell coordinates (inclusive, reading
+/// order) from the visible screen, trimming trailing spaces per line. Shared by
+/// keyboard copy mode and mouse drag-selection.
+fn extract_range(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> String {
+    let (_, cols) = screen.size();
+    let last = cols.saturating_sub(1);
+    let ((sr, sc), (er, ec)) = (start, end);
     let mut out = String::new();
     for r in sr..=er {
         let cstart = if r == sr { sc } else { 0 };
@@ -2433,6 +2579,43 @@ fn extract_selection(screen: &vt100::Screen, cm: &CopyMode) -> String {
         }
     }
     out
+}
+
+/// Reverse-highlight a plain (start, end) cell range on an already-blitted pane
+/// — the live feedback for a mouse drag-selection (#21). `inner` is the pane's
+/// content rect; `s`/`e` are (row, col) in reading order.
+fn draw_selection(
+    out: &mut Vec<u8>,
+    screen: &vt100::Screen,
+    inner: Rect,
+    s: (u16, u16),
+    e: (u16, u16),
+) -> Result<()> {
+    let (rows, cols) = screen.size();
+    let (sr, sc) = s;
+    let (er, ec) = e;
+    for r in 0..rows.min(inner.h) {
+        if r < sr || r > er {
+            continue;
+        }
+        let cstart = if r == sr { sc } else { 0 };
+        let cend = if r == er { ec } else { cols.saturating_sub(1) };
+        for c in cstart..=cend.min(cols.min(inner.w).saturating_sub(1)) {
+            let ch = screen
+                .cell(r, c)
+                .map(|cell| cell.contents())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| " ".to_string());
+            queue!(
+                out,
+                cursor::MoveTo(inner.x + c, inner.y + r),
+                SetAttribute(Attribute::Reverse),
+                Print(ch),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Minimal standard base64 (no deps), for OSC 52 clipboard payloads.
@@ -2538,14 +2721,28 @@ fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16, k: Keys, h: &HelpState) ->
         lines.push((format!("  {}", h.msg), false));
     }
 
-    let w = lines
+    // Never vanish on a short/narrow terminal: clamp instead of bailing. The
+    // editable key rows come first, so if anything is dropped it's the trailing
+    // info/footer lines, not a binding you're trying to see or rebind.
+    let max_lines = rows.saturating_sub(2) as usize;
+    if lines.len() > max_lines && max_lines > 0 {
+        lines.truncate(max_lines);
+    }
+    let max_w = cols.saturating_sub(2) as usize;
+    for (l, _) in lines.iter_mut() {
+        if l.chars().count() > max_w {
+            *l = l.chars().take(max_w).collect();
+        }
+    }
+    let w = (lines
         .iter()
         .map(|(l, _)| l.chars().count())
         .max()
         .unwrap_or(0) as u16
-        + 2;
-    let bh = lines.len() as u16 + 2;
-    if w > cols || bh > rows {
+        + 2)
+    .min(cols);
+    let bh = (lines.len() as u16 + 2).min(rows);
+    if w < 2 || bh < 2 {
         return Ok(());
     }
     let x = (cols - w) / 2;
