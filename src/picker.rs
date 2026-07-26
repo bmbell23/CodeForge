@@ -89,6 +89,29 @@ impl Picker {
             .map(|&i| self.root.join(&self.all[i]))
     }
 
+    /// The windowed slice of matches currently on screen: `(start, count)`.
+    /// Depends only on `sel` and `MAX_ROWS`, so `render` and `feed_bytes` agree
+    /// on which rows are visible (and thus which number picks which project).
+    fn window(&self) -> (usize, usize) {
+        let visible = self.matches.len().min(MAX_ROWS);
+        let start = self
+            .sel
+            .saturating_sub(MAX_ROWS - 1)
+            .min(self.matches.len().saturating_sub(visible));
+        (start, visible)
+    }
+
+    /// Project at visible row `n` (0-based), if that row exists on screen.
+    fn at_visible(&self, n: usize) -> Option<PathBuf> {
+        let (start, visible) = self.window();
+        if n < visible {
+            let mi = self.matches[start + n];
+            Some(self.root.join(&self.all[mi]))
+        } else {
+            None
+        }
+    }
+
     /// Drive the picker from raw input bytes (main-loop / overlay mode).
     pub fn feed_bytes(&mut self, bytes: &[u8]) -> PickerAction {
         for &b in bytes {
@@ -101,12 +124,29 @@ impl Picker {
                             return PickerAction::Chosen(p);
                         }
                     }
+                    // A digit opens the numbered row directly (shown 1-9). If no
+                    // such row is on screen, fall through and treat it as filter
+                    // text so a project name with a digit is still typable.
+                    b'1'..=b'9' => {
+                        if let Some(p) = self.at_visible((b - b'1') as usize) {
+                            return PickerAction::Chosen(p);
+                        }
+                        self.input_char(b as char);
+                    }
                     0x7f | 0x08 => self.backspace(),
                     0x20..=0x7e => self.input_char(b as char),
                     _ => {}
                 },
                 1 => {
-                    self.esc = if b == b'[' { 2 } else { 0 };
+                    // ESC then `[` begins an arrow sequence; anything else means
+                    // it was a lone Esc keypress — handled after the loop.
+                    if b == b'[' {
+                        self.esc = 2;
+                    } else {
+                        self.esc = 0;
+                        // A non-`[` byte right after ESC: not a sequence we know.
+                        return PickerAction::Cancel;
+                    }
                 }
                 _ => {
                     self.esc = 0;
@@ -117,6 +157,11 @@ impl Picker {
                     }
                 }
             }
+        }
+        // A lone Esc (no `[` followed) arrives as a single 0x1b byte: cancel.
+        if self.esc == 1 {
+            self.esc = 0;
+            return PickerAction::Cancel;
         }
         PickerAction::None
     }
@@ -145,6 +190,14 @@ impl Picker {
                     KeyCode::Backspace => self.backspace(),
                     KeyCode::Up => self.up(),
                     KeyCode::Down => self.down(),
+                    // Digit opens the numbered row (see feed_bytes); otherwise
+                    // it's filter text.
+                    KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+                        if let Some(p) = self.at_visible(c as usize - '1' as usize) {
+                            return Ok(Some(p));
+                        }
+                        self.input_char(c);
+                    }
                     KeyCode::Char(c) => self.input_char(c),
                     _ => {}
                 },
@@ -201,17 +254,24 @@ impl Picker {
         )?;
         line(out, row, format!(" > {}", self.filter))?;
         row += 1;
-        line(out, row, format!(" {} matches", self.matches.len()))?;
+        line(
+            out,
+            row,
+            format!(" {} matches · 1-9 open · Esc cancel", self.matches.len()),
+        )?;
         row += 1;
 
-        // Window the list around the selection.
-        let start = self
-            .sel
-            .saturating_sub(MAX_ROWS - 1)
-            .min(self.matches.len().saturating_sub(visible));
+        // Window the list around the selection (same math as `window()`).
+        let (start, _) = self.window();
         for (i, &mi) in self.matches.iter().enumerate().skip(start).take(visible) {
             let name = &self.all[mi];
-            let marker = if i == self.sel { "❯ " } else { "  " };
+            let vis = i - start; // 0-based row on screen
+            let num = if vis < 9 {
+                (b'1' + vis as u8) as char
+            } else {
+                ' '
+            };
+            let marker = if i == self.sel { "❯" } else { " " };
             if i == self.sel {
                 queue!(
                     out,
@@ -221,7 +281,7 @@ impl Picker {
             } else {
                 queue!(out, ResetColor, SetForegroundColor(Color::White))?;
             }
-            line(out, row, format!(" {marker}{name}"))?;
+            line(out, row, format!(" {num} {marker} {name}"))?;
             row += 1;
         }
         if visible == 0 {

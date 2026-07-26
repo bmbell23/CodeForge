@@ -115,9 +115,11 @@ forge codeforge       # open a project by name under your projects root
 forge ~/src/foo       # open a project by path
 ```
 
-Bare `forge` shows a **project picker** (type to filter, ↑↓ to select, Enter to
-open, Ctrl-c to cancel). All three panes (nvim, shell, claude) start in the
-chosen directory.
+Bare `forge` shows a **project picker** (type to filter, ↑↓ to select, `Enter`
+to open, a **number `1`–`9` to open that row directly**, `Esc`/`Ctrl-c` to
+cancel). The same picker opens for `Ctrl-a n` (new window) and `Ctrl-a p`
+(switch project). All three panes (nvim, shell, claude) start in the chosen
+directory.
 
 **Windows.** Each window is an independent editor/shell/AI workspace for one
 project or worktree. `Ctrl-a c` opens a new window (pick its project), `Ctrl-a n`
