@@ -85,6 +85,9 @@ pub struct Keys {
     /// Enter copy/scroll mode on the focused pane (scroll its scrollback, select
     /// text, copy). Esc/q exits.
     pub copy: char,
+    /// Toggle the git-diff list (#18): changed files with +/- counts; picking
+    /// one opens a full-window side-by-side diff in the editor.
+    pub git_diff: char,
 }
 
 impl Default for Config {
@@ -136,6 +139,7 @@ impl Default for Keys {
             tab_prev: '[',
             tab_close: 'w',
             copy: 'v',
+            git_diff: 'g',
         }
     }
 }
@@ -143,10 +147,11 @@ impl Default for Keys {
 /// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
 /// `(config field, human label)`. Focus keys are listed individually so each
 /// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
-pub const EDITABLE: [(&str, &str); 21] = [
+pub const EDITABLE: [(&str, &str); 22] = [
     ("toggle_editor", "show/hide editor"),
     ("toggle_shell", "show/hide terminal"),
     ("toggle_ai", "show/hide Claude"),
+    ("git_diff", "git diff (changed files)"),
     ("tab_new", "new terminal/Claude tab"),
     ("tab_next", "next tab (focused slot)"),
     ("tab_prev", "prev tab (focused slot)"),
@@ -192,6 +197,7 @@ impl Keys {
             "tab_prev" => self.tab_prev,
             "tab_close" => self.tab_close,
             "copy" => self.copy,
+            "git_diff" => self.git_diff,
             _ => return None,
         })
     }
@@ -220,6 +226,7 @@ impl Keys {
             "tab_prev" => self.tab_prev = ch,
             "tab_close" => self.tab_close = ch,
             "copy" => self.copy = ch,
+            "git_diff" => self.git_diff = ch,
             _ => return false,
         }
         true
@@ -249,7 +256,7 @@ impl Keys {
     }
 
     /// All (action, key) bindings, for help display and conflict checking.
-    fn bindings(&self) -> [(&'static str, char); 21] {
+    fn bindings(&self) -> [(&'static str, char); 22] {
         [
             ("focus_left", self.focus_left),
             ("focus_down", self.focus_down),
@@ -272,6 +279,7 @@ impl Keys {
             ("tab_prev", self.tab_prev),
             ("tab_close", self.tab_close),
             ("copy", self.copy),
+            ("git_diff", self.git_diff),
         ]
     }
 
@@ -492,6 +500,7 @@ tab_next = "]"   # next tab in the focused slot
 tab_prev = "["   # prev tab in the focused slot
 tab_close = "w"  # close the active tab in the focused slot
 copy = "v"       # copy/scroll mode on the focused pane (scroll, select, copy)
+git_diff = "g"   # git diff list; pick a file for a side-by-side editable diff
 # also: prefix + 1..9 jumps to that window
 "#;
 

@@ -242,7 +242,7 @@ require("lazy").setup({
         local sheet = {
           { "Files", { "Ctrl-P", "open file" }, { "Space e", "file tree" }, { "Space fg", "search text" } },
           { "Editor", { "gd", "go to definition" }, { "gr", "references" }, { "]b / [b", "next/prev file" } },
-          { "Git", { "Space gd", "diff view" }, { "Space gh", "file history" } },
+          { "Git", { "Ctrl-a g", "git diff" }, { "Space gh", "file history" } },
           { "Panes", { "Ctrl-a e/t/c", "editor/term/claude" }, { "Ctrl-a hjkl", "move focus" } },
           { "Session", { "Ctrl-a n", "new window" }, { "Ctrl-a v", "scroll/copy" }, { "Ctrl-a ?", "all keys" } },
         }
@@ -616,6 +616,333 @@ vim.keymap.set("n", "<leader>rr", ":%s//g<Left><Left>", { desc = "Replace in fil
 -- Quick write/quit.
 vim.keymap.set("n", "<leader>w", "<cmd>write<cr>", { desc = "Write" })
 vim.keymap.set("n", "<leader>q", "<cmd>quit<cr>", { desc = "Quit window" })
+
+-- Native CodeForge git diff (#18). Forge's Ctrl-a g list drives these over the
+-- RPC socket. CodeForgeDiffOpen(file) builds a full-tab side-by-side diff —
+-- the HEAD version read-only on the left, the real (editable) file on the
+-- right, both in vim diff mode, plus a change map hugging the right edge —
+-- and drops a flag file next to the RPC socket so forge knows the view is up.
+-- Esc (or any way of killing the view) removes the flag, which is forge's cue
+-- to restore its pane layout.
+local function cf_diff_flag()
+  return vim.v.servername .. ".diff"
+end
+
+-- State of the one open diff view; nil when closed.
+local cf_diff = nil
+
+-- Hunks vs HEAD as {start, count, kind} in working-file line numbers; kind is
+-- "add" | "change" | "del" ("del" marks where lines were removed). Untracked
+-- files are a single all-add hunk.
+local function cf_diff_hunks()
+  local st = cf_diff
+  local total = math.max(vim.api.nvim_buf_line_count(st.right_buf), 1)
+  if st.untracked then
+    return { { start = 1, count = total, kind = "add" } }, total
+  end
+  local hunks = {}
+  local raw = vim.fn.systemlist({ "git", "-C", st.root, "diff", "-U0", "HEAD", "--", st.rel })
+  for _, l in ipairs(raw) do
+    local _, oc, ns, nc = l:match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@")
+    if ns then
+      ns = tonumber(ns)
+      nc = nc ~= "" and tonumber(nc) or 1
+      oc = oc ~= "" and tonumber(oc) or 1
+      if nc == 0 then
+        table.insert(hunks, { start = math.max(ns, 1), count = 1, kind = "del" })
+      else
+        table.insert(hunks, { start = ns, count = nc, kind = oc == 0 and "add" or "change" })
+      end
+    end
+  end
+  return hunks, total
+end
+
+-- The change map: a thin unfocusable float pinned to the right edge, one row
+-- per slice of the file, colored where that slice contains changes. Rebuilt
+-- whole on every refresh — it's tiny.
+local cf_diff_map_ns = vim.api.nvim_create_namespace("codeforge_diff_map")
+local CF_MAP_HL = { add = "DiffAdd", change = "DiffChange", del = "DiffDelete" }
+local CF_MAP_RANK = { add = 1, change = 2, del = 3 }
+
+local function cf_diff_map_refresh()
+  local st = cf_diff
+  if not (st and vim.api.nvim_win_is_valid(st.right_win) and vim.api.nvim_buf_is_valid(st.map_buf)) then
+    return
+  end
+  -- winheight() excludes the winbar, which is exactly the strip we can cover.
+  local h = vim.api.nvim_win_call(st.right_win, function()
+    return vim.fn.winheight(0)
+  end)
+  local w = vim.api.nvim_win_get_width(st.right_win)
+  if h < 2 or w < 4 then
+    return
+  end
+  local hunks, total = cf_diff_hunks()
+  local rows, marks = {}, {}
+  for i = 1, h do
+    rows[i] = " "
+  end
+  for _, hk in ipairs(hunks) do
+    local r1 = math.floor((hk.start - 1) * h / total) + 1
+    local r2 = math.floor((hk.start + hk.count - 2) * h / total) + 1
+    for r = math.max(r1, 1), math.min(r2, h) do
+      if not marks[r] or CF_MAP_RANK[hk.kind] > CF_MAP_RANK[marks[r]] then
+        marks[r] = hk.kind
+      end
+      rows[r] = "▐"
+    end
+  end
+  -- Scroll thumb: a dim left-half bar over the rows currently on screen.
+  -- Where the viewport crosses a change block the cell becomes a full block.
+  local first, last = unpack(vim.api.nvim_win_call(st.right_win, function()
+    return { vim.fn.line("w0"), vim.fn.line("w$") }
+  end))
+  local t1 = math.max(math.floor((first - 1) * h / total) + 1, 1)
+  local t2 = math.min(math.floor((last - 1) * h / total) + 1, h)
+  for r = t1, t2 do
+    rows[r] = rows[r] == "▐" and "█" or "▌"
+  end
+  vim.bo[st.map_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(st.map_buf, 0, -1, false, rows)
+  vim.bo[st.map_buf].modifiable = false
+  vim.api.nvim_buf_clear_namespace(st.map_buf, cf_diff_map_ns, 0, -1)
+  for r, kind in pairs(marks) do
+    vim.api.nvim_buf_set_extmark(st.map_buf, cf_diff_map_ns, r - 1, 0, {
+      end_col = #"▐",
+      hl_group = CF_MAP_HL[kind],
+    })
+  end
+  local cfg = {
+    relative = "win",
+    win = st.right_win,
+    anchor = "NW",
+    row = 1, -- window-relative row 0 is the winbar; the map covers the text rows
+    col = w - 1,
+    width = 1,
+    height = h,
+    focusable = false,
+    style = "minimal",
+    zindex = 30,
+  }
+  if st.map_win and vim.api.nvim_win_is_valid(st.map_win) then
+    vim.api.nvim_win_set_config(st.map_win, cfg)
+  else
+    st.map_win = vim.api.nvim_open_win(st.map_buf, false, cfg)
+    vim.wo[st.map_win].winhighlight = "Normal:Comment"
+  end
+end
+
+-- Zoom the focused side to (almost) full width, or back to 50/50.
+local function cf_diff_focus_toggle()
+  if vim.api.nvim_win_get_width(0) < vim.o.columns - 12 then
+    vim.cmd("wincmd |")
+  else
+    vim.cmd("wincmd =")
+  end
+end
+
+function _G.CodeForgeDiffOpen(path)
+  if vim.g.codeforge_diff_tab and vim.api.nvim_tabpage_is_valid(vim.g.codeforge_diff_tab) then
+    _G.CodeForgeDiffClose()
+  end
+  local dir = vim.fn.fnamemodify(path, ":h")
+  local root = (vim.fn.systemlist({ "git", "-C", dir, "rev-parse", "--show-toplevel" }) or {})[1]
+  if vim.v.shell_error ~= 0 or not root or root == "" then
+    return "err: not a git repository"
+  end
+  local rel = path:sub(#root + 2)
+  local head = vim.fn.systemlist({ "git", "-C", root, "show", "HEAD:" .. rel })
+  local untracked = false
+  if vim.v.shell_error ~= 0 then
+    head = {} -- new/untracked file: the whole right side shows as added
+    untracked = true
+  end
+
+  vim.cmd("tab split")
+  local tab = vim.api.nvim_get_current_tabpage()
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
+  local right_win = vim.api.nvim_get_current_win()
+  local right_buf = vim.api.nvim_get_current_buf()
+  local ft = vim.bo.filetype
+
+  -- Left half: the HEAD version as a read-only scratch that wipes on close.
+  vim.cmd("leftabove vnew")
+  local left_win = vim.api.nvim_get_current_win()
+  local left_buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, head)
+  pcall(vim.api.nvim_buf_set_name, left_buf, "HEAD: " .. rel)
+  local bo = vim.bo[left_buf]
+  bo.buftype = "nofile"
+  bo.bufhidden = "wipe"
+  bo.swapfile = false
+  bo.modifiable = false
+  bo.filetype = ft
+  vim.b[left_buf].codeforge_diff_left = true
+  vim.cmd("diffthis")
+  vim.cmd("wincmd l")
+  vim.cmd("diffthis")
+
+  -- Label the sides and put the keys where they're discoverable. Softer
+  -- filler glyph for lines that only exist on the other side.
+  vim.wo[left_win].winbar = "  HEAD · read-only"
+  vim.wo[right_win].winbar = "  %t · Enter unfold · Tab side · Space-z focus · ]c/[c · Esc close"
+  vim.wo[left_win].fillchars = "diff: "
+  vim.wo[right_win].fillchars = "diff: "
+
+  local aug = vim.api.nvim_create_augroup("codeforge_diff", { clear = true })
+  local map_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[map_buf].bufhidden = "wipe"
+
+  cf_diff = {
+    tab = tab,
+    root = root,
+    rel = rel,
+    untracked = untracked,
+    left_buf = left_buf,
+    right_buf = right_buf,
+    left_win = left_win,
+    right_win = right_win,
+    map_buf = map_buf,
+    map_win = nil,
+    aug = aug,
+  }
+
+  -- Esc closes the whole view; Tab hops sides; Space-z zooms one side.
+  for _, b in ipairs({ left_buf, right_buf }) do
+    vim.keymap.set("n", "<Esc>", _G.CodeForgeDiffClose, { buffer = b, nowait = true, silent = true })
+    vim.keymap.set("n", "<Tab>", function()
+      local st = cf_diff
+      if st then
+        local cur = vim.api.nvim_get_current_win()
+        local other = cur == st.right_win and st.left_win or st.right_win
+        if vim.api.nvim_win_is_valid(other) then
+          vim.api.nvim_set_current_win(other)
+        end
+      end
+    end, { buffer = b, nowait = true, silent = true })
+    vim.keymap.set("n", "<leader>z", cf_diff_focus_toggle, { buffer = b, silent = true })
+    -- Enter toggles the fold under the cursor (diff mode folds the unchanged
+    -- stretches); off a fold it keeps its normal meaning.
+    vim.keymap.set("n", "<CR>", function()
+      return vim.fn.foldclosed(".") ~= -1 and "za" or "<CR>"
+    end, { buffer = b, expr = true, silent = true })
+  end
+
+  -- Forge opens the diff while the pane is still small, then zooms it — nvim
+  -- dumps all the new columns on the rightmost window, so re-equalize on every
+  -- terminal resize while the diff tab is up.
+  vim.api.nvim_create_autocmd("VimResized", {
+    group = aug,
+    callback = function()
+      if cf_diff and vim.api.nvim_get_current_tabpage() == cf_diff.tab then
+        vim.cmd("wincmd =")
+        -- WinResized doesn't reliably chain off wincmd here; re-anchor directly.
+        vim.schedule(cf_diff_map_refresh)
+      end
+    end,
+  })
+  vim.api.nvim_create_autocmd("WinResized", {
+    group = aug,
+    callback = function()
+      local st = cf_diff
+      if not st then
+        return
+      end
+      for _, w in ipairs(vim.v.event.windows or {}) do
+        if w == st.right_win or w == st.left_win then
+          vim.schedule(cf_diff_map_refresh)
+          return
+        end
+      end
+    end,
+  })
+  -- vim only syncs scrollbind windows when the *current* window scrolls, so a
+  -- wheel over the unfocused half moves it alone. Re-sync from whichever side
+  -- actually moved, then redraw the thumb.
+  vim.api.nvim_create_autocmd("WinScrolled", {
+    group = aug,
+    pattern = { tostring(left_win), tostring(right_win) },
+    callback = function(ev)
+      local st = cf_diff
+      local win = tonumber(ev.match)
+      if st and win and vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_win_call(win, function()
+          vim.cmd("syncbind")
+        end)
+      end
+      vim.schedule(cf_diff_map_refresh)
+    end,
+  })
+  -- Autosave keeps disk current, so the map tracks edits as they land.
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    group = aug,
+    buffer = right_buf,
+    callback = function()
+      vim.schedule(cf_diff_map_refresh)
+    end,
+  })
+
+  -- Teardown is anchored to the left scratch: however the view dies (Esc,
+  -- :tabclose, :q), wiping that buffer removes the flag and all the trimmings.
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = left_buf,
+    once = true,
+    callback = function()
+      local st = cf_diff
+      cf_diff = nil
+      vim.g.codeforge_diff_tab = nil
+      if st then
+        pcall(vim.api.nvim_del_augroup_by_id, st.aug)
+        if st.map_win and vim.api.nvim_win_is_valid(st.map_win) then
+          pcall(vim.api.nvim_win_close, st.map_win, true)
+        end
+        for _, k in ipairs({ "<Esc>", "<Tab>", "<leader>z", "<CR>" }) do
+          pcall(vim.keymap.del, "n", k, { buffer = st.right_buf })
+        end
+        -- The right window survives the last-tab fallback close: un-dress it.
+        if vim.api.nvim_win_is_valid(st.right_win) then
+          vim.wo[st.right_win].winbar = ""
+          vim.wo[st.right_win].fillchars = ""
+        end
+      end
+      pcall(vim.cmd, "diffoff!")
+      vim.fn.delete(cf_diff_flag())
+    end,
+  })
+
+  vim.g.codeforge_diff_tab = tab
+  cf_diff_map_refresh()
+  vim.fn.writefile({}, cf_diff_flag())
+  return "ok"
+end
+
+function _G.CodeForgeDiffClose()
+  local tab = vim.g.codeforge_diff_tab
+  if tab and vim.api.nvim_tabpage_is_valid(tab) then
+    local closed = pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
+    if not closed then
+      -- Only tab left (the original got closed meanwhile): drop the scratch
+      -- window instead; its wipe runs the teardown autocmd above.
+      for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+        local b = vim.api.nvim_win_get_buf(win)
+        if vim.b[b].codeforge_diff_left then
+          pcall(vim.api.nvim_win_close, win, true)
+        end
+      end
+      pcall(vim.cmd, "diffoff!")
+    end
+  end
+  return "ok"
+end
+
+-- An nvim exiting mid-diff must not leave a stale flag behind (forge would
+-- keep the editor zoomed waiting for it).
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  callback = function()
+    vim.fn.delete(cf_diff_flag())
+  end,
+})
 
 -- Autosave (#19): write real file buffers on change / leaving insert, unless
 -- CodeForge disabled it via `g:codeforge_autosave = 0` (config `autosave = false`).

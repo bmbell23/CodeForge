@@ -5,7 +5,7 @@
 //! layout (`layout.rs`) — and outlives any client, so a disconnect/SSH drop
 //! never loses the session. A thin **client** (`forge`) owns the real terminal:
 //! it forwards keystrokes/resizes over a unix socket (`protocol.rs`) and paints
-//! the bytes the server sends back. Bare `forge` starts a server (picking a
+//! the bytes the servee sends back. Bare `forge` starts a server (picking a
 //! project) then attaches; a second `forge` attaches to the running one.
 //!
 //! Each window is a fixed editor (Neovim) + terminal + Claude CLI trio; there
@@ -24,6 +24,12 @@
 //!   Ctrl-a c     new window (its own editor/shell/AI for another project)
 //!   Ctrl-a X     close the current window (kills its panes)
 //!   Ctrl-a n     next window   ·   Ctrl-a 1..9  jump to window
+//!   Ctrl-a g     git diff: persistent panel of changed files with +/- counts
+//!                over the terminal pane (stays up until toggled again, Esc
+//!                with the terminal focused, or the terminal is toggled);
+//!                arrows/Enter or a click open a full-window side-by-side
+//!                diff (HEAD left, editable working file right); Esc there
+//!                brings the layout back
 //!   Ctrl-a d     detach (server keeps running; reattach with `forge`)
 //!   Ctrl-a r     reload the server on the latest build (reopens same windows)
 //!   Ctrl-a F     forget the saved session (next `forge` starts fresh)
@@ -37,6 +43,7 @@
 //! `claude --resume`. Panes are never destroyed, only hidden.
 
 mod config;
+mod gitdiff;
 mod layout;
 mod pane;
 mod picker;
@@ -65,6 +72,7 @@ use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
 use config::{Config, Keys};
+use gitdiff::{DiffAction, DiffList};
 use layout::{Dir, FocusDir, Layout, Rect};
 use pane::{Pane, PaneRole};
 use picker::{Picker, PickerAction};
@@ -251,6 +259,50 @@ fn nvim_cycle_buffer(sock: &Path, delta: i32) {
         .output();
 }
 
+/// The flag file nvim drops while its side-by-side diff view (#18) is open.
+/// Lives next to the RPC socket; nvim derives the same path from v:servername.
+fn diff_flag(id: usize) -> PathBuf {
+    let mut p = nvim_sock(id).into_os_string();
+    p.push(".diff");
+    PathBuf::from(p)
+}
+
+/// Ask the editor to open CodeForge's side-by-side diff (#18) on `file`.
+/// True only when nvim confirms — the caller zooms the layout on success.
+fn nvim_diff_open(sock: &Path, file: &Path) -> bool {
+    if !sock.exists() {
+        return false;
+    }
+    // Vim single-quoted strings escape ' by doubling it.
+    let arg = file.to_string_lossy().replace('\'', "''");
+    let out = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg(format!("v:lua.CodeForgeDiffOpen('{arg}')"))
+        .output();
+    matches!(out, Ok(o) if o.status.success()
+        && String::from_utf8_lossy(&o.stdout).trim() == "ok")
+}
+
+/// Ask the editor to close the side-by-side diff view. Best-effort: the flag
+/// file vanishing is what actually drives the layout restore.
+fn nvim_diff_close(sock: &Path) {
+    if !sock.exists() {
+        return;
+    }
+    let _ = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg("v:lua.CodeForgeDiffClose()")
+        .output();
+}
+
 /// Capture a restorable spec for every window (open files + shell cwd).
 fn capture_specs(windows: &[Window]) -> Vec<WindowSpec> {
     windows
@@ -305,6 +357,12 @@ pub enum Msg {
     },
     /// Toggle the keybinding help overlay.
     ToggleHelp,
+    /// Toggle the git-diff list overlay (#18); with the full-screen diff view
+    /// up, asks the editor to close it instead.
+    ToggleDiff,
+    /// The editor's side-by-side diff view went away (its flag file vanished):
+    /// restore the pane layout saved when it opened. Payload = editor pane id.
+    DiffClosed(usize),
     /// Toggle the project picker (re-homes the current window).
     OpenPicker,
     /// Open the picker to create a new window.
@@ -476,6 +534,86 @@ fn refresh_layout(w: &mut Window, editor_ratio: f32, right_ratio: f32) {
     }
 }
 
+/// Pane-visibility snapshot taken when the full-screen diff view (#18) opened,
+/// so Esc in the editor puts the layout back exactly as it was.
+struct DiffZoom {
+    editor_id: usize,
+    /// (show_editor, show_shell, show_ai) before the zoom.
+    prev: (bool, bool, bool),
+}
+
+/// Where the git-diff list overlay sits: exactly over the terminal pane when
+/// it's visible, otherwise a centered box.
+fn diff_overlay_rect(w: &Window, cols: u16, rows: u16) -> Rect {
+    let area = rows.saturating_sub(1);
+    let mut rects = Vec::new();
+    w.layout.rects(
+        Rect {
+            x: 0,
+            y: 0,
+            w: cols,
+            h: area,
+        },
+        &mut rects,
+    );
+    if let Some((_, r)) = rects.iter().find(|(id, _)| *id == w.active[1]) {
+        return *r;
+    }
+    let bw = cols.saturating_sub(4).clamp(24, 70);
+    let bh = area.saturating_sub(2).clamp(4, 16);
+    Rect {
+        x: cols.saturating_sub(bw) / 2,
+        y: area.saturating_sub(bh) / 2,
+        w: bw,
+        h: bh,
+    }
+}
+
+/// Hand a picked file to the editor as a full-window side-by-side diff (#18):
+/// snapshot the pane layout, zoom the editor, and RPC nvim to build the view.
+/// A watcher thread waits for nvim's flag file to vanish (Esc / close / exit)
+/// and then sends `Msg::DiffClosed` so the saved layout comes back. Returns
+/// false (layout untouched) when the editor didn't respond.
+fn open_diff_view(
+    windows: &mut [Window],
+    cur: usize,
+    path: &Path,
+    diff_zoom: &mut Option<DiffZoom>,
+    cfg: &Config,
+    size: (u16, u16),
+    tx: &Sender<Msg>,
+) -> Result<bool> {
+    let w = &mut windows[cur];
+    let ed = w.active[0];
+    let flag = diff_flag(ed);
+    // A stale flag (earlier crash) must not make the watcher fire instantly;
+    // nvim re-creates it during the open call below.
+    let _ = std::fs::remove_file(&flag);
+    if !nvim_diff_open(&nvim_sock(ed), path) {
+        return Ok(false);
+    }
+    if diff_zoom.is_none() {
+        *diff_zoom = Some(DiffZoom {
+            editor_id: ed,
+            prev: (w.show_editor, w.show_shell, w.show_ai),
+        });
+    }
+    w.show_editor = true;
+    w.show_shell = false;
+    w.show_ai = false;
+    w.focus_id = ed;
+    refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+    relayout(&mut w.panes, &w.layout, size.0, size.1.saturating_sub(1))?;
+    let txc = tx.clone();
+    thread::spawn(move || {
+        while flag.exists() {
+            thread::sleep(Duration::from_millis(200));
+        }
+        let _ = txc.send(Msg::DiffClosed(ed));
+    });
+    Ok(true)
+}
+
 /// The last path component, for the window's status-bar label.
 fn dir_title(dir: &Path) -> String {
     dir.file_name()
@@ -600,6 +738,7 @@ fn build_editor(
         c.env("NVIM_APPNAME", "codeforge");
         let sock = nvim_sock(id);
         let _ = std::fs::remove_file(&sock); // stale socket blocks --listen
+        let _ = std::fs::remove_file(diff_flag(id)); // stale diff flag (#18)
         c.arg("--listen");
         c.arg(&sock);
         if !cfg.wrap {
@@ -1072,6 +1211,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let mut msel: Option<MouseSel> = None;
     let mut picker: Option<Picker> = None;
     let mut picker_new_window = false;
+    let mut diff: Option<DiffList> = None;
+    let mut diff_zoom: Option<DiffZoom> = None;
     // (cols, rows) of the attached client; updated on attach/resize.
     let mut size = (80u16, 24u16);
     let mut client: Option<UnixStream> = None;
@@ -1179,6 +1320,44 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             }
                         }
                         dirty = true;
+                    } else if diff.is_some()
+                        && windows[cur].focus_id == windows[cur].active[1]
+                        && !diff_zoom
+                            .as_ref()
+                            .is_some_and(|z| windows[cur].panes.iter().any(|p| p.id == z.editor_id))
+                    {
+                        // The git-diff panel (#18) covers the terminal pane;
+                        // while that pane is focused the panel owns the keys
+                        // (arrows/Enter/Esc). Focus any other pane and input
+                        // flows there untouched — the panel just stays up.
+                        let action = diff
+                            .as_mut()
+                            .map(|dl| dl.feed_bytes(&bytes))
+                            .unwrap_or(DiffAction::None);
+                        match action {
+                            DiffAction::None => {}
+                            DiffAction::Cancel => {
+                                diff = None;
+                                needs_clear = true;
+                            }
+                            DiffAction::Open(p) => {
+                                if !open_diff_view(
+                                    &mut windows,
+                                    cur,
+                                    &p,
+                                    &mut diff_zoom,
+                                    &cfg,
+                                    size,
+                                    &tx,
+                                )? {
+                                    if let Some(dl) = diff.as_mut() {
+                                        dl.set_note("editor didn't respond — try again");
+                                    }
+                                }
+                                needs_clear = true;
+                            }
+                        }
+                        dirty = true;
                     } else {
                         let w = &mut windows[cur];
                         if let Some(p) = w.panes.iter_mut().find(|p| p.id == w.focus_id) {
@@ -1230,6 +1409,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         }
                         refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
                         relayout(&mut w.panes, &w.layout, c, area)?;
+                        // Toggling the terminal (either way) dismisses the
+                        // diff panel that sits on top of it (#18).
+                        if matches!(role, PaneRole::Shell) {
+                            diff = None;
+                        }
                         dirty = true;
                         needs_clear = true;
                     }
@@ -1244,130 +1428,180 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                 }
                 Msg::Mouse { x, y, cb, press } => {
-                    let (c, r) = size;
-                    let area = r.saturating_sub(1);
-                    let w = &mut windows[cur];
-                    let mut rects = Vec::new();
-                    w.layout.rects(
-                        Rect {
-                            x: 0,
-                            y: 0,
-                            w: c,
-                            h: area,
-                        },
-                        &mut rects,
-                    );
-                    let (px, py) = (x.saturating_sub(1), y.saturating_sub(1));
-                    let hit = rects
-                        .iter()
-                        .find(|(_, rc)| {
-                            px >= rc.x && px < rc.x + rc.w && py >= rc.y && py < rc.y + rc.h
-                        })
-                        .copied();
-                    if let Some((id, rect)) = hit {
-                        // SGR cb bits: low 2 = button (0=left), bit5 (32) = motion
-                        // (drag), bit6 (64) = wheel.
-                        let is_wheel = cb & 64 != 0;
-                        let is_motion = cb & 32 != 0;
-                        let button = cb & 3;
-                        if press && !is_wheel && !is_motion && w.focus_id != id {
-                            w.focus_id = id;
-                            dirty = true;
-                        }
-                        let wants_mouse = w
-                            .panes
-                            .iter()
-                            .find(|p| p.id == id)
-                            .is_some_and(|p| p.wants_mouse());
-                        let inner = rect.inner();
-                        // Cell under the pointer within the pane's content rect.
-                        let cell = inner.and_then(|i| {
-                            (px >= i.x && px < i.x + i.w && py >= i.y && py < i.y + i.h)
-                                .then(|| (py - i.y, px - i.x))
-                        });
-
-                        let forward = |w: &mut Window, cb: u16, press: bool| -> Result<()> {
-                            if let Some(i) = inner {
-                                if px >= i.x && px < i.x + i.w && py >= i.y && py < i.y + i.h {
-                                    let seq = format!(
-                                        "\x1b[<{};{};{}{}",
-                                        cb,
-                                        px - i.x + 1,
-                                        py - i.y + 1,
-                                        if press { 'M' } else { 'm' }
-                                    );
-                                    if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
-                                        p.write_input(seq.as_bytes())?;
+                    // The git-diff panel (#18) persists over the terminal
+                    // pane; it only owns mouse events that land inside its
+                    // box (click opens a row, wheel moves the selection).
+                    // Everything else falls through to the panes. While the
+                    // full-screen diff view has this window the panel isn't
+                    // drawn, so it takes nothing.
+                    let zoomed_here = diff_zoom
+                        .as_ref()
+                        .is_some_and(|z| windows[cur].panes.iter().any(|p| p.id == z.editor_id));
+                    let mut taken = false;
+                    if !zoomed_here {
+                        if let Some(dl) = diff.as_mut() {
+                            let rect = diff_overlay_rect(&windows[cur], size.0, size.1);
+                            let (px, py) = (x.saturating_sub(1), y.saturating_sub(1));
+                            taken = px >= rect.x
+                                && px < rect.x + rect.w
+                                && py >= rect.y
+                                && py < rect.y + rect.h;
+                            if taken {
+                                let is_wheel = cb & 64 != 0;
+                                if is_wheel {
+                                    if press {
+                                        dl.scroll(if cb & 1 == 0 { -3 } else { 3 });
+                                        dirty = true;
+                                    }
+                                } else if press && cb & 3 == 0 && cb & 32 == 0 {
+                                    if let Some(i) = dl.row_at(&rect, px, py) {
+                                        dl.select(i);
+                                        if let Some(p) = dl.entry_path(i) {
+                                            if !open_diff_view(
+                                                &mut windows,
+                                                cur,
+                                                &p,
+                                                &mut diff_zoom,
+                                                &cfg,
+                                                size,
+                                                &tx,
+                                            )? {
+                                                dl.set_note("editor didn't respond — try again");
+                                            }
+                                            needs_clear = true;
+                                        }
+                                        dirty = true;
                                     }
                                 }
                             }
-                            Ok(())
-                        };
-
-                        if is_wheel {
-                            // Wheel: forward to mouse-aware apps, else scroll our
-                            // own scrollback.
-                            if wants_mouse {
-                                forward(w, cb, press)?;
-                            } else if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
-                                p.scroll(if cb & 1 == 0 { 3 } else { -3 });
+                        }
+                    }
+                    if !taken {
+                        let (c, r) = size;
+                        let area = r.saturating_sub(1);
+                        let w = &mut windows[cur];
+                        let mut rects = Vec::new();
+                        w.layout.rects(
+                            Rect {
+                                x: 0,
+                                y: 0,
+                                w: c,
+                                h: area,
+                            },
+                            &mut rects,
+                        );
+                        let (px, py) = (x.saturating_sub(1), y.saturating_sub(1));
+                        let hit = rects
+                            .iter()
+                            .find(|(_, rc)| {
+                                px >= rc.x && px < rc.x + rc.w && py >= rc.y && py < rc.y + rc.h
+                            })
+                            .copied();
+                        if let Some((id, rect)) = hit {
+                            // SGR cb bits: low 2 = button (0=left), bit5 (32) = motion
+                            // (drag), bit6 (64) = wheel.
+                            let is_wheel = cb & 64 != 0;
+                            let is_motion = cb & 32 != 0;
+                            let button = cb & 3;
+                            if press && !is_wheel && !is_motion && w.focus_id != id {
+                                w.focus_id = id;
                                 dirty = true;
                             }
-                        } else if button == 0 && press && !is_motion {
-                            // Left press: begin a selection at this cell (don't
-                            // forward yet — a click without drag is forwarded on
-                            // release so app buttons still work).
-                            if let Some(c) = cell {
-                                msel = Some(MouseSel {
-                                    pane_id: id,
-                                    anchor: c,
-                                    cur: c,
-                                    moved: false,
-                                });
-                            }
-                        } else if is_motion && button == 0 {
-                            // Left drag: extend the selection.
-                            if let (Some(ms), Some(c)) = (msel.as_mut(), cell) {
-                                if ms.pane_id == id && c != ms.cur {
-                                    ms.cur = c;
-                                    ms.moved = true;
-                                    dirty = true;
-                                }
-                            }
-                        } else if !press {
-                            // Release: finish selection. A real drag copies via
-                            // OSC 52; a plain click is forwarded to the app.
-                            match msel.take() {
-                                Some(ms) if ms.moved => {
-                                    let (s, e) = ms.range();
-                                    let text = w
-                                        .panes
-                                        .iter()
-                                        .find(|p| p.id == ms.pane_id)
-                                        .map(|p| extract_range(p.screen(), s, e))
-                                        .unwrap_or_default();
-                                    if !text.is_empty() {
-                                        if let Some(cl) = client.as_mut() {
-                                            let _ = protocol::write_frame(
-                                                cl,
-                                                protocol::OUTPUT,
-                                                &osc52(&text),
-                                            );
+                            let wants_mouse = w
+                                .panes
+                                .iter()
+                                .find(|p| p.id == id)
+                                .is_some_and(|p| p.wants_mouse());
+                            let inner = rect.inner();
+                            // Cell under the pointer within the pane's content rect.
+                            let cell = inner.and_then(|i| {
+                                (px >= i.x && px < i.x + i.w && py >= i.y && py < i.y + i.h)
+                                    .then(|| (py - i.y, px - i.x))
+                            });
+
+                            let forward = |w: &mut Window, cb: u16, press: bool| -> Result<()> {
+                                if let Some(i) = inner {
+                                    if px >= i.x && px < i.x + i.w && py >= i.y && py < i.y + i.h {
+                                        let seq = format!(
+                                            "\x1b[<{};{};{}{}",
+                                            cb,
+                                            px - i.x + 1,
+                                            py - i.y + 1,
+                                            if press { 'M' } else { 'm' }
+                                        );
+                                        if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
+                                            p.write_input(seq.as_bytes())?;
                                         }
                                     }
+                                }
+                                Ok(())
+                            };
+
+                            if is_wheel {
+                                // Wheel: forward to mouse-aware apps, else scroll our
+                                // own scrollback.
+                                if wants_mouse {
+                                    forward(w, cb, press)?;
+                                } else if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
+                                    p.scroll(if cb & 1 == 0 { 3 } else { -3 });
                                     dirty = true;
                                 }
-                                _ if wants_mouse => {
-                                    // A click (no drag): send press then release
-                                    // so the app registers a full click.
-                                    forward(w, button, true)?;
-                                    forward(w, button, false)?;
+                            } else if button == 0 && press && !is_motion {
+                                // Left press: begin a selection at this cell (don't
+                                // forward yet — a click without drag is forwarded on
+                                // release so app buttons still work).
+                                if let Some(c) = cell {
+                                    msel = Some(MouseSel {
+                                        pane_id: id,
+                                        anchor: c,
+                                        cur: c,
+                                        moved: false,
+                                    });
                                 }
-                                _ => {}
+                            } else if is_motion && button == 0 {
+                                // Left drag: extend the selection.
+                                if let (Some(ms), Some(c)) = (msel.as_mut(), cell) {
+                                    if ms.pane_id == id && c != ms.cur {
+                                        ms.cur = c;
+                                        ms.moved = true;
+                                        dirty = true;
+                                    }
+                                }
+                            } else if !press {
+                                // Release: finish selection. A real drag copies via
+                                // OSC 52; a plain click is forwarded to the app.
+                                match msel.take() {
+                                    Some(ms) if ms.moved => {
+                                        let (s, e) = ms.range();
+                                        let text = w
+                                            .panes
+                                            .iter()
+                                            .find(|p| p.id == ms.pane_id)
+                                            .map(|p| extract_range(p.screen(), s, e))
+                                            .unwrap_or_default();
+                                        if !text.is_empty() {
+                                            if let Some(cl) = client.as_mut() {
+                                                let _ = protocol::write_frame(
+                                                    cl,
+                                                    protocol::OUTPUT,
+                                                    &osc52(&text),
+                                                );
+                                            }
+                                        }
+                                        dirty = true;
+                                    }
+                                    _ if wants_mouse => {
+                                        // A click (no drag): send press then release
+                                        // so the app registers a full click.
+                                        forward(w, button, true)?;
+                                        forward(w, button, false)?;
+                                    }
+                                    _ => {}
+                                }
+                            } else if wants_mouse {
+                                // Other buttons (right/middle) go to the app as-is.
+                                forward(w, cb, press)?;
                             }
-                        } else if wants_mouse {
-                            // Other buttons (right/middle) go to the app as-is.
-                            forward(w, cb, press)?;
                         }
                     }
                 }
@@ -1392,6 +1626,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 }
                 Msg::ToggleHelp => {
                     exit_copy(&mut copy, &mut windows);
+                    diff = None;
                     help = if help.is_some() {
                         None
                     } else {
@@ -1400,8 +1635,57 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                     needs_clear = true;
                 }
+                Msg::ToggleDiff => {
+                    exit_copy(&mut copy, &mut windows);
+                    help = None;
+                    picker = None;
+                    // With this window's full-screen diff view up, the same key
+                    // closes it; the flag watcher then restores the layout.
+                    let zoom_here = diff_zoom
+                        .as_ref()
+                        .is_some_and(|z| windows[cur].panes.iter().any(|p| p.id == z.editor_id));
+                    if zoom_here {
+                        let ed = diff_zoom.as_ref().unwrap().editor_id;
+                        nvim_diff_close(&nvim_sock(ed));
+                    } else if diff.is_some() {
+                        diff = None;
+                    } else {
+                        diff = Some(DiffList::new(&windows[cur].dir));
+                        // Land focus on the terminal pane the panel covers so
+                        // the arrow keys drive the list immediately.
+                        let w = &mut windows[cur];
+                        if w.show_shell {
+                            w.focus_id = w.active[1];
+                        }
+                    }
+                    dirty = true;
+                    needs_clear = true;
+                }
+                Msg::DiffClosed(ed) => {
+                    if diff_zoom.as_ref().is_some_and(|z| z.editor_id == ed) {
+                        let z = diff_zoom.take().unwrap();
+                        if let Some(w) = windows
+                            .iter_mut()
+                            .find(|w| w.panes.iter().any(|p| p.id == ed))
+                        {
+                            (w.show_editor, w.show_shell, w.show_ai) = z.prev;
+                            refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                            let (c, r) = size;
+                            relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                        }
+                        // The panel persists across the full-screen view;
+                        // refresh it so the counts reflect the edits made.
+                        if diff.is_some() {
+                            diff = Some(DiffList::new(&windows[cur].dir));
+                        }
+                        dirty = true;
+                        needs_clear = true;
+                    }
+                }
                 Msg::CopyMode => {
-                    // Enter copy/scroll mode on the focused pane (no overlays up).
+                    // Enter copy/scroll mode on the focused pane (no overlays
+                    // up; the diff panel yields rather than blocking).
+                    diff = None;
                     if help.is_none() && picker.is_none() {
                         let w = &mut windows[cur];
                         let id = w.focus_id;
@@ -1416,6 +1700,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 Msg::OpenPicker => {
                     exit_copy(&mut copy, &mut windows);
                     help = None;
+                    diff = None;
                     picker = if picker.is_some() {
                         None
                     } else {
@@ -1428,6 +1713,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 Msg::NewWindow => {
                     exit_copy(&mut copy, &mut windows);
                     help = None;
+                    diff = None;
                     picker = Some(Picker::new(proot.clone()));
                     picker_new_window = true;
                     dirty = true;
@@ -1695,6 +1981,16 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 let right_info = segs.join("  ");
                 framebuf.clear();
                 let ksnap = *keys.lock().unwrap();
+                // The diff panel hides while this window is zoomed for the
+                // full-screen view (its home, the terminal pane, is hidden).
+                let dl = if diff_zoom
+                    .as_ref()
+                    .is_some_and(|z| windows[cur].panes.iter().any(|p| p.id == z.editor_id))
+                {
+                    None
+                } else {
+                    diff.as_ref()
+                };
                 render(
                     &mut framebuf,
                     &windows,
@@ -1705,6 +2001,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     help.as_ref(),
                     copy.as_ref(),
                     picker.as_ref(),
+                    dl,
                     &right_info,
                     ksnap,
                     msel.as_ref().map(|m| {
@@ -1975,6 +2272,8 @@ impl InputParser {
                         Some(Msg::TabClose)
                     } else if c == k.copy {
                         Some(Msg::CopyMode)
+                    } else if c == k.git_diff {
+                        Some(Msg::ToggleDiff)
                     } else if c == k.detach {
                         Some(Msg::Detach)
                     } else if c == k.reload {
@@ -2061,6 +2360,7 @@ fn render(
     help: Option<&HelpState>,
     copy: Option<&CopyMode>,
     picker: Option<&Picker>,
+    diff: Option<&DiffList>,
     right_info: &str,
     keys: Keys,
     msel: Option<Sel>,
@@ -2145,6 +2445,9 @@ fn render(
     }
     if let Some(pk) = picker {
         pk.render(out, cols, rows)?;
+    }
+    if let Some(dl) = diff {
+        dl.render(out, &diff_overlay_rect(w, cols, rows))?;
     }
     // End the synchronized frame: present everything queued above at once.
     out.extend_from_slice(b"\x1b[?2026l");
@@ -2310,11 +2613,9 @@ fn help_input(h: &mut HelpState, bytes: &[u8], keys: &Arc<Mutex<Keys>>) -> bool 
                     h.editing = true;
                     h.msg.clear();
                 }
-                HelpKey::Char(c) => {
-                    // 'q' or the (current) help key also closes.
-                    if c == 'q' || c == keys.lock().unwrap().help {
-                        return true;
-                    }
+                // 'q' or the (current) help key also closes.
+                HelpKey::Char(c) if c == 'q' || c == keys.lock().unwrap().help => {
+                    return true;
                 }
                 _ => {}
             }
