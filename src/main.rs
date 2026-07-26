@@ -104,6 +104,65 @@ fn proc_cwd(pid: u32) -> Option<PathBuf> {
 }
 
 /// Fetch the current temperature for `city` from wttr.in (best-effort, via curl).
+/// Read the aggregate CPU counters from `/proc/stat` as `(idle, total)` jiffies.
+fn read_cpu() -> Option<(u64, u64)> {
+    let stat = std::fs::read_to_string("/proc/stat").ok()?;
+    let line = stat.lines().next()?; // "cpu  user nice system idle iowait irq ..."
+    let vals: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    if vals.len() < 4 {
+        return None;
+    }
+    let idle = vals[3] + vals.get(4).copied().unwrap_or(0); // idle + iowait
+    let total: u64 = vals.iter().sum();
+    Some((idle, total))
+}
+
+/// CPU busy percentage between two `/proc/stat` samples.
+fn cpu_percent(prev: (u64, u64), cur: (u64, u64)) -> u8 {
+    let dt = cur.1.saturating_sub(prev.1);
+    let di = cur.0.saturating_sub(prev.0);
+    if dt == 0 {
+        return 0;
+    }
+    (((dt - di) as f64 / dt as f64) * 100.0).round() as u8
+}
+
+/// Used-memory percentage from `/proc/meminfo`.
+fn mem_percent() -> Option<u8> {
+    let info = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let mut total = 0u64;
+    let mut avail = 0u64;
+    for line in info.lines() {
+        let mut it = line.split_whitespace();
+        match it.next() {
+            Some("MemTotal:") => total = it.next()?.parse().ok()?,
+            Some("MemAvailable:") => avail = it.next()?.parse().ok()?,
+            _ => {}
+        }
+    }
+    if total == 0 {
+        return None;
+    }
+    Some((((total - avail) as f64 / total as f64) * 100.0).round() as u8)
+}
+
+/// Used-disk percentage for the filesystem holding `path`, via `df`.
+fn disk_percent(path: &Path) -> Option<u8> {
+    let out = Command::new("df").arg("-P").arg(path).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    // Second line, 5th column is the use percentage ("63%").
+    let line = s.lines().nth(1)?;
+    let pct = line.split_whitespace().nth(4)?.trim_end_matches('%');
+    pct.parse().ok()
+}
+
 fn fetch_weather(city: &str) -> Option<String> {
     let q = city.trim().replace(' ', "+");
     let url = format!("https://wttr.in/{q}?format=%t&u");
@@ -952,6 +1011,32 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         });
     }
 
+    // Status-bar system metrics (cpu / ram / disk), refreshed every few seconds.
+    let metrics = Arc::new(Mutex::new(String::new()));
+    if cfg.status_metrics {
+        let metrics = metrics.clone();
+        let tx = tx.clone();
+        let disk_path = proot.clone();
+        thread::spawn(move || {
+            let mut prev = read_cpu().unwrap_or((0, 0));
+            loop {
+                thread::sleep(Duration::from_secs(3));
+                let cur = read_cpu().unwrap_or(prev);
+                let cpu = cpu_percent(prev, cur);
+                prev = cur;
+                let mut parts = vec![format!("cpu {cpu}%")];
+                if let Some(m) = mem_percent() {
+                    parts.push(format!("ram {m}%"));
+                }
+                if let Some(d) = disk_percent(&disk_path) {
+                    parts.push(format!("dsk {d}%"));
+                }
+                *metrics.lock().unwrap() = parts.join(" ");
+                let _ = tx.send(Msg::Tick);
+            }
+        });
+    }
+
     let mut windows: Vec<Window> = Vec::new();
     let mut next_id: usize = 0;
     for spec in &specs {
@@ -1485,19 +1570,33 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         if dirty {
             if let Some(cl) = client.as_mut() {
                 let now = chrono::Local::now();
-                // weather, then date, then clock (drop wttr.in's leading '+').
-                let temp = weather
-                    .lock()
-                    .unwrap()
-                    .trim_start_matches('+')
-                    .trim()
-                    .to_string();
-                let dt = now.format("%a %b %-d  %H:%M");
-                let right_info = if temp.is_empty() {
-                    dt.to_string()
-                } else {
-                    format!("{temp}  {dt}")
-                };
+                // Right side, left-to-right: metrics, weather, date, clock — each
+                // gated by its config toggle (#16).
+                let mut segs: Vec<String> = Vec::new();
+                if cfg.status_metrics {
+                    let m = metrics.lock().unwrap().clone();
+                    if !m.is_empty() {
+                        segs.push(m);
+                    }
+                }
+                if cfg.status_weather {
+                    let temp = weather
+                        .lock()
+                        .unwrap()
+                        .trim_start_matches('+')
+                        .trim()
+                        .to_string();
+                    if !temp.is_empty() {
+                        segs.push(temp);
+                    }
+                }
+                if cfg.status_date {
+                    segs.push(now.format("%a %b %-d").to_string());
+                }
+                if cfg.status_clock {
+                    segs.push(now.format("%H:%M").to_string());
+                }
+                let right_info = segs.join("  ");
                 framebuf.clear();
                 let ksnap = *keys.lock().unwrap();
                 render(
@@ -2667,6 +2766,21 @@ mod tests {
         // Digits and TOML-unsafe keys are rejected.
         assert!(k.with_bind("toggle_ai", '1').is_err());
         assert!(k.with_bind("toggle_ai", '"').is_err());
+    }
+
+    #[test]
+    fn cpu_percent_math() {
+        // 50 of 100 non-idle jiffies -> 50% busy.
+        assert_eq!(cpu_percent((100, 200), (150, 300)), 50);
+        // No elapsed jiffies -> 0 (no divide by zero).
+        assert_eq!(cpu_percent((100, 200), (100, 200)), 0);
+    }
+
+    #[test]
+    fn metrics_readable_on_linux() {
+        assert!(read_cpu().is_some());
+        assert!(mem_percent().is_some_and(|m| m <= 100));
+        assert!(disk_percent(std::path::Path::new("/")).is_some_and(|d| d <= 100));
     }
 
     #[test]

@@ -38,6 +38,12 @@ pub struct Config {
     pub start_editor: bool,
     pub start_terminal: bool,
     pub start_ai: bool,
+    /// Status-bar right side toggles (#16), left-to-right order when shown:
+    /// metrics (cpu/ram/disk), weather, date, clock.
+    pub status_metrics: bool,
+    pub status_weather: bool,
+    pub status_date: bool,
+    pub status_clock: bool,
     /// Per-action keybindings (single chars, pressed after the prefix).
     pub keys: Keys,
 }
@@ -97,6 +103,10 @@ impl Default for Config {
             start_editor: true,
             start_terminal: true,
             start_ai: true,
+            status_metrics: true,
+            status_weather: true,
+            status_date: true,
+            status_clock: true,
             keys: Keys::default(),
         }
     }
@@ -411,6 +421,12 @@ right_ratio  = 0.5   # terminal height fraction of the right column
 
 # Status-bar temperature location (empty "" disables it).
 weather = "Colorado Springs"
+
+# Status-bar right side (#16). Shown left-to-right: metrics, weather, date, clock.
+status_metrics = true   # cpu / ram / disk usage
+status_weather = true
+status_date = true
+status_clock = true
 
 # Editor line wrapping. true wraps long lines (default); false starts nvim with
 # `nowrap` so long lines run off-screen instead.
