@@ -1007,6 +1007,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     if let Some(cm) = copy.as_mut() {
                         // Copy/scroll mode is modal on its pane.
                         let w = &mut windows[cur];
+                        let mut done = false;
                         if let Some(p) = w.panes.iter_mut().find(|p| p.id == cm.pane_id) {
                             let (exit, clip) = copy_input(cm, p, &bytes);
                             if let Some(text) = clip {
@@ -1021,10 +1022,14 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 }
                             }
                             if exit {
-                                copy = None;
+                                p.unfreeze();
+                                done = true;
                             }
                         } else {
-                            copy = None; // pane vanished
+                            done = true; // pane vanished
+                        }
+                        if done {
+                            copy = None;
                         }
                         dirty = true;
                         needs_clear = true;
@@ -1210,6 +1215,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                 }
                 Msg::ToggleHelp => {
+                    exit_copy(&mut copy, &mut windows);
                     help = if help.is_some() {
                         None
                     } else {
@@ -1221,12 +1227,18 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 Msg::CopyMode => {
                     // Enter copy/scroll mode on the focused pane (no overlays up).
                     if help.is_none() && picker.is_none() {
-                        copy = Some(CopyMode::new(windows[cur].focus_id));
+                        let w = &mut windows[cur];
+                        let id = w.focus_id;
+                        if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
+                            p.freeze(); // hold live output so the view stays put
+                        }
+                        copy = Some(CopyMode::new(id));
                         dirty = true;
                         needs_clear = true;
                     }
                 }
                 Msg::OpenPicker => {
+                    exit_copy(&mut copy, &mut windows);
                     help = None;
                     picker = if picker.is_some() {
                         None
@@ -1238,6 +1250,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     needs_clear = true;
                 }
                 Msg::NewWindow => {
+                    exit_copy(&mut copy, &mut windows);
                     help = None;
                     picker = Some(Picker::new(proot.clone()));
                     picker_new_window = true;
@@ -1356,6 +1369,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 }
                 Msg::SelectWindow(n) => {
                     if n < windows.len() && n != cur {
+                        exit_copy(&mut copy, &mut windows);
                         cur = n;
                         dirty = true;
                         needs_clear = true;
@@ -2201,11 +2215,25 @@ fn decode_copy_keys(bytes: &[u8]) -> Vec<CopyKey> {
     v
 }
 
+/// Leave copy mode: unfreeze the pane (apply buffered output) and clear state.
+fn exit_copy(copy: &mut Option<CopyMode>, windows: &mut [Window]) {
+    if let Some(cm) = copy.take() {
+        for w in windows.iter_mut() {
+            if let Some(p) = w.panes.iter_mut().find(|p| p.id == cm.pane_id) {
+                p.unfreeze();
+            }
+        }
+    }
+}
+
 /// Drive copy mode on pane `p`. Returns `(should_exit, text_to_copy)`.
 fn copy_input(cm: &mut CopyMode, p: &mut Pane, bytes: &[u8]) -> (bool, Option<String>) {
     let (rows, cols) = p.screen().size();
     let maxr = rows.saturating_sub(1);
     let maxc = cols.saturating_sub(1);
+    // Alt-screen apps (Claude/vim) have no line scrollback — only move the
+    // cursor over the visible screen, don't try to scroll history.
+    let alt = p.alternate_screen();
     for ev in decode_copy_keys(bytes) {
         match ev {
             CopyKey::Esc => {
@@ -2215,27 +2243,43 @@ fn copy_input(cm: &mut CopyMode, p: &mut Pane, bytes: &[u8]) -> (bool, Option<St
             CopyKey::Up => {
                 if cm.row > 0 {
                     cm.row -= 1;
-                } else {
+                } else if !alt {
                     p.scroll(1);
                 }
             }
             CopyKey::Down => {
                 if cm.row < maxr {
                     cm.row += 1;
-                } else {
+                } else if !alt {
                     p.scroll(-1);
                 }
             }
             CopyKey::Left => cm.col = cm.col.saturating_sub(1),
             CopyKey::Right => cm.col = (cm.col + 1).min(maxc),
-            CopyKey::PageUp => p.scroll((rows / 2).max(1) as i32),
-            CopyKey::PageDown => p.scroll(-((rows / 2).max(1) as i32)),
+            CopyKey::PageUp => {
+                if alt {
+                    cm.row = 0;
+                } else {
+                    p.scroll((rows / 2).max(1) as i32);
+                }
+            }
+            CopyKey::PageDown => {
+                if alt {
+                    cm.row = maxr;
+                } else {
+                    p.scroll(-((rows / 2).max(1) as i32));
+                }
+            }
             CopyKey::Top => {
-                p.scroll(1_000_000);
+                if !alt {
+                    p.scroll(1_000_000);
+                }
                 cm.row = 0;
             }
             CopyKey::Bottom => {
-                p.scroll_to_bottom();
+                if !alt {
+                    p.scroll_to_bottom();
+                }
                 cm.row = maxr;
             }
             CopyKey::Select => {

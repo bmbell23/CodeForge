@@ -37,6 +37,11 @@ pub struct Pane {
     parser: vt100::Parser,
     /// How many rows we're scrolled back into history (0 = live bottom).
     scroll: usize,
+    /// Copy-mode freeze: while true, incoming output is buffered (not fed to the
+    /// emulator) so the scrolled view stays put and vt100 can't panic feeding a
+    /// scrolled grid. Applied on `unfreeze`.
+    frozen: bool,
+    pending: Vec<u8>,
     /// When this child was spawned (to distinguish a quick crash from a normal
     /// exit when deciding whether to respawn).
     spawned_at: Instant,
@@ -105,6 +110,8 @@ impl Pane {
             child,
             parser: vt100::Parser::new(rows, cols, SCROLLBACK),
             scroll: 0,
+            frozen: false,
+            pending: Vec::new(),
             spawned_at: Instant::now(),
             respawns: 0,
             title,
@@ -131,12 +138,49 @@ impl Pane {
         self.respawns = n;
     }
 
-    /// Feed child output into the emulator. vt100 can panic on internal edge
-    /// cases (e.g. wrapping a wide glyph in a degenerate grid); contain it so a
-    /// single pane's bad byte stream can never take down the whole server.
+    /// Feed child output into the emulator. While frozen (copy mode) the bytes
+    /// are buffered instead. Otherwise, if we were scrolled back via the wheel,
+    /// new output snaps to the live bottom first — both the natural behavior and
+    /// a guard against a vt100 panic when processing into a scrolled grid.
+    ///
+    /// vt100 can also panic on other internal edge cases (e.g. wrapping a wide
+    /// glyph in a degenerate grid); contain it so a single pane's byte stream
+    /// can never take down the whole server.
     pub fn feed(&mut self, bytes: &[u8]) {
+        if self.frozen {
+            self.pending.extend_from_slice(bytes);
+            return;
+        }
+        if self.scroll != 0 {
+            self.scroll = 0;
+            self.parser.set_scrollback(0);
+        }
         let parser = &mut self.parser;
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(bytes)));
+    }
+
+    /// Freeze the emulator (enter copy mode): buffer incoming output.
+    pub fn freeze(&mut self) {
+        self.frozen = true;
+    }
+
+    /// Unfreeze (leave copy mode): drop the scroll, then apply buffered output.
+    pub fn unfreeze(&mut self) {
+        self.frozen = false;
+        self.scroll = 0;
+        self.parser.set_scrollback(0);
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            let parser = &mut self.parser;
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| parser.process(&pending)));
+        }
+    }
+
+    /// Whether the child is on the alternate screen (a fullscreen TUI like
+    /// Claude/vim). Such panes have no meaningful line scrollback.
+    pub fn alternate_screen(&self) -> bool {
+        self.parser.screen().alternate_screen()
     }
 
     /// Forward user input to the child.
