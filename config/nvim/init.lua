@@ -205,7 +205,7 @@ require("lazy").setup({
 
       local keys = {
         "find    Ctrl-P file     Space e explore     Ctrl-Shift-F grep",
-        "edit    ]b / [b tabs     Space bd close     gd peek def",
+        "code    gd peek def     Space gd git diff     ]b / [b tabs",
         "panes   Ctrl-a e/t/c show·hide     hjkl focus     Ctrl-a v copy/scroll",
         "more    Ctrl-a s tab     Ctrl-a n window     Ctrl-a ? all keys",
       }
@@ -295,6 +295,29 @@ require("lazy").setup({
           end)
         end,
       })
+    end,
+  },
+
+  -- Git diff (#18): a GitLens-lite view. `Space g d` opens a changed-files
+  -- panel; pick one for a side-by-side diff (old left, working tree right,
+  -- editable). `q` or `Esc` closes it. `Space g h` shows a file's history.
+  {
+    "sindrets/diffview.nvim",
+    dependencies = { "nvim-lua/plenary.nvim" },
+    cmd = { "DiffviewOpen", "DiffviewClose", "DiffviewFileHistory", "DiffviewToggleFiles" },
+    config = function()
+      local close = "<cmd>DiffviewClose<cr>"
+      require("diffview").setup({
+        use_icons = false, -- no Nerd Font required (avoids [] tofu)
+        keymaps = {
+          view = { { "n", "q", close, { desc = "Close diff" } }, { "n", "<esc>", close, {} } },
+          file_panel = { { "n", "q", close, { desc = "Close diff" } }, { "n", "<esc>", close, {} } },
+          file_history_panel = { { "n", "q", close, {} }, { "n", "<esc>", close, {} } },
+        },
+      })
+      vim.keymap.set("n", "<leader>gd", "<cmd>DiffviewOpen<cr>", { desc = "Git diff (changed files)" })
+      vim.keymap.set("n", "<leader>gh", "<cmd>DiffviewFileHistory %<cr>", { desc = "Git file history" })
+      vim.keymap.set("n", "<leader>gc", "<cmd>DiffviewClose<cr>", { desc = "Close git diff" })
     end,
   },
 
