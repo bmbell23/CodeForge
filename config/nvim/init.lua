@@ -334,9 +334,6 @@ require("lazy").setup({
           file_history_panel = { { "n", "q", close, {} }, { "n", "<esc>", close, {} } },
         },
       })
-      vim.keymap.set("n", "<leader>gd", "<cmd>DiffviewOpen<cr>", { desc = "Git diff (changed files)" })
-      vim.keymap.set("n", "<leader>gh", "<cmd>DiffviewFileHistory %<cr>", { desc = "Git file history" })
-      vim.keymap.set("n", "<leader>gc", "<cmd>DiffviewClose<cr>", { desc = "Close git diff" })
     end,
   },
 
@@ -464,6 +461,16 @@ require("lazy").setup({
   -- Update on demand with <leader>u (mapped below).
   checker = { enabled = true, notify = false, frequency = 86400 },
 })
+
+-- Git diff (#18) keymaps live here, NOT inside the diffview plugin spec:
+-- diffview lazy-loads on its :Diffview* commands, so a keymap defined in its
+-- own config wouldn't exist until the command was run once by hand. Defined
+-- globally, `<cmd>DiffviewOpen<cr>` both triggers the lazy load and opens it.
+--   Space g d  changed-files panel + side-by-side diff (q / Esc closes)
+--   Space g h  history of the current file      Space g c  close the diff
+vim.keymap.set("n", "<leader>gd", "<cmd>DiffviewOpen<cr>", { desc = "Git diff (changed files)" })
+vim.keymap.set("n", "<leader>gh", "<cmd>DiffviewFileHistory %<cr>", { desc = "Git file history" })
+vim.keymap.set("n", "<leader>gc", "<cmd>DiffviewClose<cr>", { desc = "Close git diff" })
 
 -- Update plugins on demand (avoids auto-updating on every launch, which would
 -- re-fetch once per nvim window and could break the editor silently).
