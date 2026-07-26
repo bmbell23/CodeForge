@@ -70,7 +70,14 @@ require("lazy").setup({
         end
       end)
       require("telescope").setup({
-        defaults = { preview = { treesitter = false } },
+        defaults = {
+          preview = { treesitter = false },
+          -- Never list the .git internals even when hidden files are shown.
+          file_ignore_patterns = { "%.git/" },
+        },
+        -- Show dotfiles (e.g. .gitignore) in the fuzzy file finder; gitignored
+        -- paths (target/, node_modules/) stay hidden via the default respect.
+        pickers = { find_files = { hidden = true } },
       })
       local t = require("telescope.builtin")
       -- VS Code-style (work in normal & insert):
@@ -138,7 +145,22 @@ require("lazy").setup({
       vim.keymap.set("n", "<S-l>", "<cmd>BufferLineCycleNext<cr>", { desc = "Next buffer/tab" })
       vim.keymap.set("n", "<S-h>", "<cmd>BufferLineCyclePrev<cr>", { desc = "Prev buffer/tab" })
       vim.keymap.set("n", "<leader>bp", "<cmd>BufferLinePick<cr>", { desc = "Pick a buffer/tab" })
-      vim.keymap.set("n", "<leader>bd", "<cmd>bdelete<cr>", { desc = "Close buffer/tab" })
+      -- Close the current buffer/tab. On the LAST real buffer, :bdelete would
+      -- leave a blank [No Name] (looks like nothing closed) — drop to the splash
+      -- instead so closing the last tab is visible and useful.
+      vim.keymap.set("n", "<leader>bd", function()
+        if vim.bo.modified then
+          vim.notify("Unsaved changes — :w (or <leader>w) first", vim.log.levels.WARN)
+          return
+        end
+        local listed = vim.tbl_filter(function(b)
+          return vim.bo[b].buflisted
+        end, vim.api.nvim_list_bufs())
+        vim.cmd("bdelete")
+        if #listed <= 1 and _G.CodeForgeSplash then
+          _G.CodeForgeSplash()
+        end
+      end, { desc = "Close buffer/tab" })
       -- Jump straight to tab N.
       for i = 1, 9 do
         vim.keymap.set(
@@ -367,6 +389,13 @@ require("lazy").setup({
         alpha.setup({ layout = layout, opts = { margin = 5 } })
       end
       splash_setup()
+
+      -- Redraw the splash on demand (e.g. after closing the last buffer). Rebuild
+      -- first so git context / recents are current.
+      _G.CodeForgeSplash = function()
+        splash_setup()
+        require("alpha").start(false)
+      end
 
       -- Draw the splash ourselves on an empty start (alpha's built-in autostart
       -- proved unreliable here). Guarded so opening a file never shows it.
