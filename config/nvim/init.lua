@@ -57,8 +57,18 @@ require("lazy").setup({
     dependencies = { "nvim-lua/plenary.nvim" },
     config = function()
       -- Telescope 0.1.x calls nvim-treesitter's old `ft_to_lang`, which the
-      -- rewritten nvim-treesitter removed — turn off treesitter in the preview
-      -- so live_grep/find_files don't crash.
+      -- rewritten (main-branch) nvim-treesitter removed. That killed live_grep /
+      -- find_files with a nil-call in __files.lua:438 and previewers/utils.lua.
+      -- Disabling preview treesitter isn't enough (the __files path isn't gated
+      -- by it), so restore the function as a thin shim over the new API.
+      pcall(function()
+        local p = require("nvim-treesitter.parsers")
+        if type(p.ft_to_lang) ~= "function" then
+          p.ft_to_lang = function(ft)
+            return vim.treesitter.language.get_lang(ft) or ft
+          end
+        end
+      end)
       require("telescope").setup({
         defaults = { preview = { treesitter = false } },
       })
@@ -87,6 +97,15 @@ require("lazy").setup({
     opts = {
       default_file_explorer = true,
       view_options = { show_hidden = true },
+      -- oil is a buffer-based explorer (you navigate in/out of dirs, not an
+      -- expand-in-place tree). Map the intuitive keys on top of the defaults:
+      --   Backspace / Left  -> go up to the parent directory
+      --   Right             -> enter the dir / open the file under the cursor
+      keymaps = {
+        ["<BS>"] = "actions.parent",
+        ["<Left>"] = "actions.parent",
+        ["<Right>"] = "actions.select",
+      },
     },
     config = function(_, opts)
       require("oil").setup(opts)
@@ -204,8 +223,8 @@ require("lazy").setup({
       end
 
       local keys = {
-        "find    Ctrl-P file     Space e explore     Ctrl-Shift-F grep",
-        "code    gd peek def     Space gd git diff     ]b / [b tabs",
+        "find    Ctrl-P file     Space e explore     Space fg grep",
+        "in file gd def · gr refs     Space gd git diff     ]b / [b tabs",
         "panes   Ctrl-a e/t/c show·hide     hjkl focus     Ctrl-a v copy/scroll",
         "more    Ctrl-a s tab     Ctrl-a n window     Ctrl-a ? all keys",
       }
