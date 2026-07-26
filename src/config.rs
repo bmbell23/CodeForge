@@ -309,7 +309,16 @@ impl Config {
         let path = config_path();
         match std::fs::read_to_string(&path) {
             Ok(s) => match toml::from_str::<Config>(&s) {
-                Ok(c) => (c, None),
+                Ok(c) => {
+                    // Guard the prefix: a spec that resolves to a flow-control or
+                    // NUL byte (e.g. "C-s", "C-space") would freeze or dead-key
+                    // the whole session with no way to recover from inside it.
+                    // Warn and fall back to Ctrl-a rather than lock the user out.
+                    let warn = parse_prefix(&c.prefix)
+                        .err()
+                        .map(|e| format!("prefix \"{}\": {e}; using Ctrl-a instead", c.prefix));
+                    (c, warn)
+                }
                 Err(e) => (
                     Config::default(),
                     Some(format!(
@@ -329,9 +338,10 @@ impl Config {
         }
     }
 
-    /// The prefix as a raw byte (e.g. `"C-a"` -> 0x01).
+    /// The prefix as a raw byte (e.g. `"C-a"` -> 0x01). An unusable spec (see
+    /// `parse_prefix`) falls back to Ctrl-a so the session is never un-drivable.
     pub fn prefix_byte(&self) -> u8 {
-        parse_prefix(&self.prefix)
+        parse_prefix(&self.prefix).unwrap_or(0x01)
     }
 }
 
@@ -379,23 +389,49 @@ pub fn persist_keybind(field: &str, ch: char) {
     let _ = std::fs::write(&path, out);
 }
 
-/// Parse a prefix spec: `"C-<c>"` -> Ctrl-<c>, or a single char literally.
-fn parse_prefix(s: &str) -> u8 {
+/// Parse a prefix spec into the raw byte the terminal sends.
+///
+/// `"C-a"` -> 0x01, `"C-b"` -> 0x02; the literal `"space"` -> 0x20; a bare
+/// single char is taken literally. Returns `Err(reason)` for a spec that would
+/// make the session un-drivable, so the caller can warn and fall back to Ctrl-a:
+///   - `Ctrl-S` / `Ctrl-Q` (0x13 / 0x11) are terminal flow-control — they freeze
+///     and unfreeze screen output, so using one as a prefix hangs the terminal.
+///   - anything resolving to NUL (0x00), e.g. `"C-space"`, which most terminals
+///     don't send (and the input parser treats NUL as "no prefix" anyway).
+fn parse_prefix(s: &str) -> Result<u8, String> {
     let s = s.trim();
-    if let Some(rest) = s.strip_prefix("C-").or_else(|| s.strip_prefix("c-")) {
-        if let Some(c) = rest.chars().next() {
-            // Ctrl masks bit 6/7: 'a' (0x61) -> 0x01.
-            return (c as u8) & 0x1f;
-        }
+    let byte = if let Some(rest) = s.strip_prefix("C-").or_else(|| s.strip_prefix("c-")) {
+        let rest = rest.trim();
+        let base = if rest.eq_ignore_ascii_case("space") {
+            b' '
+        } else if let Some(c) = rest.bytes().next() {
+            c
+        } else {
+            return Err("nothing after \"C-\"".into());
+        };
+        // Ctrl masks bits 6/7: 'a' (0x61) -> 0x01; Space (0x20) -> 0x00.
+        base & 0x1f
+    } else if s.eq_ignore_ascii_case("space") {
+        b' '
+    } else if let Some(c) = s.bytes().next() {
+        c
+    } else {
+        return Err("empty prefix".into());
+    };
+    match byte {
+        0x00 => Err("resolves to NUL, which terminals don't reliably send".into()),
+        0x11 | 0x13 => Err("Ctrl-S/Ctrl-Q are terminal flow-control and freeze the screen".into()),
+        b => Ok(b),
     }
-    s.bytes().next().unwrap_or(0x01)
 }
 
 /// Written to `config.toml` on first run.
 const DEFAULT_TOML: &str = r#"# CodeForge configuration.
 # Edit and restart forge. Every field is optional.
 
-# Command prefix (tmux-style). Examples: "C-a", "C-b", "C-space".
+# Command prefix (tmux-style). Examples: "C-a", "C-b", "C-o".
+# Avoid Ctrl-S / Ctrl-Q (terminal flow-control — they freeze the screen) and
+# Ctrl-Space (sends NUL); those fall back to Ctrl-a with a startup warning.
 prefix = "C-a"
 
 # Where the project picker looks. Defaults to $DDN_PROJECTS, then ~/projects.
@@ -487,5 +523,23 @@ mod tests {
         assert_eq!(cfg.keys.toggle_ai, 'x');
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prefix_parsing_and_guards() {
+        assert_eq!(parse_prefix("C-a"), Ok(0x01));
+        assert_eq!(parse_prefix("C-b"), Ok(0x02));
+        assert_eq!(parse_prefix("space"), Ok(0x20));
+        assert_eq!(parse_prefix("x"), Ok(b'x'));
+        // Unusable specs are rejected (never returned as a live byte).
+        assert!(parse_prefix("C-s").is_err()); // XOFF: froze the terminal
+        assert!(parse_prefix("C-q").is_err()); // XON
+        assert!(parse_prefix("C-space").is_err()); // NUL
+                                                   // prefix_byte falls back to Ctrl-a for any rejected spec.
+        let c = Config {
+            prefix: "C-space".into(),
+            ..Config::default()
+        };
+        assert_eq!(c.prefix_byte(), 0x01);
     }
 }
