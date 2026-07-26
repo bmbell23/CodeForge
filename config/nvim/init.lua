@@ -138,7 +138,11 @@ require("lazy").setup({
   -- a file (the first key seeds Telescope find_files).
   {
     "goolord/alpha-nvim",
-    event = "VimEnter",
+    -- Load eagerly, NOT on VimEnter: alpha registers its auto-draw inside its
+    -- own VimEnter handler, so lazy-loading it on VimEnter misses the event and
+    -- nvim shows its stock intro instead of our splash.
+    lazy = false,
+    priority = 100,
     config = function()
       local ok, alpha = pcall(require, "alpha")
       if not ok then
@@ -226,6 +230,25 @@ require("lazy").setup({
       layout[#layout + 1] = { type = "padding", val = 1 }
       layout[#layout + 1] = text(footer, "Function")
       alpha.setup({ layout = layout, opts = { margin = 5 } })
+
+      -- Draw the splash ourselves on an empty start (alpha's built-in autostart
+      -- proved unreliable here). Guarded so opening a file never shows it.
+      vim.api.nvim_create_autocmd("VimEnter", {
+        once = true,
+        callback = function()
+          if
+            vim.fn.argc() == 0
+            and vim.api.nvim_buf_get_name(0) == ""
+            and vim.bo.buftype == ""
+            and vim.api.nvim_buf_line_count(0) <= 1
+            and (vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] or "") == ""
+          then
+            -- start(false) forces a draw; start(true) (the on-vimenter path)
+            -- proved to be a no-op with this alpha version.
+            require("alpha").start(false)
+          end
+        end,
+      })
 
       -- Type-to-open: any letter opens the fuzzy finder seeded with it. Digits
       -- stay bound to the recent-file buttons above.

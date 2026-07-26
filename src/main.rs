@@ -1882,7 +1882,7 @@ fn render(
                 p.title.clone()
             };
             if copy.is_some_and(|cm| cm.pane_id == *id) {
-                title.push_str("  COPY  k/j v y Esc");
+                title.push_str("  COPY: j/k scroll · v select · y copy · Esc exit");
             }
             draw_border(out, rect, &title, *id == w.focus_id)?;
             if let Some(inner) = rect.inner() {
@@ -2324,12 +2324,14 @@ fn draw_copy_overlay(
     let sel = cm.selection();
     let (rows, cols) = screen.size();
     for r in 0..rows.min(inner.h) {
+        // Highlight the whole current line so scrolling/motion is visible even
+        // before the cursor reaches an edge.
+        let on_cur_row = r == cm.row;
         for c in 0..cols.min(inner.w) {
             let selected = sel.is_some_and(|((sr, sc), (er, ec))| {
                 (r > sr || (r == sr && c >= sc)) && (r < er || (r == er && c <= ec))
             });
-            let is_cursor = r == cm.row && c == cm.col;
-            if !selected && !is_cursor {
+            if !selected && !on_cur_row {
                 continue;
             }
             let ch = screen
