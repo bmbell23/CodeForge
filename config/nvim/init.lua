@@ -132,9 +132,10 @@ require("lazy").setup({
     end,
   },
 
-  -- Start screen (#14): a CodeForge splash when the editor opens with no file.
-  -- Shows ASCII art + key hints, and — the point — you can just start typing to
-  -- fuzzy-open a file (the first key seeds a Telescope find_files search).
+  -- CodeForge start screen: a project-aware splash when the editor opens with
+  -- no file. Shows the project + git context, recent files you can jump to by
+  -- number, and a key cheatsheet — and you can just start typing to fuzzy-open
+  -- a file (the first key seeds Telescope find_files).
   {
     "goolord/alpha-nvim",
     event = "VimEnter",
@@ -143,6 +144,9 @@ require("lazy").setup({
       if not ok then
         return
       end
+      local db = require("alpha.themes.dashboard")
+      local cwd = vim.fn.getcwd()
+
       local header = {
         [[   ______          __     ______                     ]],
         [[  / ____/___  ____/ /__  / ____/___  _________ ____   ]],
@@ -150,39 +154,86 @@ require("lazy").setup({
         [[/ /___/ /_/ / /_/ /  __/ __/ / /_/ / /  / /_/ /  __/  ]],
         [[\____/\____/\__,_/\___/_/    \____/_/   \__, /\___/   ]],
         [[                                       /____/         ]],
+        [[         terminal-native IDE · nvim + shell + Claude  ]],
       }
-      local info = {
-        "terminal-native IDE — nvim + shell + Claude in managed panes",
-        "",
-        "‹ just start typing to open a file ›",
-        "",
-        "Ctrl-P  find file        Ctrl-Shift-F  grep the project",
-        "<leader>e  file explorer     ]b / [b  switch buffer tabs",
-        "<leader>bd  close buffer      gd  peek definition",
-        "",
-        "Ctrl-a ?  keys + live editor    Ctrl-a s  new terminal/Claude tab",
-        "Ctrl-a h/j/k/l  focus panes     Ctrl-a n  new window",
+
+      -- Project + git context line.
+      local function git_bits()
+        local br = vim.fn.systemlist({ "git", "-C", cwd, "branch", "--show-current" })
+        if vim.v.shell_error ~= 0 or not br[1] or br[1] == "" then
+          return nil, 0
+        end
+        local st = vim.fn.systemlist({ "git", "-C", cwd, "status", "--porcelain" })
+        return br[1], (vim.v.shell_error == 0) and #st or 0
+      end
+      local branch, changed = git_bits()
+      local ctx = "  " .. vim.fn.fnamemodify(cwd, ":t")
+      if branch then
+        ctx = ctx .. "   ⎇ " .. branch
+        if changed > 0 then
+          ctx = ctx .. "   " .. changed .. " changed"
+        end
+      end
+
+      -- Recent files, project-local first, that still exist.
+      local recent = {}
+      do
+        local under, other, seen = {}, {}, {}
+        for _, f in ipairs(vim.v.oldfiles or {}) do
+          if not seen[f] and vim.fn.filereadable(f) == 1 then
+            seen[f] = true
+            if f:sub(1, #cwd) == cwd then
+              under[#under + 1] = f
+            else
+              other[#other + 1] = f
+            end
+          end
+        end
+        vim.list_extend(recent, under)
+        vim.list_extend(recent, other)
+      end
+      local buttons = {}
+      for i = 1, math.min(#recent, 6) do
+        local f = recent[i]
+        local disp = vim.fn.fnamemodify(f, ":~:.")
+        buttons[i] = db.button(tostring(i), "  " .. disp, "<cmd>edit " .. vim.fn.fnameescape(f) .. "<cr>")
+      end
+
+      local keys = {
+        "find   Ctrl-P file    Ctrl-Shift-F grep    gd peek def",
+        "edit   ]b / [b tabs    <leader>bd close    autosaved",
+        "panes  Ctrl-a e/t/c show·hide    hjkl focus    v copy/scroll",
+        "more   Ctrl-a s tab    Ctrl-a n window    Ctrl-a ? all keys",
       }
+      local footer = { "‹ type to open a file ›    1-6 recent    Ctrl-a ? keybindings" }
+
       local function text(lines, hl)
         return { type = "text", val = lines, opts = { position = "center", hl = hl } }
       end
-      alpha.setup({
-        layout = {
-          { type = "padding", val = 4 },
-          text(header, "Keyword"),
-          { type = "padding", val = 2 },
-          text(info, "Comment"),
-        },
-        opts = { margin = 5 },
-      })
+      local layout = {
+        { type = "padding", val = 2 },
+        text(header, "Keyword"),
+        { type = "padding", val = 1 },
+        text({ ctx }, "Identifier"),
+        { type = "padding", val = 1 },
+      }
+      if #buttons > 0 then
+        layout[#layout + 1] = text({ "recent files" }, "Comment")
+        layout[#layout + 1] = { type = "group", val = buttons, opts = { spacing = 0 } }
+        layout[#layout + 1] = { type = "padding", val = 1 }
+      end
+      layout[#layout + 1] = text(keys, "Comment")
+      layout[#layout + 1] = { type = "padding", val = 1 }
+      layout[#layout + 1] = text(footer, "Function")
+      alpha.setup({ layout = layout, opts = { margin = 5 } })
 
-      -- On the splash, any printable key opens the fuzzy file finder seeded with
-      -- that character — so you "just start typing" to open a file.
+      -- Type-to-open: any letter opens the fuzzy finder seeded with it. Digits
+      -- stay bound to the recent-file buttons above.
       vim.api.nvim_create_autocmd("FileType", {
         pattern = "alpha",
         callback = function(ev)
           local tb = require("telescope.builtin")
-          local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+          local chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ._-"
           for i = 1, #chars do
             local ch = chars:sub(i, i)
             vim.keymap.set("n", ch, function()
