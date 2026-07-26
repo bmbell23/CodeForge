@@ -100,6 +100,13 @@ without relaunching: `git -C /home/bbell/projects/CodeForge pull` then `Ctrl-a r
 Recommended tools for full IDE features: **ripgrep (`rg`)** for grep, **`fd`**
 for faster file finding, and LSP servers via `:Mason` inside nvim.
 
+**Font.** CodeForge is a terminal program — it draws characters, but the
+*font* is chosen by your terminal emulator (iTerm2, Windows Terminal, Kitty,
+your phone's SSH app, …), not by CodeForge or nvim. To use e.g. **Cascadia Code
+Mono**, set it in that app's settings; it applies to every pane. CodeForge
+needs only a normal monospace font — icons are off by default, so no Nerd Font
+is required (that's what those `[]` boxes were).
+
 ### Run
 
 ```bash
@@ -124,28 +131,28 @@ the first of `~/projects` or `~/work/projects` that exists.
 
 ### CodeForge (`Ctrl-a` prefix)
 
-| Keys        | Action                               |
-|-------------|--------------------------------------|
-| `Ctrl-a e`  | Show/hide the **editor** pane        |
-| `Ctrl-a t`  | Show/hide the **terminal** pane      |
-| `Ctrl-a c`  | Show/hide the **Claude** pane        |
-| `Ctrl-a s`  | New tab in the focused slot (terminal/Claude) |
-| `Ctrl-a ]` / `[` | Next / prev tab in the focused slot |
-| `Ctrl-a w`  | Close the active tab in the focused slot |
-| `Ctrl-a v`  | Copy/scroll mode on the focused pane |
-| `Ctrl-a h/j/k/l` | Move focus left/down/up/right   |
-| `Ctrl-a o`  | Cycle focus                          |
-| `Ctrl-a p`  | Switch project (re-home window)      |
-| `Ctrl-a n`  | New window (pick its project)        |
-| `Ctrl-a X`  | Close current window                 |
-| `Ctrl-a 1`–`9` | Jump to window                    |
-| `Ctrl-a d`  | Detach (server keeps running)        |
-| `Ctrl-a r`  | Reload server on latest build        |
-| `Ctrl-a F`  | Forget saved session (fresh next run)|
-| `Ctrl-a ?`  | Keybinding help + live editor        |
-| `Ctrl-a q`  | Quit CodeForge (ends session)        |
-| `Ctrl-a Ctrl-a` | Send a literal `Ctrl-a` to the child |
-| **Click a pane** | Focus it (clicks reach nvim too) |
+| Keys              | Action                                        |
+|-------------------|-----------------------------------------------|
+| `Ctrl-a e`        | Show/hide the **editor** pane                 |
+| `Ctrl-a t`        | Show/hide the **terminal** pane               |
+| `Ctrl-a c`        | Show/hide the **Claude** pane                 |
+| `Ctrl-a s`        | New tab in the focused slot (terminal/Claude) |
+| `Ctrl-a ]` / `[`  | Next / prev tab in the focused slot           |
+| `Ctrl-a w`        | Close the active tab in the focused slot      |
+| `Ctrl-a v`        | Copy/scroll mode on the focused pane          |
+| `Ctrl-a h/j/k/l`  | Move focus left/down/up/right                 |
+| `Ctrl-a o`        | Cycle focus                                   |
+| `Ctrl-a p`        | Switch project (re-home window)               |
+| `Ctrl-a n`        | New window (pick its project)                 |
+| `Ctrl-a X`        | Close current window                          |
+| `Ctrl-a 1`–`9`    | Jump to window                                |
+| `Ctrl-a d`        | Detach (server keeps running)                 |
+| `Ctrl-a r`        | Reload server on latest build                 |
+| `Ctrl-a F`        | Forget saved session (fresh next run)         |
+| `Ctrl-a ?`        | Keybinding help + live editor                 |
+| `Ctrl-a q`        | Quit CodeForge (ends session)                 |
+| `Ctrl-a Ctrl-a`   | Send a literal `Ctrl-a` to the child          |
+| **Click a pane**  | Focus it (clicks reach nvim too)              |
 
 Keys are rebindable live in the `Ctrl-a ?` overlay (press `e`), no file editing
 needed. Each slot (terminal, Claude) can hold several **tabs**; the border shows
