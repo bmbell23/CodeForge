@@ -222,13 +222,15 @@ require("lazy").setup({
         buttons[i] = db.button(tostring(i), "  " .. disp, "<cmd>edit " .. vim.fn.fnameescape(f) .. "<cr>")
       end
 
+      -- Grouped, aligned cheatsheet. Space = leader; Ctrl-a = CodeForge prefix.
       local keys = {
-        "find    Ctrl-P file     Space e explore     Space fg grep",
-        "in file gd def · gr refs     Space gd git diff     ]b / [b tabs",
-        "panes   Ctrl-a e/t/c show·hide     hjkl focus     Ctrl-a v copy/scroll",
-        "more    Ctrl-a s tab     Ctrl-a n window     Ctrl-a ? all keys",
+        "Files    Ctrl-P  open file       Space e   file tree     Space fg  search text",
+        "Editor   gd  go to definition    gr  references          ]b / [b   prev / next file",
+        "Git      Space gd  diff view (changed files, side-by-side, editable)",
+        "Panes    Ctrl-a e/t/c  editor / terminal / claude        Ctrl-a hjkl  move focus",
+        "Session  Ctrl-a n  new window     Ctrl-a v  scroll / copy   Ctrl-a ?  all keys",
       }
-      local footer = { "‹ type to open a file ›    1-6 recent    Space e explore" }
+      local footer = { "just start typing to fuzzy-open a file   ·   Space e for the file tree" }
 
       local function text(lines, hl)
         return { type = "text", val = lines, opts = { position = "center", hl = hl } }
@@ -241,7 +243,7 @@ require("lazy").setup({
         { type = "padding", val = 1 },
       }
       if #buttons > 0 then
-        layout[#layout + 1] = text({ "recent files" }, "Comment")
+        layout[#layout + 1] = text({ "recent files — press its number to open" }, "Comment")
         layout[#layout + 1] = { type = "group", val = buttons, opts = { spacing = 0 } }
         layout[#layout + 1] = { type = "padding", val = 1 }
       end
