@@ -5,5 +5,5 @@
 # per-machine plugin lockfile
 config/nvim/lazy-lock.json
 
-# personal Claude Code permissions (machine-specific paths)
+# per-machine Claude Code permission overrides (shared rules are settings.json)
 .claude/settings.local.json

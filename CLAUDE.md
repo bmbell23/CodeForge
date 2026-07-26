@@ -13,6 +13,48 @@ client — the IDE must not burn API tokens on its own.
 Work is tracked on the GitHub Project board:
 https://github.com/users/bmbell23/projects/8/views/1 — use `gh` to read/write it.
 
+## Working rules (same process as GreatReads)
+
+Repo: https://github.com/bmbell23/CodeForge · Board: **Project #8 "CodeForge"**
+(https://github.com/users/bmbell23/projects/8)
+
+- **GitHub Issues are the source of truth.** Plans, scoping, next-steps, and status
+  live in issues — never in local planning `.md` files. Read `gh issue list` before
+  starting work; comment/close/edit issues as work moves. The issues — not memory,
+  not docs — are what the next session trusts.
+- **Every issue is tagged `STORY:` or `BUG:`** in three synced places: title prefix,
+  first line of the description, and the `story`/`bug` label.
+- **No work without a ticket.** Create the ticket before touching code.
+- **Board flow, in order: Backlog → Ready → In progress → In review → Done**
+  (this board's names for GreatReads' Scoping → Ready to Implement → …).
+  Never skip columns. New tickets land in Backlog (open questions — ask the user,
+  never build from a guess) or Ready (confidently scoped).
+- **ONE active ticket at a time** in In progress + In Review (committed "watch"
+  tickets sitting in In Review don't count). If the user pivots while an active
+  uncommitted ticket is In Review, STOP and resolve it first.
+- **Any code change → move the ticket to In Review and say so.** In-Review work
+  stays **uncommitted**; uncommitted changes must match the one active ticket.
+- **Done = the user blesses it.** Only then commit.
+- **Builds/installs are explicit:** the launcher runs the *installed* `forge`
+  from the shared clone's release build — if a change only becomes visible after
+  `cargo build --release` or `./scripts/install.sh`, say so plainly and ask who
+  runs it. Never let the user discover a rebuild was needed on their own.
+- **Gated actions (always ask first):** (1) `git commit` / `gvc` / `git push`,
+  (2) reinstalling the shared launcher/binary (`./scripts/install.sh`) — other
+  users ride the shared clone, (3) destructive git ops (`reset --hard`, `clean`,
+  `rm -rf`).
+- Remind the user of In-Review tickets at every task transition.
+
+## Permissions (source-controlled)
+
+The Claude Code permission rules for this repo are **checked in** at
+`.claude/settings.json` — the read-only/build allowlist plus `ask` gates,
+adapted from `GreatReads/.claude/settings.json` and merged with the home-level
+`~/.claude/settings.json` ask rules (git tag, `rm -rf`, `sudo`, docker) so the
+home rules are versioned here too. Per-machine overrides belong in
+`.claude/settings.local.json`, which is gitignored — don't relax the shared
+gates there.
+
 ## Architecture (v0.1)
 
 - `src/main.rs` — the event loop. Spawns a child in a PTY (`portable-pty`),
