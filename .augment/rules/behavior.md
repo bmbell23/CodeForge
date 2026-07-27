@@ -43,9 +43,16 @@ memory, not local docs. The next session trusts the issues.
    `story`/`bug` label.
 3. **Board flow, in order — never skip:**
    **Backlog → Ready → In Progress → In Review → Done.**
-   - **Backlog** — has open questions; ask the user, never build from a guess.
-   - **Ready** — confidently scoped and ready to implement.
-   - **In Progress** — being actively worked. **One at a time.**
+   - **Backlog** — not yet fully scoped or understood. Stays here until the
+     problem is understood and the approach is clear — investigate, ask the
+     user, resolve open questions **here**, never build from a guess. A vague
+     "make X faster" / "fix the lag" report starts in Backlog and is scoped
+     (root cause found, fix approach agreed) before it moves on.
+   - **Ready** — fully scoped and understood; we're confident we can start
+     making code changes. Promote from Backlog to Ready only when that's true.
+   - **In Progress** — being actively worked. **One at a time.** Only ever
+     entered from **Ready** — never move an unscoped Backlog ticket straight
+     to In Progress.
    - **In Review** — believed done; **uncommitted**.
    - **Done** — the user has blessed it; only then commit.
 4. **Scoping can be parallel; implementation is serial.** You may move several
