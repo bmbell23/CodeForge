@@ -982,6 +982,17 @@ local function cf_diff_hunks()
   return hunks, total
 end
 
+-- Hunks change only when the file content does, so cache them on the diff state
+-- and recompute only on open / save (#43). The old code ran `git diff` from
+-- cf_diff_map_refresh, which fires on every WinScrolled — a git subprocess per
+-- wheel notch, the source of the scroll glitchiness.
+local function cf_diff_recompute_hunks()
+  if not cf_diff then
+    return
+  end
+  cf_diff.hunks, cf_diff.total = cf_diff_hunks()
+end
+
 -- The change map: a thin unfocusable float pinned to the right edge, one row
 -- per slice of the file, colored where that slice contains changes. Rebuilt
 -- whole on every refresh — it's tiny.
@@ -1002,7 +1013,15 @@ local function cf_diff_map_refresh()
   if h < 2 or w < 4 then
     return
   end
-  local hunks, total = cf_diff_hunks()
+  -- Use cached hunks (recomputed on open/save); only the thumb below is live
+  -- per scroll. Lazily compute once if the cache is empty (first refresh).
+  if not st.hunks then
+    cf_diff_recompute_hunks()
+  end
+  local hunks, total = st.hunks, st.total
+  if not (hunks and total) then
+    return
+  end
   local rows, marks = {}, {}
   for i = 1, h do
     rows[i] = " "
@@ -1198,12 +1217,17 @@ function _G.CodeForgeDiffOpen(path)
       vim.schedule(cf_diff_map_refresh)
     end,
   })
-  -- Autosave keeps disk current, so the map tracks edits as they land.
+  -- Autosave keeps disk current, so the map tracks edits as they land. This is
+  -- the only place hunks are recomputed (git diff) besides open — scroll/resize
+  -- reuse the cache (#43).
   vim.api.nvim_create_autocmd("BufWritePost", {
     group = aug,
     buffer = right_buf,
     callback = function()
-      vim.schedule(cf_diff_map_refresh)
+      vim.schedule(function()
+        cf_diff_recompute_hunks()
+        cf_diff_map_refresh()
+      end)
     end,
   })
 
