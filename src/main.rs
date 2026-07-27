@@ -616,8 +616,18 @@ fn open_diff_view(
     relayout(&mut w.panes, &w.layout, size.0, size.1.saturating_sub(1))?;
     let txc = tx.clone();
     thread::spawn(move || {
-        while flag.exists() {
-            thread::sleep(Duration::from_millis(200));
+        // Poll the flag. Stepping to the next/prev file (#51) reopens the diff,
+        // which briefly deletes and recreates the flag, so only a *sustained*
+        // absence counts as a real close — a short grace re-check absorbs the
+        // swap blip and avoids a false DiffClosed.
+        loop {
+            if !flag.exists() {
+                thread::sleep(Duration::from_millis(300));
+                if !flag.exists() {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
         }
         let _ = txc.send(Msg::DiffClosed(ed));
     });
@@ -1729,12 +1739,19 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         diff = None;
                     } else {
                         diff = Some(DiffList::new(&windows[cur].dir));
-                        // Land focus on the terminal pane the panel covers so
-                        // the arrow keys drive the list immediately.
+                        let (c, r) = size;
                         let w = &mut windows[cur];
-                        if w.show_shell {
-                            w.focus_id = w.active[1];
+                        // The panel lives over the terminal pane. If that pane is
+                        // hidden the list has no home — it floated mid-screen and
+                        // couldn't take focus to be driven or dismissed (#51). So
+                        // reveal the terminal first, then land focus on it so the
+                        // arrows/Esc drive the list immediately.
+                        if !w.show_shell {
+                            w.show_shell = true;
+                            refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                            relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
                         }
+                        w.focus_id = w.active[1];
                     }
                     dirty = true;
                     needs_clear = true;
@@ -1752,9 +1769,16 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
                         }
                         // The panel persists across the full-screen view;
-                        // refresh it so the counts reflect the edits made.
+                        // refresh it so the counts reflect the edits made, and
+                        // return focus to the panel (over the terminal pane) so
+                        // Esc/arrows drive the list again instead of the editor
+                        // that just had focus for scrolling the diff (#51).
                         if diff.is_some() {
                             diff = Some(DiffList::new(&windows[cur].dir));
+                            let w = &mut windows[cur];
+                            if w.show_shell {
+                                w.focus_id = w.active[1];
+                            }
                         }
                         dirty = true;
                         needs_clear = true;

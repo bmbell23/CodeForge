@@ -1116,6 +1116,30 @@ local function cf_diff_focus_toggle()
   end
 end
 
+-- Step to the next/prev changed file's diff without leaving the view (#51).
+-- Walks the same set the forge diff list shows (`git diff --name-only HEAD`),
+-- wrapping around, and reopens the diff on that file. `]`/`[` are bound to this;
+-- `]c`/`[c` stay the native within-file hunk motions (nvim disambiguates).
+local function cf_diff_step(delta)
+  local st = cf_diff
+  if not st then
+    return
+  end
+  local files = vim.fn.systemlist({ "git", "-C", st.root, "diff", "--name-only", "HEAD" })
+  if not files or #files == 0 then
+    return
+  end
+  local idx = 1
+  for i, f in ipairs(files) do
+    if f == st.rel then
+      idx = i
+      break
+    end
+  end
+  local nxt = ((idx - 1 + delta) % #files) + 1
+  _G.CodeForgeDiffOpen(st.root .. "/" .. files[nxt])
+end
+
 function _G.CodeForgeDiffOpen(path)
   if vim.g.codeforge_diff_tab and vim.api.nvim_tabpage_is_valid(vim.g.codeforge_diff_tab) then
     _G.CodeForgeDiffClose()
@@ -1160,7 +1184,7 @@ function _G.CodeForgeDiffOpen(path)
   -- Label the sides and put the keys where they're discoverable. Softer
   -- filler glyph for lines that only exist on the other side.
   vim.wo[left_win].winbar = "  HEAD · read-only"
-  vim.wo[right_win].winbar = "  %t · Enter unfold · Tab side · Space-z focus · ]c/[c · Esc close"
+  vim.wo[right_win].winbar = "  %t · ]/[ next/prev file · Tab side · Esc list"
   vim.wo[left_win].fillchars = "diff: "
   vim.wo[right_win].fillchars = "diff: "
   -- The global scrolloff (6) pins the cursor that many rows below the top, so
@@ -1201,6 +1225,16 @@ function _G.CodeForgeDiffOpen(path)
       end
     end, { buffer = b, nowait = true, silent = true })
     vim.keymap.set("n", "<leader>z", cf_diff_focus_toggle, { buffer = b, silent = true })
+    -- ] / [ step to the next / prev changed file (#51). `nowait` makes them
+    -- fire immediately: without it nvim waits timeoutlen (1s) to see whether the
+    -- global `]b`/`]d`/`[b`/[d` (bufferline/diagnostics) prefixes follow, which
+    -- made `]` sluggish and `[` feel dead.
+    vim.keymap.set("n", "]", function()
+      cf_diff_step(1)
+    end, { buffer = b, nowait = true, silent = true })
+    vim.keymap.set("n", "[", function()
+      cf_diff_step(-1)
+    end, { buffer = b, nowait = true, silent = true })
     -- Enter toggles the fold under the cursor (diff mode folds the unchanged
     -- stretches); off a fold it keeps its normal meaning.
     vim.keymap.set("n", "<CR>", function()
