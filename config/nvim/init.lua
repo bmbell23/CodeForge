@@ -123,6 +123,10 @@ opt.mouse = "a"
 -- Right-click opens a context menu (PopUp) at the click, moving the cursor there
 -- first so LSP actions target the symbol under the pointer (#31).
 opt.mousemodel = "popup_setpos"
+-- Open that same PopUp menu at the cursor with no mouse (#34). `:popup!` (with
+-- the bang) anchors at the text cursor instead of the mouse pointer; the menu's
+-- LSP entries are the global ones added on LspAttach, so this shares #31's menu.
+vim.keymap.set("n", "<leader>m", "<Cmd>popup! PopUp<CR>", { desc = "Context menu at cursor" })
 opt.clipboard = "unnamedplus"
 opt.ignorecase = true
 opt.smartcase = true
