@@ -607,6 +607,34 @@ require("lazy").setup({
           end)
         end,
       })
+
+      -- Drop the initial empty [No Name] buffer once a real file is open, so it
+      -- doesn't linger as a blank, useless bufferline tab (#33). Only wipes an
+      -- unnamed, unmodified, empty, ordinary buffer shown in no window — never
+      -- the splash (ft=alpha), a terminal, or a real file.
+      vim.api.nvim_create_autocmd("BufReadPost", {
+        callback = function()
+          if vim.api.nvim_buf_get_name(0) == "" or vim.bo.buftype ~= "" then
+            return -- what just opened isn't a real file; nothing to clean up
+          end
+          vim.schedule(function()
+            for _, b in ipairs(vim.api.nvim_list_bufs()) do
+              if
+                vim.api.nvim_buf_is_loaded(b)
+                and vim.bo[b].buflisted
+                and vim.bo[b].buftype == ""
+                and vim.api.nvim_buf_get_name(b) == ""
+                and not vim.bo[b].modified
+                and vim.api.nvim_buf_line_count(b) == 1
+                and (vim.api.nvim_buf_get_lines(b, 0, 1, false)[1] or "") == ""
+                and #vim.fn.win_findbuf(b) == 0
+              then
+                pcall(vim.api.nvim_buf_delete, b, {})
+              end
+            end
+          end)
+        end,
+      })
     end,
   },
 
