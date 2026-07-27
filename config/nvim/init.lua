@@ -120,6 +120,9 @@ local opt = vim.opt
 opt.number = true
 opt.relativenumber = false -- show real (absolute) line numbers on every line
 opt.mouse = "a"
+-- Right-click opens a context menu (PopUp) at the click, moving the cursor there
+-- first so LSP actions target the symbol under the pointer (#31).
+opt.mousemodel = "popup_setpos"
 opt.clipboard = "unnamedplus"
 opt.ignorecase = true
 opt.smartcase = true
@@ -734,18 +737,43 @@ require("lazy").setup({
     },
     config = function()
       require("mason").setup()
+
+      -- Servers to install (Story #11/#31). Mason installs these on first launch.
+      --   rust -> rust_analyzer  python -> pyright   C/C++ -> clangd
+      --   bash -> bashls         perl   -> perlnavigator   lua -> lua_ls
+      --   html/css/json -> vscode-langservers   yaml -> yamlls
+      --   toml -> taplo          markdown -> marksman
+      -- Heavy servers that need a language runtime (Java jdtls, C# omnisharp,
+      -- Ruby, Go gopls) are intentionally left out — install on demand via
+      -- :Mason so a first launch without those runtimes doesn't fail noisily.
+      local want = {
+        "rust_analyzer", "pyright", "clangd", "bashls", "perlnavigator",
+        "lua_ls", "html", "cssls", "jsonls", "yamlls", "taplo", "marksman",
+      }
+
+      -- Only ONE nvim auto-installs. CodeForge runs an nvim per pane/window, and
+      -- all of them firing ensure_installed at once made Mason race — lockfile
+      -- collisions and half-finished npm installs (#35). An atomic mkdir lock
+      -- elects a single installer; the others skip (they'll see the servers once
+      -- the installer finishes). A stale lock (crashed installer) is taken over
+      -- after 10 minutes, and the holder releases it on exit.
+      local lock = vim.fn.stdpath("state") .. "/codeforge-mason-install.lock"
+      local st = vim.loop.fs_stat(lock)
+      if st and (os.time() - st.mtime.sec) > 600 then
+        pcall(vim.fn.delete, lock, "d")
+      end
+      -- mkdir is the atomic election: it *errors* (E739) if the dir already
+      -- exists, so pcall succeeds only for the instance that created it.
+      local installer = pcall(vim.fn.mkdir, lock)
+      if installer then
+        vim.api.nvim_create_autocmd("VimLeavePre", {
+          callback = function()
+            pcall(vim.fn.delete, lock, "d")
+          end,
+        })
+      end
       require("mason-lspconfig").setup({
-        -- The languages we want working out of the box (Story #11). Mason
-        -- installs these servers on first launch; add more here or via :Mason.
-        --   rust  -> rust_analyzer   python -> pyright     C -> clangd
-        --   bash  -> bashls          perl   -> perlnavigator
-        ensure_installed = {
-          "rust_analyzer",
-          "pyright",
-          "clangd",
-          "bashls",
-          "perlnavigator",
-        },
+        ensure_installed = installer and want or {},
       })
 
       -- Buffer-local LSP keymaps, set when a server attaches. Definition /
@@ -762,8 +790,29 @@ require("lazy").setup({
           local peek = function(scope, fallback)
             return has_glance and ("<cmd>Glance " .. scope .. "<cr>") or fallback
           end
+          -- Find callers = references WITHOUT the declaration (Glance/default
+          -- both include it, which is noise when you want callers). If no
+          -- attached server implements references (perlnavigator has no
+          -- referencesProvider — it indexes definitions, not references), fall
+          -- back to a whole-word ripgrep of the symbol so Perl/shell still get
+          -- a usable caller list.
+          local function find_callers()
+            local buf = vim.api.nvim_get_current_buf()
+            local has_refs = false
+            for _, c in pairs(vim.lsp.get_clients({ bufnr = buf })) do
+              if c.server_capabilities and c.server_capabilities.referencesProvider then
+                has_refs = true
+                break
+              end
+            end
+            if has_refs then
+              tb.lsp_references({ include_declaration = false })
+            else
+              tb.grep_string({ word_match = "-w" })
+            end
+          end
           map("gd", peek("definitions", tb.lsp_definitions), "Peek / go to definition")
-          map("gr", peek("references", tb.lsp_references), "Peek references (callers)")
+          map("gr", find_callers, "Find callers (references, no declaration)")
           map("gi", peek("implementations", tb.lsp_implementations), "Peek implementations")
           map("gt", peek("type_definitions", tb.lsp_type_definitions), "Peek type definition")
           -- Direct jump (no popup), for when you know where you're going.
@@ -775,6 +824,23 @@ require("lazy").setup({
           map("<leader>ca", vim.lsp.buf.code_action, "Code action")
           map("[d", vim.diagnostic.goto_prev, "Prev diagnostic")
           map("]d", vim.diagnostic.goto_next, "Next diagnostic")
+
+          -- Right-click context menu (#31): same navigation as the keys above,
+          -- for the symbol under the click (mousemodel=popup_setpos moved the
+          -- cursor there). Glance gives a peek window when installed, else the
+          -- Telescope list — matching gd/gr. Works for every attached server
+          -- (clangd/perlnavigator/rust_analyzer/pyright/bashls).
+          local def_cmd = has_glance and "<Cmd>Glance definitions<CR>"
+            or "<Cmd>lua require('telescope.builtin').lsp_definitions()<CR>"
+          -- Menu strings can't reach the find_callers closure; expose it as a
+          -- buffer-local command so "Find callers" gets the same declaration
+          -- filter + ripgrep fallback as the gr map.
+          vim.api.nvim_buf_create_user_command(ev.buf, "CFFindCallers", find_callers, {})
+          vim.cmd("anoremenu PopUp.-CodeForgeSep- <Nop>")
+          vim.cmd("anoremenu PopUp.Go\\ to\\ definition " .. def_cmd)
+          vim.cmd("anoremenu PopUp.Find\\ callers <Cmd>CFFindCallers<CR>")
+          vim.cmd("anoremenu PopUp.Rename\\ symbol <Cmd>lua vim.lsp.buf.rename()<CR>")
+          vim.cmd("anoremenu PopUp.Code\\ action <Cmd>lua vim.lsp.buf.code_action()<CR>")
         end,
       })
 
@@ -783,7 +849,18 @@ require("lazy").setup({
       if ok then
         local lspconfig = require("lspconfig")
         for _, server in ipairs(mlsp.get_installed_servers()) do
-          lspconfig[server].setup({})
+          local opts = {}
+          if server == "lua_ls" then
+            -- Editing this Neovim config is Lua: recognise the `vim` global so it
+            -- isn't flagged undefined, and don't prompt about third-party libs.
+            opts.settings = {
+              Lua = {
+                diagnostics = { globals = { "vim" } },
+                workspace = { checkThirdParty = false },
+              },
+            }
+          end
+          lspconfig[server].setup(opts)
         end
       end
     end,
