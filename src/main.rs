@@ -821,6 +821,18 @@ fn respawn_pane(
     }
 }
 
+/// The AI command for a *fresh* session — no `--resume`/`--continue` (#49). The
+/// first AI pane resumes the prior conversation (which we like), but a new AI
+/// tab should start clean. For claude we drop any resume/continue flags that got
+/// appended to `cfg.ai`; other CLIs relaunch as configured.
+fn fresh_ai_cmd(cfg: &Config) -> String {
+    if cfg.ai.trim_start().starts_with("claude") {
+        "claude".to_string()
+    } else {
+        cfg.ai.clone()
+    }
+}
+
 /// Build a command from a whitespace-separated command line (program + args),
 /// running in `cwd`. Returns the builder and a short title (the program name).
 /// nvim gets NVIM_APPNAME so it loads CodeForge's isolated config.
@@ -1827,7 +1839,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                     tx.clone(),
                                 )?
                             } else {
-                                let (cmd, title) = command_line(&cfg.ai, &dir);
+                                // A new AI tab starts a fresh session, not a
+                                // resume of the first tab's conversation (#49).
+                                let (cmd, title) = command_line(&fresh_ai_cmd(&cfg), &dir);
                                 Pane::spawn(cmd, title, PaneRole::Ai, 1, 1, id, tx.clone())?
                             };
                             w.panes.push(pane);
@@ -3581,6 +3595,18 @@ mod tests {
         let p4 = d.frame(&at('B'), 20, 5, true);
         assert!(p4.windows(1).any(|w| w == b"B"), "force_full repaints");
         assert!(p4.len() > p3.len(), "forced full is larger than a diff");
+    }
+
+    #[test]
+    fn fresh_ai_drops_resume_flags() {
+        let mk = |ai: &str| Config {
+            ai: ai.into(),
+            ..Config::default()
+        };
+        // #49: a new AI tab is fresh — resume/continue flags are dropped.
+        assert_eq!(fresh_ai_cmd(&mk("claude --continue")), "claude");
+        assert_eq!(fresh_ai_cmd(&mk("claude")), "claude");
+        assert_eq!(fresh_ai_cmd(&mk("augment")), "augment"); // non-claude as-is
     }
 
     #[test]
