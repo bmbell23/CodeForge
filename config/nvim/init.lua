@@ -12,6 +12,12 @@
 vim.g.mapleader = " "
 vim.g.maplocalleader = " "
 
+-- Filetype overrides. Neovim defaults `.pt` to html (Template Toolkit), but in
+-- the Janus codebase `.pt` files are Perl — map them so perlnavigator attaches
+-- and go-to-def / find-callers work (#37). Override in a local config if your
+-- `.pt` files really are templates.
+vim.filetype.add({ extension = { pt = "perl" } })
+
 -- Editor keybindings, injected by CodeForge from config.toml's [editor_keys]
 -- via the CODEFORGE_EDITOR_KEYS env var as `name=token` lines (#28). One place
 -- feeds both the finder/explorer/tab maps and the splash cheatsheet, so a rebind
