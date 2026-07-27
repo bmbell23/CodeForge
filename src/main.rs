@@ -736,6 +736,14 @@ fn build_editor(
     }
     if is_nvim {
         c.env("NVIM_APPNAME", "codeforge");
+        // Editor keybinds (open file, explorer, tab cycling, …) flow to init.lua
+        // as `name=token` lines so the finder maps and the splash cheatsheet read
+        // from config.toml's [editor_keys] (#28).
+        c.env("CODEFORGE_EDITOR_KEYS", cfg.editor_keys.env_string());
+        // The prefix + its bindings, so the splash's "Ctrl-a …" cheatsheet shows
+        // the live keys after a rebind rather than the hardcoded defaults (#28).
+        c.env("CODEFORGE_PREFIX", &cfg.prefix);
+        c.env("CODEFORGE_PREFIX_KEYS", cfg.keys.env_string());
         let sock = nvim_sock(id);
         let _ = std::fs::remove_file(&sock); // stale socket blocks --listen
         let _ = std::fs::remove_file(diff_flag(id)); // stale diff flag (#18)
@@ -1005,6 +1013,17 @@ fn socket_path() -> PathBuf {
 /// conversations).
 fn spawn_server(dirs: &[PathBuf]) -> Result<()> {
     let exe = std::env::current_exe().context("finding own executable")?;
+    // Re-exec the freshly-built binary by its stable path, not the inode we're
+    // running. A `cargo build --release` replaces `target/release/forge` with a
+    // new inode; the running process keeps the old one open (on NFS it's
+    // silly-renamed to `.nfsXXXX`, on local fs Linux marks it " (deleted)"), so
+    // `current_exe()` points at the stale binary. Re-launching `<dir>/forge`
+    // instead means `Ctrl-a r` (reload) actually picks up the latest build.
+    let exe = exe
+        .parent()
+        .map(|d| d.join("forge"))
+        .filter(|p| p.is_file())
+        .unwrap_or(exe);
     let mut cmd = Command::new("setsid");
     cmd.arg(exe).arg("--server");
     for d in dirs {
@@ -1055,6 +1074,10 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // Shared so the `Ctrl-a ?` editor can rebind keys live: reader-thread
     // parsers and the event loop all see the same mapping.
     let keys = Arc::new(Mutex::new(cfg.keys));
+    // Editor bindings edited in the `Ctrl-a ?` overlay: the overlay shows the
+    // pending value here and persists to config.toml; nvim picks it up on reload
+    // (#28). Kept beside `keys` so the overlay has one place to read/write.
+    let editor_keys = Arc::new(Mutex::new(cfg.editor_keys.clone()));
     let shell = cfg
         .shell
         .clone()
@@ -1286,7 +1309,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     } else if let Some(h) = help.as_mut() {
                         // The help overlay is modal: it captures keystrokes for
                         // navigation / live rebinding instead of the focused pane.
-                        if help_input(h, &bytes, &keys) {
+                        if help_input(h, &bytes, &keys, &editor_keys) {
                             help = None;
                             needs_clear = true;
                         }
@@ -1981,6 +2004,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 let right_info = segs.join("  ");
                 framebuf.clear();
                 let ksnap = *keys.lock().unwrap();
+                let eksnap = editor_keys.lock().unwrap().clone();
                 // The diff panel hides while this window is zoomed for the
                 // full-screen view (its home, the terminal pane, is hidden).
                 let dl = if diff_zoom
@@ -2004,6 +2028,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dl,
                     &right_info,
                     ksnap,
+                    &eksnap,
                     msel.as_ref().map(|m| {
                         let (s, e) = m.range();
                         (m.pane_id, s, e)
@@ -2363,6 +2388,7 @@ fn render(
     diff: Option<&DiffList>,
     right_info: &str,
     keys: Keys,
+    editor_keys: &config::EditorKeys,
     msel: Option<Sel>,
 ) -> Result<()> {
     let w = &windows[cur];
@@ -2441,7 +2467,7 @@ fn render(
     }
 
     if let Some(h) = help {
-        draw_help(out, cols, rows, keys, h)?;
+        draw_help(out, cols, rows, keys, editor_keys, h)?;
     }
     if let Some(pk) = picker {
         pk.render(out, cols, rows)?;
@@ -2514,17 +2540,57 @@ fn draw_status(
     Ok(())
 }
 
+/// What the overlay is currently capturing for a rebind.
+enum Capture {
+    /// Not capturing.
+    None,
+    /// Waiting for a single printable key — a prefix (`Ctrl-a X`) binding.
+    Char,
+    /// Typing a token (e.g. `C-p`, `Space e`) — an editor binding. The text
+    /// accumulates in `HelpState::text_buf`.
+    Text,
+}
+
+/// Which key surface a selectable overlay row belongs to.
+enum EditKind {
+    /// A prefix binding: single char, rebinds live.
+    Prefix,
+    /// An editor (Neovim) binding: a token persisted to `[editor_keys]`, applied
+    /// on the next reload (`Ctrl-a r`).
+    Editor,
+}
+
+/// The selectable (editable) rows of the overlay, in display order: the prefix
+/// bindings followed by the editor bindings. `HelpState::sel` indexes this list;
+/// fixed/read-only rows are drawn but never selected.
+fn editable_rows() -> Vec<(EditKind, &'static str, &'static str)> {
+    let mut v = Vec::new();
+    for (f, l) in config::EDITABLE.iter() {
+        v.push((EditKind::Prefix, *f, *l));
+    }
+    for (f, l) in config::EDITOR_EDITABLE.iter() {
+        v.push((EditKind::Editor, *f, *l));
+    }
+    v
+}
+
 /// State of the `Ctrl-a ?` overlay. It starts as a read-only key reference and
-/// can flip into an inline editor that rebinds keys live (Story #10).
+/// can flip into an inline editor that rebinds keys (Story #10 / #28).
 struct HelpState {
     /// In the editor (rows selectable) vs. just viewing the reference.
     editing: bool,
-    /// Selected row, an index into `config::EDITABLE`.
+    /// Selected row, an index into `editable_rows()`.
     sel: usize,
-    /// Waiting to capture the next printable keypress as the new binding.
-    capturing: bool,
+    /// What, if anything, we're capturing for the selected row.
+    capture: Capture,
+    /// Token being typed while `capture == Text`.
+    text_buf: String,
     /// Transient status / error line shown at the bottom.
     msg: String,
+    /// First visible body row — the overlay scrolls because the full key list is
+    /// taller than most terminals. Set by `draw_help` (which knows the height) to
+    /// keep the selected row visible; nudged directly for view-mode scrolling.
+    scroll: std::cell::Cell<usize>,
 }
 
 impl HelpState {
@@ -2532,8 +2598,10 @@ impl HelpState {
         HelpState {
             editing: false,
             sel: 0,
-            capturing: false,
+            capture: Capture::None,
+            text_buf: String::new(),
             msg: String::new(),
+            scroll: std::cell::Cell::new(0),
         }
     }
 }
@@ -2544,6 +2612,7 @@ enum HelpKey {
     Down,
     Enter,
     Esc,
+    Backspace,
     Char(char),
 }
 
@@ -2570,6 +2639,7 @@ fn decode_help_keys(bytes: &[u8]) -> Vec<HelpKey> {
         }
         match b {
             b'\r' | b'\n' => v.push(HelpKey::Enter),
+            0x7f | 0x08 => v.push(HelpKey::Backspace),
             0x20..=0x7e => v.push(HelpKey::Char(b as char)),
             _ => {}
         }
@@ -2581,59 +2651,108 @@ fn decode_help_keys(bytes: &[u8]) -> Vec<HelpKey> {
 /// Drive the help overlay from user input. Mutates `h`, applies committed
 /// rebinds to the shared `keys` (effective immediately) and persists them.
 /// Returns true when the overlay should close.
-fn help_input(h: &mut HelpState, bytes: &[u8], keys: &Arc<Mutex<Keys>>) -> bool {
+fn help_input(
+    h: &mut HelpState,
+    bytes: &[u8],
+    keys: &Arc<Mutex<Keys>>,
+    ekeys: &Arc<Mutex<config::EditorKeys>>,
+) -> bool {
+    let rows = editable_rows();
+    let n = rows.len();
     for ev in decode_help_keys(bytes) {
-        if h.capturing {
-            match ev {
+        match h.capture {
+            // Capturing a single key for a prefix (Ctrl-a X) binding: applied live.
+            Capture::Char => match ev {
                 HelpKey::Esc => {
-                    h.capturing = false;
+                    h.capture = Capture::None;
                     h.msg = "cancelled".into();
                 }
                 HelpKey::Char(c) => {
-                    let field = config::EDITABLE[h.sel].0;
+                    let field = rows[h.sel].1;
                     let cur = *keys.lock().unwrap();
                     match cur.with_bind(field, c) {
                         Ok(nk) => {
                             *keys.lock().unwrap() = nk; // live: reader threads see it
                             config::persist_keybind(field, c); // survive restart
-                            h.capturing = false;
+                            h.capture = Capture::None;
                             h.msg = format!("bound {field} to '{c}'");
                         }
                         Err(e) => h.msg = e, // stay capturing so they can retry
                     }
                 }
                 _ => h.msg = "press a printable key (Esc to cancel)".into(),
-            }
-            continue;
-        }
-        if !h.editing {
-            match ev {
-                HelpKey::Esc => return true,
-                HelpKey::Char('e') | HelpKey::Char('E') => {
-                    h.editing = true;
-                    h.msg.clear();
-                }
-                // 'q' or the (current) help key also closes.
-                HelpKey::Char(c) if c == 'q' || c == keys.lock().unwrap().help => {
-                    return true;
-                }
-                _ => {}
-            }
-        } else {
-            let n = config::EDITABLE.len();
-            match ev {
+            },
+            // Typing a token for an editor binding: persisted; applied on reload.
+            Capture::Text => match ev {
                 HelpKey::Esc => {
-                    h.editing = false;
-                    h.msg.clear();
+                    h.capture = Capture::None;
+                    h.text_buf.clear();
+                    h.msg = "cancelled".into();
                 }
-                HelpKey::Up | HelpKey::Char('k') => h.sel = (h.sel + n - 1) % n,
-                HelpKey::Down | HelpKey::Char('j') => h.sel = (h.sel + 1) % n,
+                HelpKey::Backspace => {
+                    h.text_buf.pop();
+                }
+                HelpKey::Char(c) => h.text_buf.push(c),
                 HelpKey::Enter => {
-                    h.capturing = true;
-                    h.msg = format!("press new key for {}", config::EDITABLE[h.sel].1);
+                    let field = rows[h.sel].1;
+                    match config::validate_editor_token(&h.text_buf) {
+                        Ok(tok) => {
+                            ekeys.lock().unwrap().set(field, tok.clone());
+                            config::persist_editor_key(field, &tok);
+                            h.capture = Capture::None;
+                            h.text_buf.clear();
+                            h.msg = format!(
+                                "{field} = {} · Ctrl-a r to apply",
+                                config::disp_token(&tok)
+                            );
+                        }
+                        Err(e) => h.msg = e, // stay in text entry to fix it
+                    }
                 }
-                HelpKey::Char('q') => return true,
                 _ => {}
+            },
+            Capture::None => {
+                if !h.editing {
+                    match ev {
+                        HelpKey::Esc => return true,
+                        HelpKey::Char('e') | HelpKey::Char('E') => {
+                            h.editing = true;
+                            h.msg.clear();
+                        }
+                        // View-mode scroll (draw_help clamps to range).
+                        HelpKey::Up | HelpKey::Char('k') => {
+                            h.scroll.set(h.scroll.get().saturating_sub(1))
+                        }
+                        HelpKey::Down | HelpKey::Char('j') => h.scroll.set(h.scroll.get() + 1),
+                        // 'q' or the (current) help key also closes.
+                        HelpKey::Char(c) if c == 'q' || c == keys.lock().unwrap().help => {
+                            return true;
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match ev {
+                        HelpKey::Esc => {
+                            h.editing = false;
+                            h.msg.clear();
+                        }
+                        HelpKey::Up | HelpKey::Char('k') => h.sel = (h.sel + n - 1) % n,
+                        HelpKey::Down | HelpKey::Char('j') => h.sel = (h.sel + 1) % n,
+                        HelpKey::Enter => match rows[h.sel].0 {
+                            EditKind::Prefix => {
+                                h.capture = Capture::Char;
+                                h.msg = format!("press new key for {}", rows[h.sel].2);
+                            }
+                            EditKind::Editor => {
+                                h.capture = Capture::Text;
+                                h.text_buf.clear();
+                                h.msg = format!("type token for {}", rows[h.sel].2);
+                            }
+                        },
+                        HelpKey::Char('q') => return true,
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -2987,103 +3106,199 @@ fn draw_copy_overlay(
     Ok(())
 }
 
-/// Draw the centered `Ctrl-a ?` overlay — a key reference, or the inline key
-/// editor when `h.editing`. Keys come from the live (possibly just-rebound)
-/// config so the display always reflects the current mapping.
-fn draw_help(out: &mut Vec<u8>, cols: u16, rows: u16, k: Keys, h: &HelpState) -> Result<()> {
-    // (text, is-the-selected-editor-row).
-    let mut lines: Vec<(String, bool)> = Vec::new();
-    let title = if h.editing {
-        "  CodeForge — edit keys (prefix Ctrl-a)"
+/// Print one overlay cell: `s` padded (or truncated) to `w` columns, inverted
+/// when it's the selected row. Assumes the box's black-on-cyan is already set.
+fn print_cell(out: &mut Vec<u8>, s: &str, w: usize, sel: bool) -> Result<()> {
+    let n = s.chars().count();
+    let t: String = if n >= w {
+        s.chars().take(w).collect()
     } else {
-        "  CodeForge — keys (prefix Ctrl-a)"
+        format!("{}{}", s, " ".repeat(w - n))
     };
-    lines.push((title.to_string(), false));
-    lines.push((String::new(), false));
+    if sel {
+        queue!(
+            out,
+            SetAttribute(Attribute::Reverse),
+            Print(&t),
+            SetAttribute(Attribute::Reset),
+            SetForegroundColor(Color::Black),
+            SetBackgroundColor(Color::Cyan)
+        )?;
+    } else {
+        queue!(out, Print(&t))?;
+    }
+    Ok(())
+}
+
+/// Draw the centered `Ctrl-a ?` overlay — a key reference, or the inline key
+/// editor when `h.editing`. Two columns (prefix left; editor + fixed right) so
+/// the whole key set fits without a tiny scrolling box. Keys come from the live
+/// (possibly just-rebound) config so the display always reflects the mapping.
+fn draw_help(
+    out: &mut Vec<u8>,
+    cols: u16,
+    rows: u16,
+    k: Keys,
+    ek: &config::EditorKeys,
+    h: &HelpState,
+) -> Result<()> {
+    let title = if h.editing {
+        " CodeForge — edit keys"
+    } else {
+        " CodeForge — keys"
+    };
+    let capturing = !matches!(h.capture, Capture::None);
+    let p = config::EDITABLE.len();
+
+    // Left column: prefix bindings (single char after Ctrl-a, rebound live).
+    let mut left: Vec<(String, bool)> = Vec::new();
+    left.push(("Prefix — Ctrl-a + key".to_string(), false));
     for (i, (field, label)) in config::EDITABLE.iter().enumerate() {
         let key = k.get(field).map(|c| c.to_string()).unwrap_or_default();
-        let marker = if h.editing && i == h.sel { "›" } else { " " };
-        let selected = h.editing && i == h.sel;
-        lines.push((format!(" {marker} Ctrl-a {key:<3}  {label}"), selected));
-    }
-    lines.push((String::new(), false));
-    lines.push(("   Ctrl-a 1..9  jump to window".to_string(), false));
-    lines.push(("   click / wheel focus / scroll".to_string(), false));
-    lines.push((String::new(), false));
-    let footer = if h.capturing {
-        format!("  {}", h.msg)
-    } else if h.editing {
-        "  ↑/↓ select · Enter rebind · Esc back".to_string()
-    } else {
-        "  e edit keys · Esc/q close".to_string()
-    };
-    lines.push((footer, false));
-    if !h.msg.is_empty() && !h.capturing {
-        lines.push((format!("  {}", h.msg), false));
+        let sel = h.editing && i == h.sel;
+        let marker = if sel { "›" } else { " " };
+        left.push((format!("{marker} Ctrl-a {key:<2}  {label}"), sel));
     }
 
-    // Never vanish on a short/narrow terminal: clamp instead of bailing. The
-    // editable key rows come first, so if anything is dropped it's the trailing
-    // info/footer lines, not a binding you're trying to see or rebind.
-    let max_lines = rows.saturating_sub(2) as usize;
-    if lines.len() > max_lines && max_lines > 0 {
-        lines.truncate(max_lines);
+    // Right column: editor bindings (typed tokens, applied on reload) then the
+    // fixed reference rows.
+    let mut right: Vec<(String, bool)> = Vec::new();
+    right.push(("Editor (Neovim) — Ctrl-a r to apply".to_string(), false));
+    for (j, (field, label)) in config::EDITOR_EDITABLE.iter().enumerate() {
+        let sel = h.editing && p + j == h.sel;
+        let marker = if sel { "›" } else { " " };
+        let shown = if sel && matches!(h.capture, Capture::Text) {
+            format!("{}_", h.text_buf) // live text entry
+        } else {
+            config::disp_token(ek.get(field).unwrap_or(""))
+        };
+        right.push((format!("{marker} {shown:<14} {label}"), sel));
     }
-    let max_w = cols.saturating_sub(2) as usize;
-    for (l, _) in lines.iter_mut() {
-        if l.chars().count() > max_w {
-            *l = l.chars().take(max_w).collect();
+    right.push((String::new(), false));
+    right.push(("Fixed".to_string(), false));
+    right.push(("  Ctrl-a 1..9    jump to window".to_string(), false));
+    right.push(("  click / wheel  focus / scroll".to_string(), false));
+    right.push((
+        "  gd gr gi gt    definition/refs/impl/type".to_string(),
+        false,
+    ));
+    right.push(("  K              hover docs".to_string(), false));
+    right.push(("  Space rn / ca  rename / code action".to_string(), false));
+
+    // The paired row of the current selection (columns share row numbers).
+    let sel_row = if !h.editing {
+        None
+    } else if h.sel < p {
+        Some(h.sel + 1)
+    } else {
+        Some(h.sel - p + 1)
+    };
+
+    let footer = match h.capture {
+        Capture::Char => format!(" {}", h.msg),
+        Capture::Text => " type e.g. Ctrl-p or Space e · Enter save · Esc cancel".to_string(),
+        Capture::None if h.editing => " ↑/↓ select · Enter rebind · Esc back".to_string(),
+        Capture::None => " ↑/↓ scroll · e edit · Esc/q close".to_string(),
+    };
+    let msg_line = (!h.msg.is_empty() && !capturing).then(|| format!(" {}", h.msg));
+
+    // Geometry. Two columns padded to their own widths, joined by a gap; the box
+    // is as wide as the content (clamped to the screen) — no cramped single col.
+    let n = left.len().max(right.len());
+    let lw = left
+        .iter()
+        .map(|(s, _)| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    let rw = right
+        .iter()
+        .map(|(s, _)| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    const GAP: usize = 3;
+    let foot_h = 1 + msg_line.is_some() as usize;
+    // Rows available for the paired list, after borders + title + footer.
+    let vh = (rows as usize).saturating_sub(2 + 1 + foot_h).max(1);
+    let shown = n.min(vh);
+    let max_scroll = n.saturating_sub(shown);
+    let mut scroll = h.scroll.get().min(max_scroll);
+    if let Some(sr) = sel_row {
+        if sr < scroll {
+            scroll = sr;
+        } else if sr >= scroll + shown {
+            scroll = sr + 1 - shown;
         }
     }
-    let w = (lines
-        .iter()
-        .map(|(l, _)| l.chars().count())
-        .max()
-        .unwrap_or(0) as u16
-        + 2)
-    .min(cols);
-    let bh = (lines.len() as u16 + 2).min(rows);
-    if w < 2 || bh < 2 {
+    scroll = scroll.min(max_scroll);
+    h.scroll.set(scroll);
+
+    let inner = (lw + GAP + rw)
+        .max(title.chars().count())
+        .max(footer.chars().count())
+        .min((cols as usize).saturating_sub(2));
+    let rw_eff = rw.min(inner.saturating_sub(lw + GAP));
+    let w = (inner + 2) as u16;
+    let bh = (2 + 1 + shown + foot_h) as u16;
+    if w < 4 || bh < 4 {
         return Ok(());
     }
-    let x = (cols - w) / 2;
-    let y = (rows - bh) / 2;
+    let x = (cols.saturating_sub(w)) / 2;
+    let y = (rows.saturating_sub(bh)) / 2;
 
     queue!(
         out,
         cursor::Hide,
         SetForegroundColor(Color::Black),
-        SetBackgroundColor(Color::Cyan)
+        SetBackgroundColor(Color::Cyan),
+        cursor::MoveTo(x, y),
+        Print(format!("┌{}┐", "─".repeat(inner))),
     )?;
+    // Title.
     queue!(
         out,
-        cursor::MoveTo(x, y),
-        Print(format!("┌{}┐", "─".repeat((w - 2) as usize)))
+        cursor::MoveTo(x, y + 1),
+        Print("│"),
+        SetAttribute(Attribute::Bold)
     )?;
-    for (i, (line, selected)) in lines.iter().enumerate() {
-        let padded = format!("{line:<width$}", width = (w - 2) as usize);
-        queue!(out, cursor::MoveTo(x, y + 1 + i as u16), Print("│"))?;
-        if *selected {
-            // Invert (black-on-cyan -> cyan-on-black) to mark the selected row.
-            queue!(
-                out,
-                SetAttribute(Attribute::Reverse),
-                Print(&padded),
-                SetAttribute(Attribute::Reset),
-                SetForegroundColor(Color::Black),
-                SetBackgroundColor(Color::Cyan)
-            )?;
-        } else {
-            queue!(out, Print(&padded))?;
+    print_cell(out, title, inner, false)?;
+    queue!(
+        out,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::Black),
+        SetBackgroundColor(Color::Cyan),
+        Print("│")
+    )?;
+    // Two-column list rows.
+    for (ri, r) in (scroll..scroll + shown).enumerate() {
+        let (ls, lsel) = left.get(r).cloned().unwrap_or_default();
+        let (rs, rsel) = right.get(r).cloned().unwrap_or_default();
+        queue!(out, cursor::MoveTo(x, y + 2 + ri as u16), Print("│"))?;
+        print_cell(out, &ls, lw, lsel)?;
+        queue!(out, Print(" ".repeat(GAP)))?;
+        print_cell(out, &rs, rw_eff, rsel)?;
+        // Pad any remaining width (when the box is wider than the two columns).
+        let used = lw + GAP + rw_eff;
+        if inner > used {
+            queue!(out, Print(" ".repeat(inner - used)))?;
         }
+        queue!(out, Print("│"))?;
+    }
+    // Footer (+ optional status line).
+    queue!(out, cursor::MoveTo(x, y + 2 + shown as u16), Print("│"))?;
+    print_cell(out, &footer, inner, false)?;
+    queue!(out, Print("│"))?;
+    if let Some(m) = &msg_line {
+        queue!(out, cursor::MoveTo(x, y + 3 + shown as u16), Print("│"))?;
+        print_cell(out, m, inner, false)?;
         queue!(out, Print("│"))?;
     }
     queue!(
         out,
         cursor::MoveTo(x, y + bh - 1),
-        Print(format!("└{}┘", "─".repeat((w - 2) as usize)))
+        Print(format!("└{}┘", "─".repeat(inner))),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
     )?;
-    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
     Ok(())
 }
 
@@ -3362,15 +3577,36 @@ mod tests {
     #[test]
     fn help_overlay_navigation() {
         let keys = Arc::new(Mutex::new(Keys::default()));
+        let ekeys = Arc::new(Mutex::new(config::EditorKeys::default()));
         let mut h = HelpState::new();
         // 'e' enters edit mode; Down moves the selection; Esc leaves edit mode.
-        assert!(!help_input(&mut h, b"e", &keys));
+        assert!(!help_input(&mut h, b"e", &keys, &ekeys));
         assert!(h.editing);
-        assert!(!help_input(&mut h, b"\x1b[B", &keys));
+        assert!(!help_input(&mut h, b"\x1b[B", &keys, &ekeys));
         assert_eq!(h.sel, 1);
-        assert!(!help_input(&mut h, &[0x1b], &keys));
+        assert!(!help_input(&mut h, &[0x1b], &keys, &ekeys));
         assert!(!h.editing);
         // Esc in view mode closes the overlay.
-        assert!(help_input(&mut h, &[0x1b], &keys));
+        assert!(help_input(&mut h, &[0x1b], &keys, &ekeys));
+    }
+
+    #[test]
+    fn help_overlay_edits_editor_key_by_token() {
+        let keys = Arc::new(Mutex::new(Keys::default()));
+        let ekeys = Arc::new(Mutex::new(config::EditorKeys::default()));
+        let mut h = HelpState::new();
+        h.editing = true;
+        // Select the first editor row (open_file), just past the prefix rows.
+        h.sel = config::EDITABLE.len();
+        // Enter starts token entry; typing + Backspace edits the buffer.
+        assert!(!help_input(&mut h, b"\r", &keys, &ekeys));
+        assert!(matches!(h.capture, Capture::Text));
+        help_input(&mut h, b"C-x", &keys, &ekeys);
+        help_input(&mut h, &[0x7f], &keys, &ekeys); // backspace the 'x'
+        help_input(&mut h, b"o", &keys, &ekeys);
+        // Enter commits: the editor key is updated in the shared state.
+        assert!(!help_input(&mut h, b"\r", &keys, &ekeys));
+        assert!(matches!(h.capture, Capture::None));
+        assert_eq!(ekeys.lock().unwrap().open_file, "C-o");
     }
 }

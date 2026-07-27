@@ -12,6 +12,103 @@
 vim.g.mapleader = " "
 vim.g.maplocalleader = " "
 
+-- Editor keybindings, injected by CodeForge from config.toml's [editor_keys]
+-- via the CODEFORGE_EDITOR_KEYS env var as `name=token` lines (#28). One place
+-- feeds both the finder/explorer/tab maps and the splash cheatsheet, so a rebind
+-- can't leave the splash showing a stale key. Falls back to the built-in tokens
+-- when the env is absent (e.g. nvim launched outside CodeForge).
+local CFKeys = {}
+do
+  local defaults = {
+    open_file = "Ctrl-p",
+    search_in_file = "Ctrl-f",
+    search_repo = "Ctrl-Shift-f",
+    explorer = "Space e",
+    close_tab = "Space b d",
+    file_history = "Space g h",
+  }
+  local raw = vim.env.CODEFORGE_EDITOR_KEYS
+  if raw then
+    for line in raw:gmatch("[^\n]+") do
+      local k, v = line:match("^(%S+)=(.+)$")
+      if k and v and v ~= "" then
+        defaults[k] = vim.trim(v)
+      end
+    end
+  end
+
+  -- One token atom -> nvim lhs piece. Notation: a modifier joins its key with
+  -- "-" (Ctrl-p / Ctrl-Shift-f, short C-/S- also accepted); "Space" is the
+  -- leader; anything else is a literal key.
+  local function atom_lhs(a)
+    if a == "Space" or a == "space" then
+      return "<leader>"
+    end
+    local short = a:gsub("Ctrl%-", "C-"):gsub("Shift%-", "S-"):gsub("Alt%-", "A-"):gsub("Meta%-", "M-")
+    if short:match("^[CSAM]%-") then
+      return "<" .. short .. ">"
+    end
+    return a
+  end
+
+  -- Token -> nvim keymap lhs. Space-separated atoms concatenate: "Space e" ->
+  -- "<leader>e", "Space b d" -> "<leader>bd", "Ctrl-p" -> "<C-p>".
+  local function to_lhs(tok)
+    local parts = {}
+    for a in vim.gsplit(vim.trim(tok), "%s+") do
+      if a ~= "" then
+        parts[#parts + 1] = atom_lhs(a)
+      end
+    end
+    return table.concat(parts, "")
+  end
+
+  -- Token -> human display: expand short modifier forms, leave the rest (long
+  -- forms and spaced sequences) as-is. "C-p" -> "Ctrl-p", "Space b d" unchanged.
+  local function to_disp(tok)
+    tok = vim.trim(tok)
+    tok = tok:gsub("C%-", "Ctrl-"):gsub("S%-", "Shift-"):gsub("A%-", "Alt-"):gsub("M%-", "Meta-")
+    return tok
+  end
+
+  CFKeys.tok = defaults
+  CFKeys.lhs = function(name)
+    return to_lhs(defaults[name])
+  end
+  CFKeys.disp = function(name)
+    return to_disp(defaults[name])
+  end
+
+  -- CodeForge prefix bindings (the "Ctrl-a X" keys), injected the same way, so
+  -- the splash cheatsheet's prefix keys stay live after a Ctrl-a ? rebind.
+  local prefix = to_disp(vim.env.CODEFORGE_PREFIX or "C-a")
+  local pkeys = {
+    toggle_editor = "e", toggle_shell = "t", toggle_ai = "c",
+    git_diff = "g", win_new = "n", copy = "v", help = "?",
+    tab_next = "]", tab_prev = "[",
+    focus_left = "h", focus_down = "j", focus_up = "k", focus_right = "l",
+  }
+  local praw = vim.env.CODEFORGE_PREFIX_KEYS
+  if praw then
+    for line in praw:gmatch("[^\n]+") do
+      local k, v = line:match("^(%S+)=(.+)$")
+      if k and v and v ~= "" then
+        pkeys[k] = v
+      end
+    end
+  end
+  CFKeys.prefix = prefix
+  -- Display a prefix binding, e.g. "Ctrl-a g". Pass several names to join their
+  -- keys after one prefix, e.g. pdisp("toggle_editor","toggle_shell") -> "Ctrl-a e/t".
+  CFKeys.pdisp = function(...)
+    local parts = {}
+    for _, name in ipairs({ ... }) do
+      parts[#parts + 1] = pkeys[name] or "?"
+    end
+    return prefix .. " " .. table.concat(parts, "/")
+  end
+end
+
 -- Sensible baseline.
 local opt = vim.opt
 opt.number = true
@@ -85,9 +182,9 @@ require("lazy").setup({
       --   Ctrl-F        search within the current file
       --   Ctrl-Shift-F  search the whole repo (needs a terminal that sends the
       --                 Shift chord; <leader>fg always works as a fallback)
-      vim.keymap.set({ "n", "i" }, "<C-p>", t.find_files, { desc = "Open file" })
-      vim.keymap.set({ "n", "i" }, "<C-f>", t.current_buffer_fuzzy_find, { desc = "Search in file" })
-      vim.keymap.set({ "n", "i" }, "<C-S-f>", t.live_grep, { desc = "Search repo" })
+      vim.keymap.set({ "n", "i" }, CFKeys.lhs("open_file"), t.find_files, { desc = "Open file" })
+      vim.keymap.set({ "n", "i" }, CFKeys.lhs("search_in_file"), t.current_buffer_fuzzy_find, { desc = "Search in file" })
+      vim.keymap.set({ "n", "i" }, CFKeys.lhs("search_repo"), t.live_grep, { desc = "Search repo" })
       vim.keymap.set("n", "<leader>ff", t.find_files, { desc = "Find files" })
       vim.keymap.set("n", "<leader>fg", t.live_grep, { desc = "Find all (grep repo)" })
       vim.keymap.set("n", "<leader>fb", t.buffers, { desc = "Find buffers" })
@@ -116,7 +213,7 @@ require("lazy").setup({
     },
     config = function(_, opts)
       require("oil").setup(opts)
-      vim.keymap.set("n", "<leader>e", "<cmd>Oil<cr>", { desc = "File explorer" })
+      vim.keymap.set("n", CFKeys.lhs("explorer"), "<cmd>Oil<cr>", { desc = "File explorer" })
       vim.keymap.set("n", "-", "<cmd>Oil<cr>", { desc = "Open parent dir" })
     end,
   },
@@ -140,6 +237,8 @@ require("lazy").setup({
         },
       })
       -- Cycle / reorder / close buffers. ]b [b move; <leader>bp pins a picker.
+      -- Next/prev tab primarily use the CodeForge prefix keys (Ctrl-a ] / [),
+      -- which cycle these same buffers over RPC. Keep ]b/[b as in-nvim aliases.
       vim.keymap.set("n", "]b", "<cmd>BufferLineCycleNext<cr>", { desc = "Next buffer/tab" })
       vim.keymap.set("n", "[b", "<cmd>BufferLineCyclePrev<cr>", { desc = "Prev buffer/tab" })
       vim.keymap.set("n", "<S-l>", "<cmd>BufferLineCycleNext<cr>", { desc = "Next buffer/tab" })
@@ -148,7 +247,7 @@ require("lazy").setup({
       -- Close the current buffer/tab. On the LAST real buffer, :bdelete would
       -- leave a blank [No Name] (looks like nothing closed) — drop to the splash
       -- instead so closing the last tab is visible and useful.
-      vim.keymap.set("n", "<leader>bd", function()
+      vim.keymap.set("n", CFKeys.lhs("close_tab"), function()
         if vim.bo.modified then
           vim.notify("Unsaved changes — :w (or <leader>w) first", vim.log.levels.WARN)
           return
@@ -261,12 +360,37 @@ require("lazy").setup({
 
         -- Cheatsheet: {category, {key, what}, ...}, laid out two pairs per row
         -- with per-column widths so keys and descriptions form real columns.
+        -- Keys come from CFKeys so the splash always matches the live bindings
+        -- (editor keys from [editor_keys], prefix keys from the running config).
         local sheet = {
-          { "Files", { "Ctrl-P", "open file" }, { "Space e", "file tree" }, { "Space fg", "search text" } },
-          { "Editor", { "gd", "go to definition" }, { "gr", "references" }, { "]b / [b", "next/prev file" } },
-          { "Git", { "Ctrl-a g", "git diff" }, { "Space gh", "file history" } },
-          { "Panes", { "Ctrl-a e/t/c", "editor/term/claude" }, { "Ctrl-a hjkl", "move focus" } },
-          { "Session", { "Ctrl-a n", "new window" }, { "Ctrl-a v", "scroll/copy" }, { "Ctrl-a ?", "all keys" } },
+          {
+            "Files",
+            { CFKeys.disp("open_file"), "open file" },
+            { CFKeys.disp("explorer"), "file tree" },
+            { CFKeys.disp("search_repo"), "search text" },
+          },
+          {
+            "Editor",
+            { "gd", "go to definition" },
+            { "gr", "references" },
+            { CFKeys.pdisp("tab_next", "tab_prev"), "next/prev file" },
+          },
+          {
+            "Git",
+            { CFKeys.pdisp("git_diff"), "git diff" },
+            { CFKeys.disp("file_history"), "file history" },
+          },
+          {
+            "Panes",
+            { CFKeys.pdisp("toggle_editor", "toggle_shell", "toggle_ai"), "editor/term/claude" },
+            { CFKeys.pdisp("focus_left", "focus_down", "focus_up", "focus_right"), "move focus" },
+          },
+          {
+            "Session",
+            { CFKeys.pdisp("win_new"), "new window" },
+            { CFKeys.pdisp("copy"), "scroll/copy" },
+            { CFKeys.pdisp("help"), "all keys" },
+          },
         }
         local rows = {}
         for _, s in ipairs(sheet) do
@@ -632,7 +756,7 @@ require("lazy").setup({
 --   Space g d  changed-files panel + side-by-side diff (q / Esc closes)
 --   Space g h  history of the current file      Space g c  close the diff
 vim.keymap.set("n", "<leader>gd", "<cmd>DiffviewOpen<cr>", { desc = "Git diff (changed files)" })
-vim.keymap.set("n", "<leader>gh", "<cmd>DiffviewFileHistory %<cr>", { desc = "Git file history" })
+vim.keymap.set("n", CFKeys.lhs("file_history"), "<cmd>DiffviewFileHistory %<cr>", { desc = "Git file history" })
 vim.keymap.set("n", "<leader>gc", "<cmd>DiffviewClose<cr>", { desc = "Close git diff" })
 
 -- Update plugins on demand (avoids auto-updating on every launch, which would

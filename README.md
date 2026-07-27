@@ -198,6 +198,10 @@ Click the nvim pane (or `Ctrl-a h`), then (VS Code style):
   terminal doesn't send the Shift chord)
 - **`Space e`** / **`-`** — file explorer (Enter opens)
 
+These editor keys (open/search/explorer/tab-cycle/history) are configurable in
+the `[editor_keys]` block of `config.toml` — edit and `Ctrl-a r` to reload. The
+start-screen cheatsheet always reflects the live bindings.
+
 ### Neovim (leader = `Space`)
 
 | Keys         | Action                                  |
