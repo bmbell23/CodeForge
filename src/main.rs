@@ -48,6 +48,8 @@ mod layout;
 mod pane;
 mod picker;
 mod protocol;
+mod worktree;
+mod wtform;
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -76,6 +78,7 @@ use gitdiff::{DiffAction, DiffList};
 use layout::{Dir, FocusDir, Layout, Rect};
 use pane::{Pane, PaneRole};
 use picker::{Picker, PickerAction};
+use wtform::{WorktreeForm, WtformAction};
 
 /// A restorable description of one window: its project dir, the shell's working
 /// directory, and the editor's open files.
@@ -379,6 +382,13 @@ pub enum Msg {
     TabClose,
     /// Switch to window `n` (0-based).
     SelectWindow(usize),
+    /// A worktree-creation worker finished (#50): the new worktree's path, or
+    /// an error message to surface. Runs off-thread so the git fetch never
+    /// blocks the event loop.
+    WorktreeResult(Result<PathBuf, String>),
+    /// A short human status from the running worktree worker (#50), shown live
+    /// in the form ("fetching…", "adding worktree…", …).
+    WorktreeProgress(String),
     /// Periodic tick to refresh the status-bar clock.
     Tick,
     /// Reload: restart the server on the latest build, reopening the same dirs.
@@ -1234,6 +1244,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let mut msel: Option<MouseSel> = None;
     let mut picker: Option<Picker> = None;
     let mut picker_new_window = false;
+    let mut wtform: Option<WorktreeForm> = None;
     let mut diff: Option<DiffList> = None;
     let mut diff_zoom: Option<DiffZoom> = None;
     // (cols, rows) of the attached client; updated on attach/resize.
@@ -1342,6 +1353,36 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 }
                                 let w = &mut windows[cur];
                                 relayout(&mut w.panes, &w.layout, c, area)?;
+                            }
+                            PickerAction::NewWorktree => {
+                                picker = None;
+                                wtform = Some(WorktreeForm::new(proot.clone()));
+                                needs_clear = true;
+                            }
+                        }
+                        dirty = true;
+                    } else if let Some(wf) = wtform.as_mut() {
+                        match wf.feed_bytes(&bytes) {
+                            WtformAction::None => {}
+                            WtformAction::Cancel => {
+                                wtform = None;
+                                needs_clear = true;
+                            }
+                            WtformAction::Submit(spec) => {
+                                // Create off-thread — the git fetch must not
+                                // block the event loop. The form stays up
+                                // ("creating…") until the result Msg lands.
+                                wf.begin_create();
+                                let txw = tx.clone();
+                                let root = proot.clone();
+                                std::thread::spawn(move || {
+                                    let txp = txw.clone();
+                                    let res = worktree::create(&root, &spec, &|s: &str| {
+                                        let _ = txp.send(Msg::WorktreeProgress(s.to_string()));
+                                    })
+                                    .map_err(|e| format!("{e:#}"));
+                                    let _ = txw.send(Msg::WorktreeResult(res));
+                                });
                             }
                         }
                         dirty = true;
@@ -1867,6 +1908,38 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         needs_clear = true;
                     }
                 }
+                Msg::WorktreeResult(res) => {
+                    // A create worker finished (#50). On success, open the new
+                    // worktree as its own window; on failure, keep the form up
+                    // with the error.
+                    match res {
+                        Ok(dir) => {
+                            wtform = None;
+                            needs_clear = true;
+                            let (c, r) = size;
+                            let area = r.saturating_sub(1);
+                            let base = next_id;
+                            next_id = base + 3;
+                            let spec = WindowSpec::bare(dir);
+                            windows.push(new_window(&spec, &cfg, &shell, base, &tx)?);
+                            cur = windows.len() - 1;
+                            let w = &mut windows[cur];
+                            relayout(&mut w.panes, &w.layout, c, area)?;
+                        }
+                        Err(msg) => {
+                            if let Some(wf) = wtform.as_mut() {
+                                wf.fail(msg);
+                            }
+                        }
+                    }
+                    dirty = true;
+                }
+                Msg::WorktreeProgress(s) => {
+                    if let Some(wf) = wtform.as_mut() {
+                        wf.set_progress(s);
+                    }
+                    dirty = true;
+                }
                 Msg::Tick => {
                     // Just refresh the status-bar clock.
                     dirty = true;
@@ -2027,6 +2100,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     help.as_ref(),
                     copy.as_ref(),
                     picker.as_ref(),
+                    wtform.as_ref(),
                     dl,
                     &right_info,
                     ksnap,
@@ -2440,6 +2514,7 @@ fn render(
     help: Option<&HelpState>,
     copy: Option<&CopyMode>,
     picker: Option<&Picker>,
+    wtform: Option<&WorktreeForm>,
     diff: Option<&DiffList>,
     right_info: &str,
     keys: Keys,
@@ -2526,6 +2601,9 @@ fn render(
     }
     if let Some(pk) = picker {
         pk.render(out, cols, rows)?;
+    }
+    if let Some(wf) = wtform {
+        wf.render(out, cols, rows)?;
     }
     if let Some(dl) = diff {
         dl.render(out, &diff_overlay_rect(w, cols, rows))?;

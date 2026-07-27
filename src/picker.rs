@@ -25,6 +25,8 @@ pub enum PickerAction {
     Cancel,
     /// User picked a project directory.
     Chosen(PathBuf),
+    /// User asked to create a new worktree (Ctrl-n) — open the worktree form.
+    NewWorktree,
 }
 
 pub struct Picker {
@@ -119,6 +121,7 @@ impl Picker {
                 0 => match b {
                     0x1b => self.esc = 1,
                     0x03 => return PickerAction::Cancel, // Ctrl-c
+                    0x0e => return PickerAction::NewWorktree, // Ctrl-n
                     b'\r' | b'\n' => {
                         if let Some(p) = self.selected() {
                             return PickerAction::Chosen(p);
@@ -257,7 +260,10 @@ impl Picker {
         line(
             out,
             row,
-            format!(" {} matches · 1-9 open · Esc cancel", self.matches.len()),
+            format!(
+                " {} matches · 1-9 open · ^n worktree · Esc",
+                self.matches.len()
+            ),
         )?;
         row += 1;
 
