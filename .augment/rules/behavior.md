@@ -51,6 +51,12 @@ memory, not local docs. The next session trusts the issues.
 4. **Scoping can be parallel; implementation is serial.** You may move several
    tickets to Ready in one pass, but only **one** ticket is In Progress / In
    Review at a time.
+   - **A new request does not preempt the active ticket.** When the user asks
+     for something else mid-work, **file it as a ticket and queue it** — do not
+     drop the In-Progress ticket to fix the new thing immediately. Finish (or
+     reach a clean, committed stop on) the active ticket first, then pick up the
+     next. Asking for X is a request to *track* X, not to context-switch to it.
+     The only exception is a fix that unblocks the active ticket itself.
 5. **Any code change → move the ticket to In Review and say so.** In-Review work
    stays **uncommitted**, and the uncommitted diff must match that one ticket.
 6. **Done = the user blesses it.** Only then `git commit` (after asking) and move
@@ -120,5 +126,5 @@ first.
 
 ## Status
 **Status**: Accepted
-**Last Updated**: 2026-07-26
+**Last Updated**: 2026-07-27
 **Review Cycle**: as the project evolves
