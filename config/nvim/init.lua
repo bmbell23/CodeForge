@@ -1132,6 +1132,11 @@ function _G.CodeForgeDiffOpen(path)
   vim.wo[right_win].winbar = "  %t · Enter unfold · Tab side · Space-z focus · ]c/[c · Esc close"
   vim.wo[left_win].fillchars = "diff: "
   vim.wo[right_win].fillchars = "diff: "
+  -- The global scrolloff (6) pins the cursor that many rows below the top, so
+  -- with scrollbind the current-code side can never reach line 1. Drop it to 0
+  -- on both diff windows so either side scrolls fully to its own top (#44).
+  vim.wo[left_win].scrolloff = 0
+  vim.wo[right_win].scrolloff = 0
 
   local aug = vim.api.nvim_create_augroup("codeforge_diff", { clear = true })
   local map_buf = vim.api.nvim_create_buf(false, true)
