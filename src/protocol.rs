@@ -21,12 +21,16 @@ pub const OUTPUT: u8 = 5;
 /// reconnect to the socket shortly. No payload.
 pub const RECONNECT: u8 = 6;
 
-/// Write one framed message.
+/// Write one framed message. Header and payload go out in a single `write_all`
+/// so a frame is one syscall's worth of writes, not three (the OUTPUT path runs
+/// once per render — see #46).
 pub fn write_frame(w: &mut impl Write, tag: u8, payload: &[u8]) -> io::Result<()> {
     let len = (payload.len() as u32).to_le_bytes();
-    w.write_all(&[tag])?;
-    w.write_all(&len)?;
-    w.write_all(payload)?;
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(tag);
+    frame.extend_from_slice(&len);
+    frame.extend_from_slice(payload);
+    w.write_all(&frame)?;
     w.flush()
 }
 

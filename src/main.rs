@@ -1239,6 +1239,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // (cols, rows) of the attached client; updated on attach/resize.
     let mut size = (80u16, 24u16);
     let mut client: Option<UnixStream> = None;
+    // Ships only what changed each frame; see FrameDiffer (#46).
+    let mut differ = FrameDiffer::new(size.0, size.1);
     let mut framebuf: Vec<u8> = Vec::new();
     // Whether to keep persisting the session (Ctrl-a fresh turns this off).
     let mut save_enabled = true;
@@ -2034,7 +2036,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         (m.pane_id, s, e)
                     }),
                 )?;
-                if protocol::write_frame(cl, protocol::OUTPUT, &framebuf).is_err() {
+                let payload = differ.frame(&framebuf, size.0, size.1, needs_clear);
+                if protocol::write_frame(cl, protocol::OUTPUT, &payload).is_err() {
                     client = None;
                 }
             }
@@ -2369,6 +2372,58 @@ fn parse_mouse(body: &[u8], press: bool) -> Option<Msg> {
     let x: u16 = parts.next()?.parse().ok()?;
     let y: u16 = parts.next()?.parse().ok()?;
     Some(Msg::Mouse { x, y, cb, press })
+}
+
+/// Server-side mirror of the composited frame, so the client is sent only what
+/// changed instead of the whole screen every render (#46).
+///
+/// We still build the full frame into `framebuf` exactly as before, but feed it
+/// to a vt100 parser that mirrors what the client currently shows, then ship
+/// vt100's minimal `contents_diff` against the previously presented screen. A
+/// keystroke echo then repaints a couple of cells on the client rather than all
+/// ~2000 — that full-screen repaint per keystroke was the typing/general lag.
+/// A fresh attach / resize / clear sends the full `contents_formatted` instead.
+struct FrameDiffer {
+    parser: vt100::Parser,
+    prev: Option<vt100::Screen>,
+    dims: (u16, u16), // (cols, rows)
+}
+
+impl FrameDiffer {
+    fn new(cols: u16, rows: u16) -> Self {
+        FrameDiffer {
+            parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
+            prev: None,
+            dims: (cols, rows),
+        }
+    }
+
+    /// Bytes to ship for this frame. `force_full` (clear / fresh attach) or a
+    /// size change sends the whole screen; otherwise a minimal diff against the
+    /// last presented screen. Wrapped in DEC 2026 synchronized output so the
+    /// client still presents each frame atomically.
+    fn frame(&mut self, framebuf: &[u8], cols: u16, rows: u16, force_full: bool) -> Vec<u8> {
+        let mut full = force_full;
+        if self.dims != (cols, rows) {
+            // Resized: start a fresh mirror at the new geometry and repaint all.
+            self.parser = vt100::Parser::new(rows.max(1), cols.max(1), 0);
+            self.prev = None;
+            self.dims = (cols, rows);
+            full = true;
+        }
+        self.parser.process(framebuf);
+        let cur = self.parser.screen().clone();
+        let body = match (&self.prev, full) {
+            (Some(prev), false) => cur.contents_diff(prev),
+            _ => cur.contents_formatted(),
+        };
+        self.prev = Some(cur);
+        let mut out = Vec::with_capacity(body.len() + 16);
+        out.extend_from_slice(b"\x1b[?2026h");
+        out.extend_from_slice(&body);
+        out.extend_from_slice(b"\x1b[?2026l");
+        out
+    }
 }
 
 /// Paint the current window's panes, the status bar, and any overlay, then
@@ -3411,6 +3466,44 @@ impl Drop for TerminalGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_differ_ships_full_then_minimal_diffs() {
+        // A framebuf that writes `ch` at the top-left via absolute positioning,
+        // the way render() composites cells.
+        let at = |ch: char| format!("\x1b[1;1H{ch}").into_bytes();
+        let mut d = FrameDiffer::new(20, 5);
+
+        // First frame with no prior screen -> full repaint, includes the glyph.
+        let p1 = d.frame(&at('A'), 20, 5, false);
+        assert!(p1.windows(1).any(|w| w == b"A"), "first frame paints A");
+
+        // Identical frame -> diff against an identical screen is empty; the
+        // payload is just the sync wrappers, and much smaller than a full paint.
+        let p2 = d.frame(&at('A'), 20, 5, false);
+        assert!(p2.len() < p1.len(), "identical frame ships less than full");
+        assert!(
+            !p2.windows(1).any(|w| w == b"A"),
+            "no redraw when unchanged"
+        );
+
+        // A changed cell -> a small delta that carries the new glyph, still
+        // smaller than a full repaint.
+        let p3 = d.frame(&at('B'), 20, 5, false);
+        assert!(
+            p3.windows(1).any(|w| w == b"B"),
+            "change ships the new glyph"
+        );
+        assert!(
+            p3.len() < p1.len(),
+            "a one-cell change ships less than full"
+        );
+
+        // force_full repaints everything again even when nothing changed.
+        let p4 = d.frame(&at('B'), 20, 5, true);
+        assert!(p4.windows(1).any(|w| w == b"B"), "force_full repaints");
+        assert!(p4.len() > p3.len(), "forced full is larger than a diff");
+    }
 
     #[test]
     fn parses_sgr_mouse() {
