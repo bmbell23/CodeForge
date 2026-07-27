@@ -782,15 +782,42 @@ require("lazy").setup({
       -- mkdir is the atomic election: it *errors* (E739) if the dir already
       -- exists, so pcall succeeds only for the instance that created it.
       local installer = pcall(vim.fn.mkdir, lock)
+      -- Force-install rather than ensure_installed so a package left
+      -- half-installed by an interrupted run (bin symlink created, receipt not
+      -- written) is cleaned and reinstalled instead of failing forever with
+      -- '<bin> is already linked' on every launch (#48). We drive mason-registry
+      -- directly for the force flag; if that API isn't present we fall back to
+      -- plain ensure_installed.
+      local self_heal = false
       if installer then
         vim.api.nvim_create_autocmd("VimLeavePre", {
           callback = function()
             pcall(vim.fn.delete, lock, "d")
           end,
         })
+        local ok_map, servermap = pcall(require, "mason-lspconfig.mappings.server")
+        local ok_reg, reg = pcall(require, "mason-registry")
+        if ok_map and ok_reg then
+          self_heal = true
+          reg.refresh(vim.schedule_wrap(function()
+            for _, server in ipairs(want) do
+              local pkg = servermap.lspconfig_to_package[server]
+              if pkg then
+                local ok_p, p = pcall(reg.get_package, pkg)
+                -- Only touch servers that aren't cleanly installed; force
+                -- overwrites any leftover partial state.
+                if ok_p and not p:is_installed() then
+                  pcall(function()
+                    p:install({ force = true })
+                  end)
+                end
+              end
+            end
+          end))
+        end
       end
       require("mason-lspconfig").setup({
-        ensure_installed = installer and want or {},
+        ensure_installed = (installer and not self_heal) and want or {},
       })
 
       -- Buffer-local LSP keymaps, set when a server attaches. Definition /
