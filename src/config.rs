@@ -79,7 +79,7 @@ impl Default for EditorKeys {
         EditorKeys {
             open_file: "Ctrl-p".into(),
             search_in_file: "Ctrl-f".into(),
-            search_repo: "Ctrl-Shift-f".into(),
+            search_repo: "Space f g".into(),
             explorer: "Space e".into(),
             close_tab: "Space b d".into(),
             file_history: "Space g h".into(),
@@ -716,7 +716,7 @@ git_diff = "g"   # git diff list; pick a file for a side-by-side editable diff
 [editor_keys]
 open_file      = "Ctrl-p"       # fuzzy-open a file by name
 search_in_file = "Ctrl-f"       # fuzzy-search in the current file
-search_repo    = "Ctrl-Shift-f" # live-grep across the repo
+search_repo    = "Space f g"    # live-grep across the repo
 explorer       = "Space e"      # toggle the file explorer
 close_tab      = "Space b d"    # close the current editor buffer/tab
 file_history   = "Space g h"    # git history of the current file

@@ -172,6 +172,20 @@ require("lazy").setup({
           end
         end
       end)
+      -- The same rewrite DELETED the whole `nvim-treesitter.configs` module,
+      -- which the 0.1.x file previewer (__files.lua:445) still requires and
+      -- calls `is_enabled` on. `require` errors -> telescope's pcall leaves a
+      -- string, and `("err"):is_enabled()` is a nil-call -> Ctrl-F/live_grep
+      -- crash. A field-shim can't help (require never returns a table), so
+      -- register a stub module in package.loaded. Preview treesitter is off
+      -- anyway, so is_enabled=false is correct.
+      if type(package.loaded["nvim-treesitter.configs"]) ~= "table" then
+        package.loaded["nvim-treesitter.configs"] = {
+          is_enabled = function()
+            return false
+          end,
+        }
+      end
       require("telescope").setup({
         defaults = {
           preview = { treesitter = false },
@@ -184,10 +198,10 @@ require("lazy").setup({
       })
       local t = require("telescope.builtin")
       -- VS Code-style (work in normal & insert):
-      --   Ctrl-P        open file by name
-      --   Ctrl-F        search within the current file
-      --   Ctrl-Shift-F  search the whole repo (needs a terminal that sends the
-      --                 Shift chord; <leader>fg always works as a fallback)
+      --   Ctrl-P    open file by name
+      --   Ctrl-F    search within the current file
+      --   Space f g search the whole repo (was Ctrl-Shift-F, which many
+      --             terminals intercept; <leader>fg is the same mapping)
       vim.keymap.set({ "n", "i" }, CFKeys.lhs("open_file"), t.find_files, { desc = "Open file" })
       vim.keymap.set({ "n", "i" }, CFKeys.lhs("search_in_file"), t.current_buffer_fuzzy_find, { desc = "Search in file" })
       vim.keymap.set({ "n", "i" }, CFKeys.lhs("search_repo"), t.live_grep, { desc = "Search repo" })
