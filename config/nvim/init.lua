@@ -724,6 +724,19 @@ require("lazy").setup({
     },
   },
 
+  -- Grouped results list (Story #36): find-callers opens here as a collapsible
+  -- tree — each file shown once as a header with its references (line + text)
+  -- nested underneath, <CR> to jump. Loaded on demand when find_callers calls
+  -- require("trouble") (lazy hooks the require) or via :Trouble.
+  {
+    "folke/trouble.nvim",
+    cmd = "Trouble",
+    opts = {
+      focus = true, -- move into the list so you can navigate it immediately
+      keys = { ["<esc>"] = "close" }, -- Esc dismisses the window (as well as q)
+    },
+  },
+
   -- LSP: go-to-definition, references (find callers), rename, etc.
   {
     "neovim/nvim-lspconfig",
@@ -790,12 +803,41 @@ require("lazy").setup({
           local peek = function(scope, fallback)
             return has_glance and ("<cmd>Glance " .. scope .. "<cr>") or fallback
           end
-          -- Find callers = references WITHOUT the declaration (Glance/default
-          -- both include it, which is noise when you want callers). If no
-          -- attached server implements references (perlnavigator has no
-          -- referencesProvider — it indexes definitions, not references), fall
-          -- back to a whole-word ripgrep of the symbol so Perl/shell still get
-          -- a usable caller list.
+          -- Find callers, grouped by file (Story #36). Results go into the
+          -- quickfix list and open in Trouble, which shows each file once as a
+          -- header with its references (line + text) nested under it. We build
+          -- the quickfix list ourselves so we control two things:
+          --   * exclude the declaration (callers, not the definition itself);
+          --   * fall back to a whole-word ripgrep when no attached server
+          --     implements references (perlnavigator indexes definitions, not
+          --     references), so Perl/shell get the same grouped view.
+          local function open_callers_qf(title, items)
+            if not items or #items == 0 then
+              vim.notify("No callers found", vim.log.levels.INFO)
+              return
+            end
+            vim.fn.setqflist({}, " ", { title = title, items = items })
+            require("trouble").open("quickfix")
+          end
+          local function rg_callers(word)
+            if word == "" then
+              return
+            end
+            if vim.fn.executable("rg") == 0 then
+              vim.notify("ripgrep (rg) not found; cannot search callers", vim.log.levels.WARN)
+              return
+            end
+            local out = vim.fn.systemlist({ "rg", "--vimgrep", "--word-regexp", "--", word })
+            local items = {}
+            for _, line in ipairs(out) do
+              local file, lnum, col, text = line:match("^(.-):(%d+):(%d+):(.*)$")
+              if file then
+                items[#items + 1] =
+                  { filename = file, lnum = tonumber(lnum), col = tonumber(col), text = text }
+              end
+            end
+            open_callers_qf("Callers: " .. word, items)
+          end
           local function find_callers()
             local buf = vim.api.nvim_get_current_buf()
             local has_refs = false
@@ -806,9 +848,13 @@ require("lazy").setup({
               end
             end
             if has_refs then
-              tb.lsp_references({ include_declaration = false })
+              vim.lsp.buf.references({ includeDeclaration = false }, {
+                on_list = function(o)
+                  open_callers_qf(o.title, o.items)
+                end,
+              })
             else
-              tb.grep_string({ word_match = "-w" })
+              rg_callers(vim.fn.expand("<cword>"))
             end
           end
           map("gd", peek("definitions", tb.lsp_definitions), "Peek / go to definition")
