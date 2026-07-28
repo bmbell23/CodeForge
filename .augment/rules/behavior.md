@@ -30,6 +30,16 @@ Show reasoning for non-obvious decisions; reference specific files and lines
 (`src/main.rs:1861`). When you weigh a choice, give a recommendation, not an
 exhaustive survey.
 
+### Quote the user's *actual* keybinds, not the code defaults
+CodeForge keybinds are user-customized in `~/.config/codeforge/config.toml`
+(`[keys]` for prefix actions, `[editor_keys]` for nvim chords), with a
+configurable prefix. **Before telling the user a shortcut, read their
+config.toml and quote their binding** — not the default in `src/config.rs`.
+Commonly remapped: the prefix, the focus keys (may be WASD), `tab_new`,
+`reload`, `tab_close`, `picker`, `quit`, `detach`. Example: don't say "Ctrl-a t"
+for a new tab when their `tab_new = "r"` — say "Ctrl-a r". If the config isn't
+readable, say the *action* ("open a new tab") and note the default may differ.
+
 ---
 
 ## The Ticket Workflow (mandatory)
