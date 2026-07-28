@@ -12,6 +12,12 @@
 vim.g.mapleader = " "
 vim.g.maplocalleader = " "
 
+-- Set 'background' explicitly so Neovim skips its startup terminal-background
+-- query (OSC/DSR). In a CodeForge pane that query can go unanswered, printing
+-- "E1568: Terminal did not respond to DSR request for 'background' color" and
+-- slowing startup; the theme is dark anyway (#64). Override in a local config.
+vim.opt.background = "dark"
+
 -- Filetype overrides. Neovim defaults `.pt` to html (Template Toolkit), but in
 -- the Janus codebase `.pt` files are Perl — map them so perlnavigator attaches
 -- and go-to-def / find-callers work (#37). Override in a local config if your
@@ -140,13 +146,28 @@ opt.shiftwidth = 4
 opt.tabstop = 4
 opt.scrolloff = 6
 
--- Bootstrap lazy.nvim.
+-- Bootstrap lazy.nvim. Verify the actual entry file, not just the directory: a
+-- failed/partial clone can leave the dir behind, which later surfaces as the
+-- cryptic "module 'lazy' not found" and unloads every plugin (#63).
+local uv = vim.uv or vim.loop
 local lazypath = vim.fn.stdpath("data") .. "/lazy/lazy.nvim"
-if not vim.loop.fs_stat(lazypath) then
-  vim.fn.system({
-    "git", "clone", "--filter=blob:none",
-    "https://github.com/folke/lazy.nvim.git", "--branch=stable", lazypath,
-  })
+local lazymain = lazypath .. "/lua/lazy/init.lua"
+if not uv.fs_stat(lazymain) then
+  local repo = "https://github.com/folke/lazy.nvim.git"
+  -- Blobless clone is fast; fall back to a full clone for gits too old for
+  -- --filter, so a partial-clone failure doesn't leave the editor plugin-less.
+  local out = vim.fn.system({ "git", "clone", "--filter=blob:none", "--branch=stable", repo, lazypath })
+  if vim.v.shell_error ~= 0 then
+    out = vim.fn.system({ "git", "clone", "--branch=stable", repo, lazypath })
+  end
+  if not uv.fs_stat(lazymain) then
+    vim.api.nvim_echo({
+      { "CodeForge: could not bootstrap lazy.nvim into " .. lazypath .. "\n", "ErrorMsg" },
+      { (out or "") .. "\n", "WarningMsg" },
+      { "Check that `git` is installed and github.com is reachable, then relaunch.\n", "WarningMsg" },
+    }, true, {})
+    return
+  end
 end
 vim.opt.rtp:prepend(lazypath)
 
