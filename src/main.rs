@@ -2652,6 +2652,42 @@ fn render(
     Ok(())
 }
 
+/// Pick the contiguous run of window tabs to show so the strip fits `avail`
+/// columns on one row and always includes `cur` (#55). Returns the `start..end`
+/// index range; the caller draws a `‹` before it when `start > 0` and a `›`
+/// after when `end < n`, so overflow never wraps the status bar to a second row
+/// (which would scroll the whole layout up).
+fn visible_tabs(widths: &[usize], cur: usize, avail: usize) -> (usize, usize) {
+    let n = widths.len();
+    if n == 0 {
+        return (0, 0);
+    }
+    if widths.iter().sum::<usize>() <= avail {
+        return (0, n); // everything fits, no markers needed
+    }
+    // Truncated: reserve a column for each overflow marker (worst case both).
+    let budget = avail.saturating_sub(2);
+    let (mut start, mut end) = (cur.min(n - 1), cur.min(n - 1) + 1);
+    let mut used = widths[start];
+    loop {
+        let mut grew = false;
+        if end < n && used + widths[end] <= budget {
+            used += widths[end];
+            end += 1;
+            grew = true;
+        }
+        if start > 0 && used + widths[start - 1] <= budget {
+            start -= 1;
+            used += widths[start];
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    (start, end)
+}
+
 /// Draw the bottom status bar: window tabs on the left (current highlighted,
 /// orange when a window wants attention), and the date/clock/temperature on the
 /// right. Keybinds live in the `Ctrl-a ?` overlay, not here.
@@ -2674,7 +2710,34 @@ fn draw_status(
         cursor::MoveTo(0, y),
         Print(" forge "),
     )?;
-    for (i, w) in windows.iter().enumerate() {
+
+    // Tabs must stay on this one row: if they'd overflow they wrap past the last
+    // cell and scroll the whole layout up (#55). Fit a scrolling window of tabs
+    // (always including the current one) into the space between " forge " and
+    // the right-aligned info, with ‹/› markers for hidden tabs.
+    let labels: Vec<String> = windows
+        .iter()
+        .enumerate()
+        .map(|(i, w)| format!(" {}:{} ", i + 1, w.title))
+        .collect();
+    let widths: Vec<usize> = labels.iter().map(|s| s.chars().count()).collect();
+    let rwidth = if right_info.is_empty() {
+        0
+    } else {
+        right_info.chars().count() + 2
+    };
+    // Leave the final column untouched so nothing triggers an auto-wrap/scroll.
+    let avail = (cols as usize).saturating_sub(7 /* " forge " */ + rwidth + 1);
+    let (start, end) = visible_tabs(&widths, cur, avail);
+    if start > 0 {
+        queue!(
+            out,
+            SetBackgroundColor(Color::DarkGrey),
+            SetForegroundColor(Color::White),
+            Print("‹")
+        )?;
+    }
+    for (i, w) in windows.iter().enumerate().take(end).skip(start) {
         let (bg, fg) = if i == cur {
             (Color::Cyan, Color::Black)
         } else if w.attention {
@@ -2690,7 +2753,15 @@ fn draw_status(
             (Color::DarkGrey, Color::White)
         };
         queue!(out, SetBackgroundColor(bg), SetForegroundColor(fg))?;
-        queue!(out, Print(format!(" {}:{} ", i + 1, w.title)))?;
+        queue!(out, Print(&labels[i]))?;
+    }
+    if end < windows.len() {
+        queue!(
+            out,
+            SetBackgroundColor(Color::DarkGrey),
+            SetForegroundColor(Color::White),
+            Print("›")
+        )?;
     }
 
     // Right-aligned date / clock / temperature.
@@ -3631,6 +3702,28 @@ mod tests {
         assert_eq!(fresh_ai_cmd(&mk("claude --continue")), "claude");
         assert_eq!(fresh_ai_cmd(&mk("claude")), "claude");
         assert_eq!(fresh_ai_cmd(&mk("augment")), "augment"); // non-claude as-is
+    }
+
+    #[test]
+    fn visible_tabs_fits_one_row_and_keeps_current() {
+        // All fit -> show everything, no markers.
+        let w = vec![5, 5, 5];
+        assert_eq!(visible_tabs(&w, 1, 100), (0, 3));
+
+        // Overflow: the returned run always includes `cur` and fits `avail`
+        // (minus 2 cols reserved for ‹/› markers).
+        let w = vec![6; 10]; // 60 total
+        for cur in 0..10 {
+            let (s, e) = visible_tabs(&w, cur, 20);
+            assert!(s <= cur && cur < e, "cur {cur} must be visible in {s}..{e}");
+            let used: usize = w[s..e].iter().sum();
+            assert!(used <= 20, "run width {used} exceeds avail");
+        }
+
+        // A current tab wider than the budget still returns just that tab.
+        let w = vec![3, 3, 50, 3];
+        let (s, e) = visible_tabs(&w, 2, 10);
+        assert_eq!((s, e), (2, 3));
     }
 
     #[test]
