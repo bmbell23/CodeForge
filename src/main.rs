@@ -702,7 +702,9 @@ fn spawn_ide(
 
     let (editor, editor_title) = build_editor(cfg, dir, base, &spec.files);
     let shell_cwd = spec.shell_cwd.as_deref().unwrap_or(dir);
-    let (ai, ai_title) = command_line(&cfg.ai, dir);
+    // Resume the prior conversation for this project if it has one, else start
+    // fresh — so a brand-new project isn't stranded on the resume picker (#54).
+    let (ai, ai_title) = command_line(&ai_cmd_for_dir(cfg, dir), dir);
 
     Ok(vec![
         Pane::spawn(
@@ -841,6 +843,66 @@ fn fresh_ai_cmd(cfg: &Config) -> String {
     } else {
         cfg.ai.clone()
     }
+}
+
+/// claude's per-project history key for `dir`: the absolute path with every
+/// non-alphanumeric char turned into `-` (e.g. `/home/bbell/projects/CodeForge`
+/// -> `-home-bbell-projects-CodeForge`).
+fn claude_project_key(dir: &Path) -> String {
+    dir.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Whether claude has a prior conversation stored for `dir` (under
+/// `~/.claude/projects/<key>`).
+fn claude_has_session(dir: &Path) -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    Path::new(&home)
+        .join(".claude/projects")
+        .join(claude_project_key(dir))
+        .is_dir()
+}
+
+/// The AI command for a window's *first* pane, opened on `dir` (#54). Resume the
+/// prior conversation only when the project actually has one — a brand-new
+/// project (e.g. a fresh worktree) has nothing to continue, so `claude
+/// --continue` would strand it on the resume picker; start it fresh instead.
+fn ai_cmd_for_dir(cfg: &Config, dir: &Path) -> String {
+    let base = fresh_ai_cmd(cfg);
+    if cfg.ai.trim_start().starts_with("claude") && claude_has_session(dir) {
+        format!("{base} --continue")
+    } else {
+        base
+    }
+}
+
+/// Open a new Claude tab in the current window's AI slot running `cmd_line`,
+/// focus it, and re-lay out (#54). Shared by the tab-new chooser's resume/fresh
+/// branches.
+#[allow(clippy::too_many_arguments)]
+fn open_ai_tab(
+    windows: &mut [Window],
+    cur: usize,
+    cmd_line: &str,
+    next_id: &mut usize,
+    cfg: &Config,
+    tx: &Sender<Msg>,
+    size: (u16, u16),
+) -> Result<()> {
+    let id = *next_id;
+    *next_id += 1;
+    let w = &mut windows[cur];
+    let dir = w.dir.clone();
+    let (cmd, title) = command_line(cmd_line, &dir);
+    let pane = Pane::spawn(cmd, title, PaneRole::Ai, 1, 1, id, tx.clone())?;
+    w.panes.push(pane);
+    w.active[role_index(PaneRole::Ai)] = id;
+    w.focus_id = id;
+    refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+    relayout(&mut w.panes, &w.layout, size.0, size.1.saturating_sub(1))?;
+    Ok(())
 }
 
 /// Build a command from a whitespace-separated command line (program + args),
@@ -1101,7 +1163,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let _ = std::fs::remove_file(sock); // clear any stale socket
     let listener = UnixListener::bind(sock).context("binding server socket")?;
 
-    let (mut cfg, _) = Config::load();
+    let (cfg, _) = Config::load();
     let prefix = cfg.prefix_byte();
     // Shared so the `Ctrl-a ?` editor can rebind keys live: reader-thread
     // parsers and the event loop all see the same mapping.
@@ -1120,15 +1182,12 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(projects_root);
 
-    // With dirs: one fresh window each. Without: restore the saved session and
-    // resume each AI conversation.
+    // With dirs: one fresh window each. Without: restore the saved session.
+    // The AI pane resumes per project only when that project has a prior
+    // conversation (decided in spawn_ide, #54) — no global --continue mutation
+    // that would leak onto brand-new projects.
     let specs: Vec<WindowSpec> = if dirs.is_empty() {
         let saved = load_snapshot();
-        // Resume the previous AI conversation on restore. `--continue` is
-        // claude-specific; other AI CLIs (e.g. augment, #13) just relaunch.
-        if cfg.ai.trim_start().starts_with("claude") {
-            cfg.ai = format!("{} --continue", cfg.ai.trim());
-        }
         if saved.is_empty() {
             vec![WindowSpec::bare(
                 std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -1267,6 +1326,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let mut picker: Option<Picker> = None;
     let mut picker_new_window = false;
     let mut wtform: Option<WorktreeForm> = None;
+    // A "new Claude tab: resume or fresh?" chooser is showing (#54); the next
+    // key (r/n/Esc) resolves it.
+    let mut ai_tab_prompt = false;
     let mut diff: Option<DiffList> = None;
     let mut diff_zoom: Option<DiffZoom> = None;
     // (cols, rows) of the attached client; updated on attach/resize.
@@ -1312,7 +1374,41 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     }
                 }
                 Msg::Input(bytes) => {
-                    if let Some(cm) = copy.as_mut() {
+                    if ai_tab_prompt {
+                        // Modal chooser for a new Claude tab (#54): r resume,
+                        // n new, Esc/Ctrl-c cancel; other keys ignored.
+                        match bytes.first().copied().unwrap_or(0) {
+                            b'r' | b'R' => {
+                                ai_tab_prompt = false;
+                                let base = fresh_ai_cmd(&cfg);
+                                open_ai_tab(
+                                    &mut windows,
+                                    cur,
+                                    &format!("{base} --resume"),
+                                    &mut next_id,
+                                    &cfg,
+                                    &tx,
+                                    size,
+                                )?;
+                            }
+                            b'n' | b'N' => {
+                                ai_tab_prompt = false;
+                                open_ai_tab(
+                                    &mut windows,
+                                    cur,
+                                    &fresh_ai_cmd(&cfg),
+                                    &mut next_id,
+                                    &cfg,
+                                    &tx,
+                                    size,
+                                )?;
+                            }
+                            0x1b | 0x03 => ai_tab_prompt = false,
+                            _ => {}
+                        }
+                        dirty = true;
+                        needs_clear = true;
+                    } else if let Some(cm) = copy.as_mut() {
                         // Copy/scroll mode is modal on its pane.
                         let w = &mut windows[cur];
                         let mut done = false;
@@ -1846,36 +1942,50 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     // applies to the terminal and Claude slots.
                     let (c, r) = size;
                     let area = r.saturating_sub(1);
-                    let w = &mut windows[cur];
-                    if let Some(role) = w.focus_role() {
-                        if role != PaneRole::Editor {
+                    let role = windows[cur].focus_role();
+                    match role {
+                        Some(PaneRole::Shell) => {
                             let id = next_id;
                             next_id += 1;
+                            let w = &mut windows[cur];
                             let dir = w.dir.clone();
-                            let pane = if role == PaneRole::Shell {
-                                Pane::spawn(
-                                    command(&shell, &dir),
-                                    "shell".into(),
-                                    PaneRole::Shell,
-                                    1,
-                                    1,
-                                    id,
-                                    tx.clone(),
-                                )?
-                            } else {
-                                // A new AI tab starts a fresh session, not a
-                                // resume of the first tab's conversation (#49).
-                                let (cmd, title) = command_line(&fresh_ai_cmd(&cfg), &dir);
-                                Pane::spawn(cmd, title, PaneRole::Ai, 1, 1, id, tx.clone())?
-                            };
+                            let pane = Pane::spawn(
+                                command(&shell, &dir),
+                                "shell".into(),
+                                PaneRole::Shell,
+                                1,
+                                1,
+                                id,
+                                tx.clone(),
+                            )?;
                             w.panes.push(pane);
-                            w.active[role_index(role)] = id;
+                            w.active[role_index(PaneRole::Shell)] = id;
                             w.focus_id = id;
                             refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
                             relayout(&mut w.panes, &w.layout, c, area)?;
                             dirty = true;
                             needs_clear = true;
                         }
+                        Some(PaneRole::Ai) => {
+                            // For claude, ask resume-vs-fresh (#54); the next key
+                            // resolves it. Other AI CLIs just open fresh.
+                            if cfg.ai.trim_start().starts_with("claude") {
+                                ai_tab_prompt = true;
+                            } else {
+                                open_ai_tab(
+                                    &mut windows,
+                                    cur,
+                                    &fresh_ai_cmd(&cfg),
+                                    &mut next_id,
+                                    &cfg,
+                                    &tx,
+                                    size,
+                                )?;
+                            }
+                            dirty = true;
+                            needs_clear = true;
+                        }
+                        _ => {}
                     }
                 }
                 Msg::TabCycle(delta) => {
@@ -2154,6 +2264,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     copy.as_ref(),
                     picker.as_ref(),
                     wtform.as_ref(),
+                    ai_tab_prompt,
                     dl,
                     &right_info,
                     ksnap,
@@ -2568,6 +2679,7 @@ fn render(
     copy: Option<&CopyMode>,
     picker: Option<&Picker>,
     wtform: Option<&WorktreeForm>,
+    ai_prompt: bool,
     diff: Option<&DiffList>,
     right_info: &str,
     keys: Keys,
@@ -2665,9 +2777,45 @@ fn render(
             w.focus_id == w.active[1],
         )?;
     }
+    if ai_prompt {
+        draw_ai_tab_prompt(out, cols, rows)?;
+    }
     // End the synchronized frame: present everything queued above at once.
     out.extend_from_slice(b"\x1b[?2026l");
     out.flush()?;
+    Ok(())
+}
+
+/// Draw the "new Claude tab: resume or fresh?" chooser, centered (#54).
+fn draw_ai_tab_prompt(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
+    let text = " new Claude tab:  r resume · n new · Esc cancel ";
+    let iw = text.chars().count();
+    let bw = iw as u16 + 2;
+    if bw > cols || rows < 3 {
+        return Ok(());
+    }
+    let x = (cols - bw) / 2;
+    let y = rows / 2;
+    queue!(
+        out,
+        SetForegroundColor(Color::Cyan),
+        SetAttribute(Attribute::Bold),
+        cursor::MoveTo(x, y - 1),
+        Print(format!("┌{}┐", "─".repeat(iw))),
+        cursor::MoveTo(x, y),
+        Print("│"),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::White),
+        Print(text),
+        SetForegroundColor(Color::Cyan),
+        SetAttribute(Attribute::Bold),
+        Print("│"),
+        cursor::MoveTo(x, y + 1),
+        Print(format!("└{}┘", "─".repeat(iw))),
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        cursor::Hide,
+    )?;
     Ok(())
 }
 
@@ -3709,6 +3857,19 @@ mod tests {
         let p4 = d.frame(&at('B'), 20, 5, true);
         assert!(p4.windows(1).any(|w| w == b"B"), "force_full repaints");
         assert!(p4.len() > p3.len(), "forced full is larger than a diff");
+    }
+
+    #[test]
+    fn claude_project_key_matches_scheme() {
+        // Slashes (and any non-alnum) become '-'; case is kept (#54).
+        assert_eq!(
+            claude_project_key(std::path::Path::new("/home/bbell/projects/CodeForge")),
+            "-home-bbell-projects-CodeForge"
+        );
+        assert_eq!(
+            claude_project_key(std::path::Path::new("/home/bbell/projects/auto-SFAP-1-x")),
+            "-home-bbell-projects-auto-SFAP-1-x"
+        );
     }
 
     #[test]
