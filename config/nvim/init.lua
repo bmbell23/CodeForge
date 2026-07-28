@@ -204,16 +204,34 @@ require("lazy").setup({
         pickers = { find_files = { hidden = true } },
       })
       local t = require("telescope.builtin")
+
+      -- Find-in-file (Ctrl-f) remembers its last query so reopening prefills it
+      -- (#53); Ctrl-u in the prompt clears. Find-all (Ctrl-g) is grug-far — a
+      -- live, grouped-by-file grep with a replace field (its own spec below).
+      local last_buf = ""
+      local tstate = require("telescope.actions.state")
+      local function cf_find_in_file()
+        t.current_buffer_fuzzy_find({
+          default_text = last_buf,
+          attach_mappings = function(_, map)
+            local actions = require("telescope.actions")
+            map({ "i", "n" }, "<CR>", function(pb)
+              last_buf = tstate.get_current_line() or last_buf
+              actions.select_default(pb)
+            end)
+            return true
+          end,
+        })
+      end
+
       -- VS Code-style (work in normal & insert):
-      --   Ctrl-P    open file by name
-      --   Ctrl-F    search within the current file
-      --   Space f g search the whole repo (was Ctrl-Shift-F, which many
-      --             terminals intercept; <leader>fg is the same mapping)
+      --   Ctrl-P  open file by name
+      --   Ctrl-F  search within the current file (remembers last, #53)
+      --   Ctrl-G  find all across the repo -> grug-far (live, grouped by file,
+      --           with replace) — bound below where grug-far is available.
       vim.keymap.set({ "n", "i" }, CFKeys.lhs("open_file"), t.find_files, { desc = "Open file" })
-      vim.keymap.set({ "n", "i" }, CFKeys.lhs("search_in_file"), t.current_buffer_fuzzy_find, { desc = "Search in file" })
-      vim.keymap.set({ "n", "i" }, CFKeys.lhs("search_repo"), t.live_grep, { desc = "Search repo" })
+      vim.keymap.set({ "n", "i" }, CFKeys.lhs("search_in_file"), cf_find_in_file, { desc = "Search in file" })
       vim.keymap.set("n", "<leader>ff", t.find_files, { desc = "Find files" })
-      vim.keymap.set("n", "<leader>fg", t.live_grep, { desc = "Find all (grep repo)" })
       vim.keymap.set("n", "<leader>fb", t.buffers, { desc = "Find buffers" })
       vim.keymap.set("n", "<leader>fh", t.help_tags, { desc = "Find help" })
       vim.keymap.set("n", "<leader>fs", t.current_buffer_fuzzy_find, { desc = "Search in file" })
@@ -738,6 +756,43 @@ require("lazy").setup({
     opts = {
       focus = true, -- move into the list so you can navigate it immediately
       keys = { ["<esc>"] = "close" }, -- Esc dismisses the window (as well as q)
+    },
+  },
+
+  -- Find-all (and replace) across the repo (#53/#52): a live, grouped-by-file
+  -- search buffer — type the query and matches appear grouped under each file
+  -- as you type; fill the Replace field to rewrite across files. Bound to the
+  -- repo-search key (Ctrl-G), which lazy-loads it on first press.
+  {
+    "MagicDuck/grug-far.nvim",
+    cmd = "GrugFar",
+    opts = {
+      -- Open in its own tab: full editor pane (the default vsplit is half
+      -- width), and closing returns to the file with no leftover [No Name]
+      -- buffer (which `enew` left behind). Enter on a match (in normal mode)
+      -- opens the real file at that location. Esc/submit maps are set on the
+      -- buffer in the FileType autocmd below (#53).
+      windowCreationCommand = "tab split",
+      openTargetWindow = { useScratchBuffer = false },
+    },
+    keys = {
+      {
+        CFKeys.lhs("search_repo"),
+        function()
+          -- One reused instance ("codeforge-find"): reopening restores the last
+          -- search text and its hits instead of a blank buffer. Esc hides (keeps
+          -- the buffer), so the next Ctrl-G re-shows the same state (#53).
+          local gf = require("grug-far")
+          local name = "codeforge-find"
+          if gf.has_instance(name) then
+            gf.get_instance(name):open()
+          else
+            gf.open({ instanceName = name })
+          end
+        end,
+        mode = { "n", "i" },
+        desc = "Find all / replace (grug-far)",
+      },
     },
   },
 
@@ -1438,6 +1493,54 @@ end
 vim.api.nvim_create_autocmd("VimLeavePre", {
   callback = function()
     vim.fn.delete(cf_diff_flag())
+  end,
+})
+
+-- Fullscreen the editor while a grug-far search is open (#53): write a flag
+-- forge watches (see grug_flag in main.rs), removed when the grug-far buffer
+-- goes away or nvim exits. servername == the --listen socket, so the flag path
+-- matches forge's `<sock>.grug`.
+local function cf_grug_flag()
+  return vim.v.servername .. ".grug"
+end
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "grug-far",
+  callback = function(ev)
+    local buf = ev.buf
+    -- Enter while typing = "submit": leave insert (results already update live),
+    -- so you can step to hits without reaching for Esc first (#53).
+    vim.keymap.set("i", "<CR>", "<Esc>", { buffer = buf, desc = "grug-far: submit search" })
+    -- Esc in normal mode hides the window but keeps the instance, so reopening
+    -- restores the search + hits (kill would lose them) (#53).
+    vim.keymap.set("n", "<Esc>", function()
+      require("grug-far").hide_instance(buf)
+    end, { buffer = buf, nowait = true, desc = "grug-far: hide" })
+
+    if vim.v.servername == "" then
+      return
+    end
+    -- Flag tracks window *visibility*, not buffer creation: the reused instance's
+    -- buffer outlives a hide, so keying off show/hide makes forge fullscreen the
+    -- editor on every open, not just the first (#53). BufWinLeave fires only when
+    -- the window closes (Esc/hide) — moving focus to an opened match leaves it up.
+    vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+      buffer = buf,
+      callback = function()
+        vim.fn.writefile({}, cf_grug_flag())
+      end,
+    })
+    vim.api.nvim_create_autocmd("BufWinLeave", {
+      buffer = buf,
+      callback = function()
+        pcall(vim.fn.delete, cf_grug_flag())
+      end,
+    })
+    vim.fn.writefile({}, cf_grug_flag())
+  end,
+})
+vim.api.nvim_create_autocmd("VimLeavePre", {
+  callback = function()
+    pcall(vim.fn.delete, cf_grug_flag())
   end,
 })
 

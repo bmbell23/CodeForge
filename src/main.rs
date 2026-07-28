@@ -270,6 +270,15 @@ fn diff_flag(id: usize) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// Flag nvim writes while a grug-far search is open in editor `id` (#53), so
+/// forge can fullscreen the editor for it (hide the terminal/AI) and restore on
+/// close — the same idea as the diff view's zoom.
+fn grug_flag(id: usize) -> PathBuf {
+    let mut p = nvim_sock(id).into_os_string();
+    p.push(".grug");
+    PathBuf::from(p)
+}
+
 /// Ask the editor to open CodeForge's side-by-side diff (#18) on `file`.
 /// True only when nvim confirms — the caller zooms the layout on success.
 fn nvim_diff_open(sock: &Path, file: &Path) -> bool {
@@ -366,6 +375,9 @@ pub enum Msg {
     /// The editor's side-by-side diff view went away (its flag file vanished):
     /// restore the pane layout saved when it opened. Payload = editor pane id.
     DiffClosed(usize),
+    /// A grug-far search opened (`true`) or closed (`false`) in editor pane
+    /// `id` (#53): fullscreen the editor for it, or restore the layout.
+    GrugZoom(usize, bool),
     /// Toggle the project picker (re-homes the current window).
     OpenPicker,
     /// Open the picker to create a new window.
@@ -705,6 +717,29 @@ fn spawn_ide(
     // Resume the prior conversation for this project if it has one, else start
     // fresh — so a brand-new project isn't stranded on the resume picker (#54).
     let (ai, ai_title) = command_line(&ai_cmd_for_dir(cfg, dir), dir);
+
+    // Watch for grug-far opening in this editor (#53): nvim writes the .grug
+    // flag while the search is up; forge fullscreens the editor for it and
+    // restores on close. Polls the flag and sends only on change; runs for the
+    // server's life (exits when the channel closes). Editor respawns reuse the
+    // same id/flag path, so one watcher per window's editor suffices.
+    {
+        let txg = tx.clone();
+        let flag = grug_flag(base);
+        thread::spawn(move || {
+            let mut last = false;
+            loop {
+                let now = flag.exists();
+                if now != last {
+                    last = now;
+                    if txg.send(Msg::GrugZoom(base, now)).is_err() {
+                        return;
+                    }
+                }
+                thread::sleep(Duration::from_millis(120));
+            }
+        });
+    }
 
     Ok(vec![
         Pane::spawn(
@@ -1331,6 +1366,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let mut ai_tab_prompt = false;
     let mut diff: Option<DiffList> = None;
     let mut diff_zoom: Option<DiffZoom> = None;
+    // Editor fullscreen while a grug-far search is open (#53), mirroring the
+    // diff view's zoom. Reuses DiffZoom (editor id + saved pane visibility).
+    let mut grug_zoom: Option<DiffZoom> = None;
     // (cols, rows) of the attached client; updated on attach/resize.
     let mut size = (80u16, 24u16);
     let mut client: Option<UnixStream> = None;
@@ -1878,6 +1916,46 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         }
                         dirty = true;
                         needs_clear = true;
+                    }
+                }
+                Msg::GrugZoom(id, on) => {
+                    if on {
+                        // Fullscreen the editor for the grug-far search: save the
+                        // window's pane visibility, show only the editor, focus
+                        // it (#53).
+                        if grug_zoom.is_none() {
+                            if let Some(w) = windows
+                                .iter_mut()
+                                .find(|w| w.panes.iter().any(|p| p.id == id))
+                            {
+                                grug_zoom = Some(DiffZoom {
+                                    editor_id: id,
+                                    prev: (w.show_editor, w.show_shell, w.show_ai),
+                                });
+                                w.show_editor = true;
+                                w.show_shell = false;
+                                w.show_ai = false;
+                                w.focus_id = id;
+                                refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                                let (c, r) = size;
+                                relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                                dirty = true;
+                                needs_clear = true;
+                            }
+                        }
+                    } else if grug_zoom.as_ref().is_some_and(|z| z.editor_id == id) {
+                        let z = grug_zoom.take().unwrap();
+                        if let Some(w) = windows
+                            .iter_mut()
+                            .find(|w| w.panes.iter().any(|p| p.id == id))
+                        {
+                            (w.show_editor, w.show_shell, w.show_ai) = z.prev;
+                            refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                            let (c, r) = size;
+                            relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                            dirty = true;
+                            needs_clear = true;
+                        }
                     }
                 }
                 Msg::CopyMode => {
