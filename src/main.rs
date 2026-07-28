@@ -1942,6 +1942,21 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     if n < windows.len() && n != cur {
                         exit_copy(&mut copy, &mut windows);
                         cur = n;
+                        // The git-diff panel follows the current project (#60):
+                        // if it's open, rebuild it for the new window's repo and
+                        // reveal + focus the terminal pane it lives over, just
+                        // like opening it fresh there.
+                        if diff.is_some() {
+                            diff = Some(DiffList::new(&windows[cur].dir));
+                            let (c, r) = size;
+                            let w = &mut windows[cur];
+                            if !w.show_shell {
+                                w.show_shell = true;
+                                refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                                relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                            }
+                            w.focus_id = w.active[1];
+                        }
                         dirty = true;
                         needs_clear = true;
                     }
@@ -2644,7 +2659,11 @@ fn render(
         wf.render(out, cols, rows)?;
     }
     if let Some(dl) = diff {
-        dl.render(out, &diff_overlay_rect(w, cols, rows))?;
+        dl.render(
+            out,
+            &diff_overlay_rect(w, cols, rows),
+            w.focus_id == w.active[1],
+        )?;
     }
     // End the synchronized frame: present everything queued above at once.
     out.extend_from_slice(b"\x1b[?2026l");

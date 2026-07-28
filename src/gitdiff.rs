@@ -177,11 +177,18 @@ impl DiffList {
     }
 
     /// Draw the overlay filling `rect` (the terminal pane's footprint).
-    pub fn render(&self, out: &mut Vec<u8>, rect: &Rect) -> Result<()> {
+    pub fn render(&self, out: &mut Vec<u8>, rect: &Rect, focused: bool) -> Result<()> {
         if rect.w < 24 || rect.h < 4 {
             return Ok(());
         }
         let inner_w = (rect.w - 2) as usize;
+        // Border is bright when the panel has focus, dim otherwise — matching the
+        // pane borders, so it doesn't look permanently focused (#61).
+        let border = if focused {
+            Color::Cyan
+        } else {
+            Color::DarkGrey
+        };
         let (tot_a, tot_d) = self.entries.iter().fold((0u64, 0u64), |(a, d), e| {
             (a + e.added.unwrap_or(0), d + e.removed.unwrap_or(0))
         });
@@ -200,7 +207,7 @@ impl DiffList {
         queue!(
             out,
             ResetColor,
-            SetForegroundColor(Color::Cyan),
+            SetForegroundColor(border),
             SetAttribute(Attribute::Bold),
             cursor::MoveTo(rect.x, rect.y),
             Print(format!(
@@ -233,7 +240,7 @@ impl DiffList {
                 out,
                 cursor::MoveTo(rect.x, y),
                 ResetColor,
-                SetForegroundColor(Color::Cyan),
+                SetForegroundColor(border),
                 Print("│"),
             )?;
             let idx = start + vis;
@@ -302,7 +309,7 @@ impl DiffList {
             } else {
                 queue!(out, ResetColor, Print(" ".repeat(inner_w)))?;
             }
-            queue!(out, ResetColor, SetForegroundColor(Color::Cyan), Print("│"))?;
+            queue!(out, ResetColor, SetForegroundColor(border), Print("│"))?;
             y += 1;
         }
 
@@ -316,12 +323,12 @@ impl DiffList {
         queue!(
             out,
             cursor::MoveTo(rect.x, y),
-            SetForegroundColor(Color::Cyan),
+            SetForegroundColor(border),
             Print("│"),
             SetForegroundColor(Color::DarkGrey),
             Print(&h),
             Print(" ".repeat(inner_w.saturating_sub(h.chars().count()))),
-            SetForegroundColor(Color::Cyan),
+            SetForegroundColor(border),
             Print("│"),
             cursor::MoveTo(rect.x, y + 1),
             Print(format!("└{}┘", "─".repeat(inner_w))),

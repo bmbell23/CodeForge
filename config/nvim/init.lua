@@ -1125,7 +1125,13 @@ local function cf_diff_step(delta)
   if not st then
     return
   end
-  local files = vim.fn.systemlist({ "git", "-C", st.root, "diff", "--name-only", "HEAD" })
+  -- Use the cached changed-files list (refreshed on open/save) so stepping
+  -- doesn't re-shell it each time (#56).
+  local files = st.files
+  if not files or #files == 0 then
+    files = vim.fn.systemlist({ "git", "-C", st.root, "diff", "--name-only", "HEAD" })
+    st.files = files
+  end
   if not files or #files == 0 then
     return
   end
@@ -1137,7 +1143,95 @@ local function cf_diff_step(delta)
     end
   end
   local nxt = ((idx - 1 + delta) % #files) + 1
-  _G.CodeForgeDiffOpen(st.root .. "/" .. files[nxt])
+  -- Swap the file in the open view instead of tearing it down and rebuilding
+  -- (#56) — much snappier, and it keeps the flag so forge sees no close.
+  _G.CodeForgeDiffSwap(st.root .. "/" .. files[nxt])
+end
+
+-- The diff view's buffer-local keys, applied to each side on open and to the
+-- new right buffer after a swap (#56). Factored so open and swap stay in sync.
+local function cf_diff_apply_buf_maps(b)
+  vim.keymap.set("n", "<Esc>", _G.CodeForgeDiffClose, { buffer = b, nowait = true, silent = true })
+  vim.keymap.set("n", "<Tab>", function()
+    local st = cf_diff
+    if st then
+      local cur = vim.api.nvim_get_current_win()
+      local other = cur == st.right_win and st.left_win or st.right_win
+      if vim.api.nvim_win_is_valid(other) then
+        vim.api.nvim_set_current_win(other)
+      end
+    end
+  end, { buffer = b, nowait = true, silent = true })
+  vim.keymap.set("n", "<leader>z", cf_diff_focus_toggle, { buffer = b, silent = true })
+  vim.keymap.set("n", "]", function()
+    cf_diff_step(1)
+  end, { buffer = b, nowait = true, silent = true })
+  vim.keymap.set("n", "[", function()
+    cf_diff_step(-1)
+  end, { buffer = b, nowait = true, silent = true })
+  vim.keymap.set("n", "<CR>", function()
+    return vim.fn.foldclosed(".") ~= -1 and "za" or "<CR>"
+  end, { buffer = b, expr = true, silent = true })
+end
+
+-- Swap the file shown in an already-open diff view, reusing its tab, windows and
+-- left scratch instead of the full teardown+rebuild CodeForgeDiffOpen does
+-- (#56). Only `git show HEAD:<file>` runs (root + file list are cached); the
+-- flag is left in place so forge never sees a close. Falls back to a full open
+-- if no view is live.
+function _G.CodeForgeDiffSwap(path)
+  local st = cf_diff
+  if not (st and vim.api.nvim_win_is_valid(st.left_win) and vim.api.nvim_win_is_valid(st.right_win)) then
+    return _G.CodeForgeDiffOpen(path)
+  end
+  local rel = path:sub(#st.root + 2)
+  local head = vim.fn.systemlist({ "git", "-C", st.root, "show", "HEAD:" .. rel })
+  local untracked = false
+  if vim.v.shell_error ~= 0 then
+    head = {}
+    untracked = true
+  end
+
+  local old_right = st.right_buf
+  vim.api.nvim_set_current_win(st.right_win)
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
+  local right_buf = vim.api.nvim_get_current_buf()
+  local ft = vim.bo.filetype
+
+  vim.bo[st.left_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(st.left_buf, 0, -1, false, head)
+  pcall(vim.api.nvim_buf_set_name, st.left_buf, "HEAD: " .. rel)
+  vim.bo[st.left_buf].modifiable = false
+  vim.bo[st.left_buf].filetype = ft
+
+  -- Re-diff both sides for the new buffer.
+  vim.api.nvim_win_call(st.left_win, function()
+    vim.cmd("diffthis")
+  end)
+  vim.api.nvim_win_call(st.right_win, function()
+    vim.cmd("diffthis")
+  end)
+
+  st.rel, st.untracked, st.right_buf = rel, untracked, right_buf
+  cf_diff_apply_buf_maps(right_buf)
+  vim.api.nvim_create_autocmd("BufWritePost", {
+    group = st.aug,
+    buffer = right_buf,
+    callback = function()
+      vim.schedule(function()
+        st.files = vim.fn.systemlist({ "git", "-C", st.root, "diff", "--name-only", "HEAD" })
+        cf_diff_recompute_hunks()
+        cf_diff_map_refresh()
+      end)
+    end,
+  })
+  -- Drop the previous file buffer so they don't accumulate as you step.
+  if old_right and old_right ~= right_buf and vim.api.nvim_buf_is_valid(old_right) then
+    pcall(vim.api.nvim_buf_delete, old_right, {})
+  end
+  cf_diff_recompute_hunks()
+  cf_diff_map_refresh()
+  return "ok"
 end
 
 function _G.CodeForgeDiffOpen(path)
@@ -1209,38 +1303,16 @@ function _G.CodeForgeDiffOpen(path)
     map_buf = map_buf,
     map_win = nil,
     aug = aug,
+    -- Changed-file list for ]/[ stepping, cached so it isn't re-shelled each
+    -- step; refreshed here and on save (#56).
+    files = vim.fn.systemlist({ "git", "-C", root, "diff", "--name-only", "HEAD" }),
   }
 
-  -- Esc closes the whole view; Tab hops sides; Space-z zooms one side.
-  for _, b in ipairs({ left_buf, right_buf }) do
-    vim.keymap.set("n", "<Esc>", _G.CodeForgeDiffClose, { buffer = b, nowait = true, silent = true })
-    vim.keymap.set("n", "<Tab>", function()
-      local st = cf_diff
-      if st then
-        local cur = vim.api.nvim_get_current_win()
-        local other = cur == st.right_win and st.left_win or st.right_win
-        if vim.api.nvim_win_is_valid(other) then
-          vim.api.nvim_set_current_win(other)
-        end
-      end
-    end, { buffer = b, nowait = true, silent = true })
-    vim.keymap.set("n", "<leader>z", cf_diff_focus_toggle, { buffer = b, silent = true })
-    -- ] / [ step to the next / prev changed file (#51). `nowait` makes them
-    -- fire immediately: without it nvim waits timeoutlen (1s) to see whether the
-    -- global `]b`/`]d`/`[b`/[d` (bufferline/diagnostics) prefixes follow, which
-    -- made `]` sluggish and `[` feel dead.
-    vim.keymap.set("n", "]", function()
-      cf_diff_step(1)
-    end, { buffer = b, nowait = true, silent = true })
-    vim.keymap.set("n", "[", function()
-      cf_diff_step(-1)
-    end, { buffer = b, nowait = true, silent = true })
-    -- Enter toggles the fold under the cursor (diff mode folds the unchanged
-    -- stretches); off a fold it keeps its normal meaning.
-    vim.keymap.set("n", "<CR>", function()
-      return vim.fn.foldclosed(".") ~= -1 and "za" or "<CR>"
-    end, { buffer = b, expr = true, silent = true })
-  end
+  -- Esc closes; Tab hops sides; Space-z zooms; ] / [ step files; Enter folds
+  -- (#51/#56, factored so a swap re-applies the same set). `nowait` on ] / [
+  -- fires them instantly instead of waiting timeoutlen for ]b/]d/[b/[d.
+  cf_diff_apply_buf_maps(left_buf)
+  cf_diff_apply_buf_maps(right_buf)
 
   -- Forge opens the diff while the pane is still small, then zooms it — nvim
   -- dumps all the new columns on the rightmost window, so re-equalize on every
@@ -1295,6 +1367,9 @@ function _G.CodeForgeDiffOpen(path)
     buffer = right_buf,
     callback = function()
       vim.schedule(function()
+        if cf_diff then
+          cf_diff.files = vim.fn.systemlist({ "git", "-C", root, "diff", "--name-only", "HEAD" })
+        end
         cf_diff_recompute_hunks()
         cf_diff_map_refresh()
       end)
@@ -1315,7 +1390,7 @@ function _G.CodeForgeDiffOpen(path)
         if st.map_win and vim.api.nvim_win_is_valid(st.map_win) then
           pcall(vim.api.nvim_win_close, st.map_win, true)
         end
-        for _, k in ipairs({ "<Esc>", "<Tab>", "<leader>z", "<CR>" }) do
+        for _, k in ipairs({ "<Esc>", "<Tab>", "<leader>z", "<CR>", "]", "[" }) do
           pcall(vim.keymap.del, "n", k, { buffer = st.right_buf })
         end
         -- The right window survives the last-tab fallback close: un-dress it.
@@ -1343,9 +1418,13 @@ function _G.CodeForgeDiffClose()
       -- Only tab left (the original got closed meanwhile): drop the scratch
       -- window instead; its wipe runs the teardown autocmd above.
       for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
-        local b = vim.api.nvim_win_get_buf(win)
-        if vim.b[b].codeforge_diff_left then
-          pcall(vim.api.nvim_win_close, win, true)
+        -- Closing one window can invalidate others still in the pre-fetched
+        -- list (and swaps churn buffers), so re-check before touching each.
+        if vim.api.nvim_win_is_valid(win) then
+          local b = vim.api.nvim_win_get_buf(win)
+          if vim.b[b].codeforge_diff_left then
+            pcall(vim.api.nvim_win_close, win, true)
+          end
         end
       end
       pcall(vim.cmd, "diffoff!")
