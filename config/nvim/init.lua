@@ -231,7 +231,27 @@ require("lazy").setup({
       -- live, grouped-by-file grep with a replace field (its own spec below).
       local last_buf = ""
       local tstate = require("telescope.actions.state")
+      -- Switch the in-file search into a find & replace scoped to this file
+      -- (#52): hand the current query to grug-far with its Paths field pinned to
+      -- the file, so Ctrl-f leads into replace the same way Ctrl-g does repo-wide.
+      -- One reused instance, refreshed to the current file/query each time.
+      local function cf_replace_in_file(file, query)
+        if file == "" then
+          return
+        end
+        local gf = require("grug-far")
+        local name = "codeforge-replace"
+        local prefills = { search = query, paths = file }
+        if gf.has_instance(name) then
+          local inst = gf.get_instance(name)
+          inst:open()
+          inst:update_input_values(prefills, true)
+        else
+          gf.open({ instanceName = name, prefills = prefills })
+        end
+      end
       local function cf_find_in_file()
+        local file = vim.api.nvim_buf_get_name(0)
         t.current_buffer_fuzzy_find({
           default_text = last_buf,
           attach_mappings = function(_, map)
@@ -239,6 +259,13 @@ require("lazy").setup({
             map({ "i", "n" }, "<CR>", function(pb)
               last_buf = tstate.get_current_line() or last_buf
               actions.select_default(pb)
+            end)
+            -- Ctrl-r: replace within this file, prefilled with the query so far.
+            map({ "i", "n" }, "<C-r>", function(pb)
+              local query = tstate.get_current_line() or ""
+              last_buf = query
+              actions.close(pb)
+              cf_replace_in_file(file, query)
             end)
             return true
           end,
