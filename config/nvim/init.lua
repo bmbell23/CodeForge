@@ -144,20 +144,112 @@ do
   local notes_dir = vim.env.CODEFORGE_NOTES_DIR
   local notes_sync = vim.env.CODEFORGE_NOTES_SYNC
   if notes_dir and notes_dir ~= "" and notes_sync and notes_sync ~= "" then
+    -- Ctrl-s: write all + sync now.
     local function cf_notes_save()
       vim.cmd("silent! wall")
       vim.fn.jobstart({ notes_sync, "--now" }, { detach = true })
       vim.notify("Notes: saving…")
     end
+    local function cf_sync()
+      vim.fn.jobstart({ notes_sync, "--now" }, { detach = true })
+    end
+    -- Alt-s: rename + move the current note within the repo (#72). One path
+    -- field, prefilled with the current path relative to the Notes root, with
+    -- file/dir tab-completion; missing dirs are created; the sync pushes it.
+    local function cf_notes_save_as()
+      local cur = vim.api.nvim_buf_get_name(0)
+      if cur == "" then
+        return
+      end
+      local rel = cur:gsub("^" .. vim.pesc(notes_dir) .. "/", "")
+      vim.ui.input(
+        { prompt = "Save note as (path in Notes): ", default = rel, completion = "file" },
+        function(input)
+          if not input or vim.trim(input) == "" then
+            return
+          end
+          input = vim.trim(input)
+          if not input:match("%.md$") then
+            input = input .. ".md"
+          end
+          local dest = notes_dir .. "/" .. input
+          if dest == cur then
+            return
+          end
+          if vim.fn.filereadable(dest) == 1 then
+            vim.notify("Target already exists: " .. input, vim.log.levels.WARN)
+            return
+          end
+          vim.fn.mkdir(vim.fn.fnamemodify(dest, ":h"), "p")
+          vim.cmd("silent! write") -- persist current content to the old path first
+          local oldbuf = vim.api.nvim_get_current_buf()
+          -- git mv keeps history when tracked; fall back to a filesystem move.
+          vim.fn.system({ "git", "-C", notes_dir, "mv", "--", cur, dest })
+          if vim.v.shell_error ~= 0 then
+            if vim.fn.filereadable(cur) == 1 then
+              (vim.uv or vim.loop).fs_rename(cur, dest)
+            else
+              vim.cmd("write " .. vim.fn.fnameescape(dest))
+            end
+          end
+          vim.cmd("keepalt edit " .. vim.fn.fnameescape(dest))
+          pcall(vim.api.nvim_buf_delete, oldbuf, { force = true })
+          cf_sync()
+          vim.notify("Note → " .. input)
+        end
+      )
+    end
+    -- Alt-d: delete the current note (a throwaway scratchpad). Removes the file
+    -- (git rm when tracked) and pushes the deletion; the window is never left
+    -- empty (opens a fresh note if this was the last one) (#72).
+    local function cf_notes_delete()
+      local cur = vim.api.nvim_buf_get_name(0)
+      if vim.fn.confirm("Delete this note?", "&Yes\n&No", 2) ~= 1 then
+        return
+      end
+      local oldbuf = vim.api.nvim_get_current_buf()
+      local listed = 0
+      for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.bo[b].buflisted then
+          listed = listed + 1
+        end
+      end
+      if listed > 1 then
+        vim.cmd("silent! bprevious")
+      else
+        local t = os.date("*t")
+        local day = string.format("%s/History/%04d/%02d/%02d", notes_dir, t.year, t.month, t.day)
+        vim.fn.mkdir(day, "p")
+        local fresh = string.format(
+          "%s/%04d-%02d-%02d-%02d:%02d:%02d.md",
+          day,
+          t.year,
+          t.month,
+          t.day,
+          t.hour,
+          t.min,
+          t.sec
+        )
+        vim.cmd("edit " .. vim.fn.fnameescape(fresh))
+      end
+      pcall(vim.api.nvim_buf_delete, oldbuf, { force = true })
+      if cur ~= "" then
+        vim.fn.system({ "git", "-C", notes_dir, "rm", "-f", "--quiet", "--", cur })
+        if vim.v.shell_error ~= 0 and vim.fn.filereadable(cur) == 1 then
+          (vim.uv or vim.loop).fs_unlink(cur)
+        end
+        cf_sync() -- commit the deletion + push, if it was committed
+      end
+      vim.notify("Note deleted")
+    end
     vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile" }, {
       pattern = notes_dir .. "/*",
       callback = function(ev)
-        vim.keymap.set({ "n", "i" }, "<C-s>", function()
-          cf_notes_save()
-        end, { buffer = ev.buf, desc = "Save + sync notes" })
-        vim.keymap.set("n", "<leader>S", function()
-          cf_notes_save()
-        end, { buffer = ev.buf, desc = "Save + sync notes" })
+        local o = { buffer = ev.buf }
+        vim.keymap.set({ "n", "i" }, "<C-s>", cf_notes_save, vim.tbl_extend("force", o, { desc = "Save + sync notes" }))
+        vim.keymap.set("n", "<leader>S", cf_notes_save, vim.tbl_extend("force", o, { desc = "Save + sync notes" }))
+        vim.keymap.set({ "n", "i" }, "<M-s>", cf_notes_save_as, vim.tbl_extend("force", o, { desc = "Notes: save as / rename+move" }))
+        vim.keymap.set("n", "<M-d>", cf_notes_delete, vim.tbl_extend("force", o, { desc = "Notes: delete this note" }))
       end,
     })
   end
