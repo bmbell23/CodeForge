@@ -315,6 +315,44 @@ fn nvim_diff_close(sock: &Path) {
         .output();
 }
 
+/// The About page (#66), embedded so it opens regardless of where the shared
+/// clone lives (the exe may be run from a path with no repo alongside it).
+const ABOUT_DOC: &str = include_str!("../docs/ABOUT.md");
+
+/// Write the embedded About doc to a cache file and return its path, so nvim can
+/// `:edit` it. `$XDG_CACHE_HOME` or `~/.cache`, mirroring `config_path`.
+fn about_doc_path() -> Option<PathBuf> {
+    let base = std::env::var("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache")
+        });
+    let dir = base.join("codeforge");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("ABOUT.md");
+    // Rewrite every time so a new build's doc always wins over a stale cache.
+    std::fs::write(&path, ABOUT_DOC).ok()?;
+    Some(path)
+}
+
+/// Open `file` as a buffer in a running nvim (its RPC socket), so it shows up as
+/// an editor tab. Best-effort; `silent!` keeps it quiet if the edit fails.
+fn nvim_open_file(sock: &Path, file: &Path) {
+    if !sock.exists() {
+        return;
+    }
+    // Vim single-quoted strings escape ' by doubling it.
+    let arg = file.to_string_lossy().replace('\'', "''");
+    let _ = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg(format!("execute('silent! edit {arg}')"))
+        .output();
+}
+
 /// Capture a restorable spec for every window (open files + shell cwd).
 fn capture_specs(windows: &[Window]) -> Vec<WindowSpec> {
     windows
@@ -369,6 +407,8 @@ pub enum Msg {
     },
     /// Toggle the keybinding help overlay.
     ToggleHelp,
+    /// Open the About page (#66) in the focused window's editor pane.
+    OpenAbout,
     /// Toggle the git-diff list overlay (#18); with the full-screen diff view
     /// up, asks the editor to close it instead.
     ToggleDiff,
@@ -1857,6 +1897,33 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                     needs_clear = true;
                 }
+                Msg::OpenAbout => {
+                    // Show the bundled docs (#66) as an editor buffer: reveal +
+                    // focus the editor, then RPC-open the cached ABOUT.md.
+                    exit_copy(&mut copy, &mut windows);
+                    help = None;
+                    picker = None;
+                    let w = &mut windows[cur];
+                    if let Some(ed) = w
+                        .panes
+                        .iter()
+                        .find(|p| p.role == PaneRole::Editor)
+                        .map(|p| p.id)
+                    {
+                        if !w.show_editor {
+                            w.show_editor = true;
+                            refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                            let (c, r) = size;
+                            relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                        }
+                        w.focus_id = ed;
+                        if let Some(path) = about_doc_path() {
+                            nvim_open_file(&nvim_sock(ed), &path);
+                        }
+                        dirty = true;
+                        needs_clear = true;
+                    }
+                }
                 Msg::ToggleDiff => {
                     exit_copy(&mut copy, &mut windows);
                     help = None;
@@ -2600,6 +2667,8 @@ impl InputParser {
                         Some(Msg::Focus(FocusDir::Right))
                     } else if c == k.help {
                         Some(Msg::ToggleHelp)
+                    } else if c == k.about {
+                        Some(Msg::OpenAbout)
                     } else if c == k.picker {
                         Some(Msg::OpenPicker)
                     } else if c == k.win_new {
