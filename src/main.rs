@@ -1447,6 +1447,14 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         for msg in batch {
             match msg {
                 Msg::Output(id, bytes) => {
+                    // Forward any OSC 52 clipboard-set a pane emits to the client,
+                    // so nvim's / the shell's "copy" reaches the real terminal's
+                    // clipboard over SSH (the vt100 mirror would swallow it) (#32).
+                    if let Some(cl) = client.as_mut() {
+                        for r in osc52_ranges(&bytes) {
+                            let _ = protocol::write_frame(cl, protocol::OUTPUT, &bytes[r]);
+                        }
+                    }
                     for (wi, w) in windows.iter_mut().enumerate() {
                         if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
                             p.feed(&bytes);
@@ -3653,6 +3661,45 @@ fn osc52(text: &str) -> Vec<u8> {
     format!("\x1b]52;c;{}\x07", base64(text.as_bytes())).into_bytes()
 }
 
+/// Byte ranges of OSC 52 clipboard sequences (`ESC ] 52 ; … (BEL | ESC \)`) in
+/// raw pane output. forge renders each pane's vt100 *screen*, which swallows
+/// these, so we lift them out and forward them verbatim to the client's real
+/// terminal — that's how nvim's / the shell's "copy to system clipboard" reaches
+/// the clipboard over SSH (#32). Sequences split across output chunks aren't
+/// stitched; fine for path-sized payloads.
+fn osc52_ranges(bytes: &[u8]) -> Vec<std::ops::Range<usize>> {
+    const START: &[u8] = b"\x1b]52;";
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + START.len() <= bytes.len() {
+        if &bytes[i..i + START.len()] != START {
+            i += 1;
+            continue;
+        }
+        let mut j = i + START.len();
+        let mut end = None;
+        while j < bytes.len() {
+            if bytes[j] == 0x07 {
+                end = Some(j + 1);
+                break;
+            }
+            if bytes[j] == 0x1b && bytes.get(j + 1) == Some(&0x5c) {
+                end = Some(j + 2);
+                break;
+            }
+            j += 1;
+        }
+        match end {
+            Some(e) => {
+                out.push(i..e);
+                i = e;
+            }
+            None => break, // incomplete at the chunk boundary
+        }
+    }
+    out
+}
+
 /// Overlay the copy-mode cursor and selection highlight on an already-blitted
 /// pane. `inner` is the pane's content rect.
 fn draw_copy_overlay(
@@ -4033,6 +4080,26 @@ mod tests {
         let p4 = d.frame(&at('B'), 20, 5, true);
         assert!(p4.windows(1).any(|w| w == b"B"), "force_full repaints");
         assert!(p4.len() > p3.len(), "forced full is larger than a diff");
+    }
+
+    #[test]
+    fn osc52_ranges_extracts_clipboard_sequences() {
+        // BEL-terminated, embedded in surrounding output.
+        let bel = b"before\x1b]52;c;aGk=\x07after".to_vec();
+        let r = osc52_ranges(&bel);
+        assert_eq!(r.len(), 1);
+        assert_eq!(&bel[r[0].clone()], b"\x1b]52;c;aGk=\x07");
+
+        // ST-terminated (ESC \) and two sequences in one chunk.
+        let two = b"\x1b]52;c;YQ==\x1b\\x\x1b]52;c;Yg==\x07".to_vec();
+        let r2 = osc52_ranges(&two);
+        assert_eq!(r2.len(), 2);
+        assert_eq!(&two[r2[0].clone()], b"\x1b]52;c;YQ==\x1b\\");
+        assert_eq!(&two[r2[1].clone()], b"\x1b]52;c;Yg==\x07");
+
+        // No OSC 52 -> nothing; an unterminated one is skipped (chunk boundary).
+        assert!(osc52_ranges(b"plain text \x1b[1mbold\x1b[0m").is_empty());
+        assert!(osc52_ranges(b"\x1b]52;c;dHJ1bmNhdGVk").is_empty());
     }
 
     #[test]

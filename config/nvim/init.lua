@@ -349,6 +349,8 @@ require("lazy").setup({
           show_buffer_close_icons = false,
           show_close_icon = false,
           separator_style = "thin",
+          -- Right-click a tab -> path/close menu for that buffer (#32).
+          right_mouse_command = "lua CF_tab_menu(%d)",
         },
       })
       -- Cycle / reorder / close buffers. ]b [b move; <leader>bp pins a picker.
@@ -384,6 +386,68 @@ require("lazy").setup({
           { desc = "Go to buffer/tab " .. i }
         )
       end
+
+      -- Tab context menu (#32): right-click a tab, or <leader>bm for the current
+      -- one. Copies emit OSC 52 so the path reaches the system clipboard over
+      -- SSH (forge forwards pane OSC 52 to the real terminal).
+      local function cf_clip(text, label)
+        vim.fn.setreg("+", text)
+        vim.fn.setreg('"', text)
+        local ok, osc = pcall(require, "vim.ui.clipboard.osc52")
+        if ok then
+          pcall(osc.copy("+"), { text })
+        end
+        vim.notify((label or "Copied") .. ": " .. text)
+      end
+      local function cf_close_buf(bufnr)
+        if vim.bo[bufnr].modified then
+          vim.notify("Unsaved changes — :w first", vim.log.levels.WARN)
+          return
+        end
+        local listed = vim.tbl_filter(function(b)
+          return vim.bo[b].buflisted
+        end, vim.api.nvim_list_bufs())
+        pcall(vim.api.nvim_buf_delete, bufnr, {})
+        if #listed <= 1 and _G.CodeForgeSplash then
+          _G.CodeForgeSplash()
+        end
+      end
+      function _G.CF_tab_menu(bufnr)
+        bufnr = (bufnr and bufnr ~= 0) and bufnr or vim.api.nvim_get_current_buf()
+        local path = vim.api.nvim_buf_get_name(bufnr)
+        if path == "" then
+          vim.notify("No file for this tab", vim.log.levels.WARN)
+          return
+        end
+        local name = vim.fn.fnamemodify(path, ":t")
+        local items = {
+          { "Copy absolute path", function() cf_clip(vim.fn.fnamemodify(path, ":p"), "Copied path") end },
+          -- ":." is relative to nvim's cwd, which forge sets to the project root.
+          { "Copy relative path", function() cf_clip(vim.fn.fnamemodify(path, ":."), "Copied path") end },
+          { "Copy file name", function() cf_clip(name, "Copied name") end },
+          { "Close tab", function() cf_close_buf(bufnr) end },
+          { "Close others", function()
+            for _, b in ipairs(vim.api.nvim_list_bufs()) do
+              if b ~= bufnr and vim.bo[b].buflisted then
+                pcall(vim.api.nvim_buf_delete, b, {})
+              end
+            end
+          end },
+        }
+        vim.ui.select(items, {
+          prompt = "Tab: " .. name,
+          format_item = function(it)
+            return it[1]
+          end,
+        }, function(choice)
+          if choice then
+            choice[2]()
+          end
+        end)
+      end
+      vim.keymap.set("n", "<leader>bm", function()
+        CF_tab_menu(0)
+      end, { desc = "Tab actions menu" })
     end,
   },
 
