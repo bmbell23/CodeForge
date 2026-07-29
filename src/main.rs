@@ -409,6 +409,8 @@ pub enum Msg {
     ToggleHelp,
     /// Open the About page (#66) in the focused window's editor pane.
     OpenAbout,
+    /// Toggle fullscreen of the focused pane, hiding the other two (#40).
+    ZoomPane,
     /// Toggle the git-diff list overlay (#18); with the full-screen diff view
     /// up, asks the editor to close it instead.
     ToggleDiff,
@@ -471,6 +473,9 @@ struct Window {
     attention: bool,
     /// Last-seen AI-pane bell count, to detect new bells.
     last_ai_bell: usize,
+    /// Saved (editor, shell, ai) visibility while the focused pane is manually
+    /// fullscreened (#40); `None` when not zoomed. Toggling restores it.
+    zoom_prev: Option<(bool, bool, bool)>,
 }
 
 /// Slot index for a role: editor 0, shell 1, ai 2. Used to index `Window.active`.
@@ -737,6 +742,7 @@ fn new_window(
         show_ai: sa,
         attention: false,
         last_ai_bell: 0,
+        zoom_prev: None,
     })
 }
 
@@ -1924,6 +1930,27 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         needs_clear = true;
                     }
                 }
+                Msg::ZoomPane => {
+                    // Fullscreen the focused pane, hiding the other two; a second
+                    // press restores the saved layout (#40).
+                    exit_copy(&mut copy, &mut windows);
+                    help = None;
+                    picker = None;
+                    let (c, r) = size;
+                    let w = &mut windows[cur];
+                    if let Some(prev) = w.zoom_prev.take() {
+                        (w.show_editor, w.show_shell, w.show_ai) = prev;
+                    } else if let Some(role) = w.focus_role() {
+                        w.zoom_prev = Some((w.show_editor, w.show_shell, w.show_ai));
+                        w.show_editor = role == PaneRole::Editor;
+                        w.show_shell = role == PaneRole::Shell;
+                        w.show_ai = role == PaneRole::Ai;
+                    }
+                    refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                    relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                    dirty = true;
+                    needs_clear = true;
+                }
                 Msg::ToggleDiff => {
                     exit_copy(&mut copy, &mut windows);
                     help = None;
@@ -2669,6 +2696,8 @@ impl InputParser {
                         Some(Msg::ToggleHelp)
                     } else if c == k.about {
                         Some(Msg::OpenAbout)
+                    } else if c == k.zoom {
+                        Some(Msg::ZoomPane)
                     } else if c == k.picker {
                         Some(Msg::OpenPicker)
                     } else if c == k.win_new {

@@ -222,6 +222,9 @@ pub struct Keys {
     /// Open the About page (#66): bundled docs on how CodeForge is built,
     /// shown in the editor pane.
     pub about: char,
+    /// Fullscreen the focused pane, hiding the other two; press again to
+    /// restore the previous layout (#40).
+    pub zoom: char,
 }
 
 impl Default for Config {
@@ -276,6 +279,7 @@ impl Default for Keys {
             copy: 'v',
             git_diff: 'g',
             about: 'i',
+            zoom: 'z',
         }
     }
 }
@@ -283,10 +287,11 @@ impl Default for Keys {
 /// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
 /// `(config field, human label)`. Focus keys are listed individually so each
 /// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
-pub const EDITABLE: [(&str, &str); 23] = [
+pub const EDITABLE: [(&str, &str); 24] = [
     ("toggle_editor", "show/hide editor"),
     ("toggle_shell", "show/hide terminal"),
     ("toggle_ai", "show/hide Claude"),
+    ("zoom", "fullscreen focused pane"),
     ("git_diff", "git diff (changed files)"),
     ("about", "about / how it's built"),
     ("tab_new", "new terminal/Claude tab"),
@@ -336,6 +341,7 @@ impl Keys {
             "copy" => self.copy,
             "git_diff" => self.git_diff,
             "about" => self.about,
+            "zoom" => self.zoom,
             _ => return None,
         })
     }
@@ -377,6 +383,7 @@ impl Keys {
             "copy" => self.copy = ch,
             "git_diff" => self.git_diff = ch,
             "about" => self.about = ch,
+            "zoom" => self.zoom = ch,
             _ => return false,
         }
         true
@@ -406,7 +413,7 @@ impl Keys {
     }
 
     /// All (action, key) bindings, for help display and conflict checking.
-    fn bindings(&self) -> [(&'static str, char); 23] {
+    fn bindings(&self) -> [(&'static str, char); 24] {
         [
             ("focus_left", self.focus_left),
             ("focus_down", self.focus_down),
@@ -431,6 +438,7 @@ impl Keys {
             ("copy", self.copy),
             ("git_diff", self.git_diff),
             ("about", self.about),
+            ("zoom", self.zoom),
         ]
     }
 
@@ -721,6 +729,7 @@ tab_close = "w"  # close the active tab in the focused slot
 copy = "v"       # copy/scroll mode on the focused pane (scroll, select, copy)
 git_diff = "g"   # git diff list; pick a file for a side-by-side editable diff
 about = "i"      # About page: bundled docs on how CodeForge is built
+zoom = "z"       # fullscreen the focused pane (hide the other two); again restores
 # also: prefix + 1..9 jumps to that window
 
 # Editor (nvim) keybindings — full chords passed through to Neovim, so the
