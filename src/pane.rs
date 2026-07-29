@@ -216,8 +216,11 @@ impl Pane {
 
     /// Whether the child has enabled a mouse reporting mode. Forwarding mouse
     /// events to a child that hasn't (e.g. a bare shell) just prints junk.
-    pub fn wants_mouse(&self) -> bool {
-        self.parser.screen().mouse_protocol_mode() != vt100::MouseProtocolMode::None
+    /// The child's current mouse-reporting mode, so forge only forwards the
+    /// event classes the app actually asked for (motion vs click), and never
+    /// leaks raw sequences into a pane in click-only / stale mode (#73).
+    pub fn mouse_mode(&self) -> vt100::MouseProtocolMode {
+        self.parser.screen().mouse_protocol_mode()
     }
 
     /// Scroll the view by `delta` rows into history (positive = back in time).

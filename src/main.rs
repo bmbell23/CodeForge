@@ -1955,11 +1955,13 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 w.focus_id = id;
                                 dirty = true;
                             }
-                            let wants_mouse = w
+                            let mouse_mode = w
                                 .panes
                                 .iter()
                                 .find(|p| p.id == id)
-                                .is_some_and(|p| p.wants_mouse());
+                                .map(|p| p.mouse_mode())
+                                .unwrap_or(vt100::MouseProtocolMode::None);
+                            let wants_mouse = mouse_mode != vt100::MouseProtocolMode::None;
                             let inner = rect.inner();
                             // Cell under the pointer within the pane's content rect.
                             let cell = inner.and_then(|i| {
@@ -2045,6 +2047,21 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                         forward(w, button, false)?;
                                     }
                                     _ => {}
+                                }
+                            } else if is_motion {
+                                // Motion (move / non-left drag): only forward when
+                                // the app actually tracks motion, so a pane left in
+                                // click-only or stale mouse mode never gets raw
+                                // sequences typed into it (#73). ButtonMotion wants
+                                // drags (a button held, code != 3); AnyMotion wants
+                                // every move.
+                                let track = match mouse_mode {
+                                    vt100::MouseProtocolMode::AnyMotion => true,
+                                    vt100::MouseProtocolMode::ButtonMotion => button != 3,
+                                    _ => false,
+                                };
+                                if track {
+                                    forward(w, cb, press)?;
                                 }
                             } else if wants_mouse {
                                 // Other buttons (right/middle) go to the app as-is.
