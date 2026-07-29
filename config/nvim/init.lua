@@ -38,6 +38,7 @@ do
     explorer = "Space e",
     close_tab = "Space b d",
     file_history = "Space g h",
+    goto_line = "Space l",
   }
   local raw = vim.env.CODEFORGE_EDITOR_KEYS
   if raw then
@@ -133,6 +134,27 @@ opt.mousemodel = "popup_setpos"
 -- the bang) anchors at the text cursor instead of the mouse pointer; the menu's
 -- LSP entries are the global ones added on LspAttach, so this shares #31's menu.
 vim.keymap.set("n", "<leader>m", "<Cmd>popup! PopUp<CR>", { desc = "Context menu at cursor" })
+
+-- Jump to a line by number (#59): press the goto_line key, then type digits —
+-- the cursor moves live after each one (8 -> 81 -> 810), no Enter needed. Any
+-- non-digit (Esc, Enter, ...) ends it, leaving the cursor where it landed.
+-- Out-of-range numbers clamp to the last line.
+local function cf_goto_line()
+  local n = ""
+  while true do
+    local ok, ch = pcall(vim.fn.getcharstr)
+    if not ok or not ch:match("^%d$") then
+      break
+    end
+    n = n .. ch
+    local total = vim.api.nvim_buf_line_count(0)
+    local line = math.min(math.max(tonumber(n), 1), total)
+    pcall(vim.api.nvim_win_set_cursor, 0, { line, 0 })
+    pcall(vim.cmd, "normal! ^") -- land on first non-blank, like `G`
+    vim.cmd("redraw")
+  end
+end
+vim.keymap.set("n", CFKeys.lhs("goto_line"), cf_goto_line, { desc = "Jump to line (type digits, live)" })
 opt.clipboard = "unnamedplus"
 opt.ignorecase = true
 opt.smartcase = true

@@ -72,6 +72,8 @@ pub struct EditorKeys {
     pub close_tab: String,
     /// Git file history for the current file.
     pub file_history: String,
+    /// Jump to a line number: type digits, cursor moves live, no Enter (#59).
+    pub goto_line: String,
 }
 
 impl Default for EditorKeys {
@@ -83,6 +85,7 @@ impl Default for EditorKeys {
             explorer: "Space e".into(),
             close_tab: "Space b d".into(),
             file_history: "Space g h".into(),
+            goto_line: "Space l".into(),
         }
     }
 }
@@ -99,6 +102,7 @@ impl EditorKeys {
             ("explorer", &self.explorer),
             ("close_tab", &self.close_tab),
             ("file_history", &self.file_history),
+            ("goto_line", &self.goto_line),
         ]
         .iter()
         .map(|(k, v)| format!("{k}={v}"))
@@ -115,6 +119,7 @@ impl EditorKeys {
             "explorer" => &self.explorer,
             "close_tab" => &self.close_tab,
             "file_history" => &self.file_history,
+            "goto_line" => &self.goto_line,
             _ => return None,
         })
     }
@@ -128,6 +133,7 @@ impl EditorKeys {
             "explorer" => self.explorer = tok,
             "close_tab" => self.close_tab = tok,
             "file_history" => self.file_history = tok,
+            "goto_line" => self.goto_line = tok,
             _ => return false,
         }
         true
@@ -137,11 +143,12 @@ impl EditorKeys {
 /// Editor-key actions, in the order shown in the `Ctrl-a ?` overlay:
 /// `(config field, human label)`. Edited via a typed token (persisted to the
 /// `[editor_keys]` block) rather than a single char, and applied on reload.
-pub const EDITOR_EDITABLE: [(&str, &str); 6] = [
+pub const EDITOR_EDITABLE: [(&str, &str); 7] = [
     ("open_file", "open file"),
     ("search_in_file", "search in file"),
     ("search_repo", "search repo (grep)"),
     ("explorer", "file explorer"),
+    ("goto_line", "jump to line"),
     ("close_tab", "close editor tab"),
     ("file_history", "git file history"),
 ];
@@ -729,6 +736,7 @@ search_repo    = "Space f g"    # live-grep across the repo
 explorer       = "Space e"      # toggle the file explorer
 close_tab      = "Space b d"    # close the current editor buffer/tab
 file_history   = "Space g h"    # git history of the current file
+goto_line      = "Space l"      # jump to a line: type digits, live, no Enter
 # next/prev editor tab use the prefix keys (Ctrl-a ] / Ctrl-a [).
 "#;
 
