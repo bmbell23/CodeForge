@@ -239,6 +239,24 @@ fn nvim_close_buffer(sock: &Path) {
         .output();
 }
 
+/// Close the current note in the Notes editor; if it's the last one, open a
+/// fresh `newnote` first so the window is never left empty (#70). The count and
+/// buffer juggling happen in nvim (`CF_notes_close`); we just pass the path.
+fn nvim_notes_close(sock: &Path, newnote: &Path) {
+    if !sock.exists() {
+        return;
+    }
+    let arg = newnote.to_string_lossy().replace('\'', "''");
+    let _ = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg(format!("v:lua.CF_notes_close('{arg}')"))
+        .output();
+}
+
 /// Cycle the editor's open buffers over RPC, so the same prev/next-tab keys that
 /// stack the terminal/Claude slots also flip through nvim's buffers (its "tabs")
 /// when the editor is focused. Uses bufferline's cycle so the order matches the
@@ -411,6 +429,9 @@ pub enum Msg {
     OpenAbout,
     /// Toggle fullscreen of the focused pane, hiding the other two (#40).
     ZoomPane,
+    /// Go to the Notes window (position 0), creating it — with a fresh
+    /// timestamped note — if it doesn't exist yet (#70).
+    OpenNotes,
     /// Toggle the git-diff list overlay (#18); with the full-screen diff view
     /// up, asks the editor to close it instead.
     ToggleDiff,
@@ -476,6 +497,9 @@ struct Window {
     /// Saved (editor, shell, ai) visibility while the focused pane is manually
     /// fullscreened (#40); `None` when not zoomed. Toggling restores it.
     zoom_prev: Option<(bool, bool, bool)>,
+    /// This is THE Notes window (its dir is `notes_dir()`), so it lives at
+    /// position 0 and `tab_new` makes a new timestamped note (#70).
+    notes: bool,
 }
 
 /// Slot index for a role: editor 0, shell 1, ai 2. Used to index `Window.active`.
@@ -691,6 +715,88 @@ fn open_diff_view(
     Ok(true)
 }
 
+/// The Notes project: `<projects_root>/Notes` — a real, source-controlled repo,
+/// pinned to window position 0 (mod-0). New notes are timestamped `.md` files
+/// filed under `History/YYYY/MM/DD/` (#70).
+fn notes_dir() -> PathBuf {
+    projects_root().join("Notes")
+}
+
+/// Path for a new timestamped note: `<notes>/History/YYYY/MM/DD/YYYY-MM-DD-HH:MM:SS.md`.
+/// The caller must create the parent dir before the editor writes it.
+fn notes_note_path(base: &Path, now: chrono::DateTime<chrono::Local>) -> PathBuf {
+    base.join("History")
+        .join(now.format("%Y").to_string())
+        .join(now.format("%m").to_string())
+        .join(now.format("%d").to_string())
+        .join(format!("{}.md", now.format("%Y-%m-%d-%H:%M:%S")))
+}
+
+/// Decide which note(s) the Notes window opens on (re)build. Same-day resume
+/// reopens whatever was open; on a new day (no open note dated today) it opens a
+/// single fresh note for today instead, so each day starts clean (#70).
+fn notes_spec_for_today(mut spec: WindowSpec, now: chrono::DateTime<chrono::Local>) -> WindowSpec {
+    let today = now.format("%Y-%m-%d").to_string();
+    let has_today = spec.files.iter().any(|f| {
+        f.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(&today))
+    });
+    if !has_today {
+        spec.files = vec![notes_note_path(&spec.dir, now)];
+    }
+    spec
+}
+
+/// A file under `$XDG_RUNTIME_DIR` (falling back to the temp dir), the shared
+/// side-channel between the Notes sync script and CodeForge's status bar (#71).
+fn runtime_file(name: &str) -> PathBuf {
+    std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(name)
+}
+
+/// The Notes auto-sync script in the shared clone (`<clone>/scripts/…`), derived
+/// from the running binary at `<clone>/target/release/forge` (#71).
+fn notes_sync_script() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let clone = exe.parent()?.parent()?.parent()?;
+    let s = clone.join("scripts").join("notes-autosync.sh");
+    s.exists().then_some(s)
+}
+
+/// The Notes sync status line for the status bar: conflict, unsaved (needs
+/// Ctrl-s), or synced with the last-sync time. The script maintains the flag /
+/// timestamp files; dirtiness is a cheap `git status` (#71).
+fn notes_status_line(dir: &Path) -> String {
+    if runtime_file("codeforge-notes-conflict").exists() {
+        return "Notes: CONFLICT — resolve".into();
+    }
+    let dirty = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false);
+    if dirty {
+        return "Notes: unsaved — ^S to save".into();
+    }
+    let synced = std::fs::read_to_string(runtime_file("codeforge-notes-synced-at"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .and_then(|e| {
+            use chrono::TimeZone;
+            chrono::Local.timestamp_opt(e, 0).single()
+        });
+    match synced {
+        Some(d) => format!("Notes: synced {}", d.format("%H:%M")),
+        None => "Notes: synced".into(),
+    }
+}
+
 /// The last path component, for the window's status-bar label.
 fn dir_title(dir: &Path) -> String {
     dir.file_name()
@@ -743,6 +849,9 @@ fn new_window(
         attention: false,
         last_ai_bell: 0,
         zoom_prev: None,
+        // The Notes window is the one pinned to the Notes repo; this also
+        // re-marks it after a session restore, which keys off the dir (#70).
+        notes: spec.dir == notes_dir(),
     })
 }
 
@@ -847,6 +956,11 @@ fn build_editor(
         // the live keys after a rebind rather than the hardcoded defaults (#28).
         c.env("CODEFORGE_PREFIX", &cfg.prefix);
         c.env("CODEFORGE_PREFIX_KEYS", cfg.keys.env_string());
+        // So nvim can bind Ctrl-s in Notes buffers to write-all + sync (#71).
+        c.env("CODEFORGE_NOTES_DIR", notes_dir());
+        if let Some(s) = notes_sync_script() {
+            c.env("CODEFORGE_NOTES_SYNC", s);
+        }
         let sock = nvim_sock(id);
         let _ = std::fs::remove_file(&sock); // stale socket blocks --listen
         let _ = std::fs::remove_file(diff_flag(id)); // stale diff flag (#18)
@@ -856,8 +970,9 @@ fn build_editor(
             c.arg("-c");
             c.arg("set nowrap");
         }
-        // init.lua autosaves unless this global is 0 (#19).
-        if !cfg.autosave {
+        // init.lua autosaves unless this global is 0 (#19). Notes always
+        // autosaves regardless of the global setting (#70).
+        if !cfg.autosave && *dir != notes_dir() {
             c.arg("-c");
             c.arg("let g:codeforge_autosave=0");
         }
@@ -1394,13 +1509,70 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         });
     }
 
+    // Notes sync status for the status bar (#71): a background poll of the flag /
+    // timestamp files the sync script maintains, plus a cheap git-dirty check.
+    // Only nudges a redraw when the line changes.
+    let notes_status = Arc::new(Mutex::new(String::new()));
+    if notes_dir().is_dir() {
+        let notes_status = notes_status.clone();
+        let tx = tx.clone();
+        let ndir = notes_dir();
+        thread::spawn(move || loop {
+            let line = notes_status_line(&ndir);
+            {
+                let mut g = notes_status.lock().unwrap();
+                if *g != line {
+                    *g = line;
+                    let _ = tx.send(Msg::Tick);
+                }
+            }
+            thread::sleep(Duration::from_secs(4));
+        });
+    }
+
     let mut windows: Vec<Window> = Vec::new();
     let mut next_id: usize = 0;
     for spec in &specs {
-        windows.push(new_window(spec, &cfg, &shell, next_id, &tx)?);
+        // On restore, the Notes window opens today's note (fresh on a new day),
+        // not yesterday's (#70).
+        let spec = if spec.dir == notes_dir() {
+            let s = notes_spec_for_today(spec.clone(), chrono::Local::now());
+            if let Some(day) = s.files.first().and_then(|f| f.parent()) {
+                let _ = std::fs::create_dir_all(day);
+            }
+            s
+        } else {
+            spec.clone()
+        };
+        windows.push(new_window(&spec, &cfg, &shell, next_id, &tx)?);
         next_id += 3;
     }
-    let mut cur = 0usize;
+    // The Notes window always exists at position 0 (mod-0) (#70). If a restored
+    // window is it, move it to the front; otherwise create it now with a fresh
+    // timestamped note. It's a normal window otherwise — closable, returns on
+    // mod-0.
+    if let Some(i) = windows.iter().position(|w| w.notes) {
+        if i != 0 {
+            let w = windows.remove(i);
+            windows.insert(0, w);
+        }
+    } else {
+        let dir = notes_dir();
+        let note = notes_note_path(&dir, chrono::Local::now());
+        if let Some(day) = note.parent() {
+            let _ = std::fs::create_dir_all(day);
+        }
+        let spec = WindowSpec {
+            dir,
+            shell_cwd: None,
+            files: vec![note],
+        };
+        let w = new_window(&spec, &cfg, &shell, next_id, &tx)?;
+        next_id += 3;
+        windows.insert(0, w);
+    }
+    // Land on the first real project window when there is one, not Notes.
+    let mut cur = windows.iter().position(|w| !w.notes).unwrap_or(0);
     let mut help: Option<HelpState> = None;
     let mut copy: Option<CopyMode> = None;
     let mut msel: Option<MouseSel> = None;
@@ -2097,6 +2269,40 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                     needs_clear = true;
                 }
+                Msg::OpenNotes => {
+                    // Singleton at position 0: jump to Notes if it exists, else
+                    // create it and open a fresh timestamped note. The note goes
+                    // in via spec.files so the just-launched nvim opens it itself
+                    // (its RPC isn't ready to drive yet) (#70).
+                    exit_copy(&mut copy, &mut windows);
+                    help = None;
+                    picker = None;
+                    diff = None;
+                    if let Some(i) = windows.iter().position(|w| w.notes) {
+                        cur = i;
+                    } else {
+                        let dir = notes_dir();
+                        let note = notes_note_path(&dir, chrono::Local::now());
+                        if let Some(day) = note.parent() {
+                            let _ = std::fs::create_dir_all(day);
+                        }
+                        let base = next_id;
+                        next_id = base + 3;
+                        let spec = WindowSpec {
+                            dir,
+                            shell_cwd: None,
+                            files: vec![note],
+                        };
+                        let w = new_window(&spec, &cfg, &shell, base, &tx)?;
+                        windows.insert(0, w);
+                        cur = 0;
+                    }
+                    let (c, r) = size;
+                    let w = &mut windows[cur];
+                    relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                    dirty = true;
+                    needs_clear = true;
+                }
                 Msg::CloseWindow => {
                     for p in &mut windows[cur].panes {
                         p.kill();
@@ -2124,6 +2330,19 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     let area = r.saturating_sub(1);
                     let role = windows[cur].focus_role();
                     match role {
+                        // In Notes, a new "tab" (mod-r) is a fresh timestamped
+                        // note filed under History/YYYY/MM/DD; the editor opens it
+                        // and autosave writes it once you type (#70).
+                        Some(PaneRole::Editor) if windows[cur].notes => {
+                            let w = &windows[cur];
+                            let ed = w.active[role_index(PaneRole::Editor)];
+                            let note = notes_note_path(&w.dir, chrono::Local::now());
+                            if let Some(day) = note.parent() {
+                                let _ = std::fs::create_dir_all(day);
+                            }
+                            nvim_open_file(&nvim_sock(ed), &note);
+                            dirty = true;
+                        }
                         Some(PaneRole::Shell) => {
                             let id = next_id;
                             next_id += 1;
@@ -2197,9 +2416,20 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
                     if let Some(PaneRole::Editor) = w.focus_role() {
-                        // Editor is a single nvim: close the current buffer (tab)
-                        // over RPC, leaving nvim alive.
-                        nvim_close_buffer(&nvim_sock(w.focus_id));
+                        if w.notes {
+                            // Notes: close the current note; if it was the last
+                            // one, open a fresh timestamped note so the window is
+                            // never left empty (#70).
+                            let note = notes_note_path(&w.dir, chrono::Local::now());
+                            if let Some(day) = note.parent() {
+                                let _ = std::fs::create_dir_all(day);
+                            }
+                            nvim_notes_close(&nvim_sock(w.focus_id), &note);
+                        } else {
+                            // Editor is a single nvim: close the current buffer
+                            // (tab) over RPC, leaving nvim alive.
+                            nvim_close_buffer(&nvim_sock(w.focus_id));
+                        }
                     } else if let Some(role) = w.focus_role() {
                         let ids = w.slot_ids(role);
                         if ids.len() > 1 {
@@ -2396,6 +2626,13 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 // Right side, left-to-right: metrics, weather, date, clock — each
                 // gated by its config toggle (#16).
                 let mut segs: Vec<String> = Vec::new();
+                // Notes sync status shows first, but only in the Notes window (#71).
+                if windows[cur].notes {
+                    let ns = notes_status.lock().unwrap().clone();
+                    if !ns.is_empty() {
+                        segs.push(ns);
+                    }
+                }
                 if cfg.status_metrics {
                     let m = metrics.lock().unwrap().clone();
                     if !m.is_empty() {
@@ -2730,8 +2967,11 @@ impl InputParser {
                         Some(Msg::Reload)
                     } else if c == k.fresh {
                         Some(Msg::ClearSession)
-                    } else if b.is_ascii_digit() && b != b'0' {
-                        Some(Msg::SelectWindow((b - b'1') as usize))
+                    } else if b == b'0' {
+                        Some(Msg::OpenNotes)
+                    } else if b.is_ascii_digit() {
+                        // Notes owns index 0 (mod-0), so mod-N selects index N (#70).
+                        Some(Msg::SelectWindow((b - b'0') as usize))
                     } else if b == self.prefix {
                         // prefix prefix -> a literal prefix byte to the child.
                         self.passthrough.push(self.prefix);
@@ -3059,7 +3299,6 @@ fn draw_status(
         SetForegroundColor(Color::White),
         Print(" ".repeat(cols as usize)),
         cursor::MoveTo(0, y),
-        Print(" forge "),
     )?;
 
     // Tabs must stay on this one row: if they'd overflow they wrap past the last
@@ -3069,7 +3308,9 @@ fn draw_status(
     let labels: Vec<String> = windows
         .iter()
         .enumerate()
-        .map(|(i, w)| format!(" {}:{} ", i + 1, w.title))
+        // Notes is pinned at index 0 (mod-0); projects follow at 1.. (mod-1..),
+        // so the tab number is the 0-based index (#70).
+        .map(|(i, w)| format!(" {}:{} ", i, w.title))
         .collect();
     let widths: Vec<usize> = labels.iter().map(|s| s.chars().count()).collect();
     let rwidth = if right_info.is_empty() {
@@ -3078,7 +3319,7 @@ fn draw_status(
         right_info.chars().count() + 2
     };
     // Leave the final column untouched so nothing triggers an auto-wrap/scroll.
-    let avail = (cols as usize).saturating_sub(7 /* " forge " */ + rwidth + 1);
+    let avail = (cols as usize).saturating_sub(rwidth + 1);
     let (start, end) = visible_tabs(&widths, cur, avail);
     if start > 0 {
         queue!(
@@ -4100,6 +4341,19 @@ mod tests {
         // No OSC 52 -> nothing; an unterminated one is skipped (chunk boundary).
         assert!(osc52_ranges(b"plain text \x1b[1mbold\x1b[0m").is_empty());
         assert!(osc52_ranges(b"\x1b]52;c;dHJ1bmNhdGVk").is_empty());
+    }
+
+    #[test]
+    fn notes_note_path_files_by_day() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 7, 29, 14, 30, 12)
+            .unwrap();
+        let p = notes_note_path(Path::new("/n/Notes"), now);
+        assert_eq!(
+            p,
+            PathBuf::from("/n/Notes/History/2026/07/29/2026-07-29-14:30:12.md")
+        );
     }
 
     #[test]

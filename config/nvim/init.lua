@@ -135,6 +135,52 @@ opt.mousemodel = "popup_setpos"
 -- LSP entries are the global ones added on LspAttach, so this shares #31's menu.
 vim.keymap.set("n", "<leader>m", "<Cmd>popup! PopUp<CR>", { desc = "Context menu at cursor" })
 
+-- Notes: Ctrl-s (and <leader>S) in Notes-repo buffers writes all and kicks the
+-- sync script (commit + pull + push) immediately — the "Save now" button (#71).
+-- Works because CodeForge runs the terminal raw (flow control off), so Ctrl-s
+-- reaches nvim instead of freezing. Bound only under the Notes dir, which
+-- CodeForge passes in via env.
+do
+  local notes_dir = vim.env.CODEFORGE_NOTES_DIR
+  local notes_sync = vim.env.CODEFORGE_NOTES_SYNC
+  if notes_dir and notes_dir ~= "" and notes_sync and notes_sync ~= "" then
+    local function cf_notes_save()
+      vim.cmd("silent! wall")
+      vim.fn.jobstart({ notes_sync, "--now" }, { detach = true })
+      vim.notify("Notes: saving…")
+    end
+    vim.api.nvim_create_autocmd({ "BufReadPost", "BufNewFile" }, {
+      pattern = notes_dir .. "/*",
+      callback = function(ev)
+        vim.keymap.set({ "n", "i" }, "<C-s>", function()
+          cf_notes_save()
+        end, { buffer = ev.buf, desc = "Save + sync notes" })
+        vim.keymap.set("n", "<leader>S", function()
+          cf_notes_save()
+        end, { buffer = ev.buf, desc = "Save + sync notes" })
+      end,
+    })
+  end
+end
+
+-- Close the current Notes note (mod-x); if it's the last buffer, open the fresh
+-- timestamped note CodeForge passes in first, so the Notes window is never left
+-- empty (#70). Called over RPC from forge's tab_close handler.
+function _G.CF_notes_close(newpath)
+  local listed = 0
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.bo[b].buflisted then
+      listed = listed + 1
+    end
+  end
+  if listed > 1 then
+    vim.cmd("silent! bprevious | bdelete #")
+  else
+    vim.cmd("edit " .. vim.fn.fnameescape(newpath))
+    vim.cmd("silent! bdelete #")
+  end
+end
+
 -- Jump to a line by number (#59): press the goto_line key, then type digits —
 -- the cursor moves live after each one (8 -> 81 -> 810), no Enter needed. Any
 -- non-digit (Esc, Enter, ...) ends it, leaving the cursor where it landed.
@@ -349,6 +395,18 @@ require("lazy").setup({
           show_buffer_close_icons = false,
           show_close_icon = false,
           separator_style = "thin",
+          -- Don't render a tab for buffers that aren't a real file — the initial
+          -- empty [No Name] and the CodeForge splash. Otherwise a janky blank /
+          -- "[No Name]" tab shows next to the splash.
+          custom_filter = function(bufnr)
+            if vim.api.nvim_buf_get_name(bufnr) == "" then
+              return false
+            end
+            if vim.bo[bufnr].filetype == "alpha" then
+              return false
+            end
+            return true
+          end,
           -- Right-click a tab -> path/close menu for that buffer (#32).
           right_mouse_command = "lua CF_tab_menu(%d)",
         },
@@ -1684,12 +1742,21 @@ if vim.g.codeforge_autosave ~= 0 then
   vim.api.nvim_create_autocmd({ "TextChanged", "InsertLeave", "FocusLost", "BufLeave" }, {
     callback = function(ev)
       local bo = vim.bo[ev.buf]
+      local name = vim.api.nvim_buf_get_name(ev.buf)
+      -- Don't create a file on disk for a brand-new, still-empty buffer — e.g. a
+      -- fresh Notes note you haven't written yet. No blank notes get committed
+      -- (#70). (Emptying an existing file still saves.)
+      local empty = vim.api.nvim_buf_line_count(ev.buf) == 1
+        and (vim.api.nvim_buf_get_lines(ev.buf, 0, 1, false)[1] or "") == ""
+      if empty and name ~= "" and vim.fn.filereadable(name) == 0 then
+        return
+      end
       if
         bo.buftype == "" -- a normal file buffer (not oil, alpha, terminal, …)
         and bo.modifiable
         and bo.modified
         and not bo.readonly
-        and vim.api.nvim_buf_get_name(ev.buf) ~= ""
+        and name ~= ""
       then
         -- `silent!` so a no-write situation (e.g. a new no-name split) is quiet.
         vim.cmd("silent! noautocmd write")
