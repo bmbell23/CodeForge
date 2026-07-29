@@ -221,7 +221,7 @@ impl Default for Config {
             projects_root: None,
             editor: "nvim".into(),
             shell: None,
-            ai: "auggie".into(),
+            ai: "claude".into(),
             editor_ratio: 0.5,
             right_ratio: 0.5,
             weather: "Colorado Springs".into(),
@@ -652,7 +652,7 @@ prefix = "C-a"
 # Startup panes. `editor` and `ai` are command lines (split on spaces).
 # The editor opens the project dir (or, on restore, your previously open files).
 editor = "nvim"
-ai = "auggie"           # any AI CLI, e.g. "claude"; claude gets --continue/--resume
+ai = "claude"           # any AI CLI, e.g. "auggie"; claude gets --continue/--resume
 # shell = "/bin/bash"   # defaults to $SHELL
 
 # Which panes open when a project window is first created. At least one true.
