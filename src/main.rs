@@ -23,7 +23,7 @@
 //!   Ctrl-a p     open the project picker (re-home the current window)
 //!   Ctrl-a c     new window (its own editor/shell/AI for another project)
 //!   Ctrl-a X     close the current window (kills its panes)
-//!   Ctrl-a n     next window   ·   Ctrl-a 1..9  jump to window
+//!   Ctrl-a n     next window   ·   Ctrl-a 1..9  jump to window (1 = last used)
 //!   Ctrl-a g     git diff: persistent panel of changed files with +/- counts
 //!                over the terminal pane (stays up until toggled again, Esc
 //!                with the terminal focused, or the terminal is toggled);
@@ -317,6 +317,27 @@ fn nvim_diff_open(sock: &Path, file: &Path) -> bool {
         && String::from_utf8_lossy(&o.stdout).trim() == "ok")
 }
 
+/// Same side-by-side view, but for `file` between two commits (#74): `base` on
+/// the left, `head` on the right, both read-only since neither is the working
+/// copy. True only when nvim confirms.
+fn nvim_diff_open_rev(sock: &Path, file: &Path, base: &str, head: &str) -> bool {
+    if !sock.exists() {
+        return false;
+    }
+    let arg = file.to_string_lossy().replace('\'', "''");
+    let (b, h) = (base.replace('\'', "''"), head.replace('\'', "''"));
+    let out = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg(format!("v:lua.CodeForgeDiffOpenRev('{arg}','{b}','{h}')"))
+        .output();
+    matches!(out, Ok(o) if o.status.success()
+        && String::from_utf8_lossy(&o.stdout).trim() == "ok")
+}
+
 /// Ask the editor to close the side-by-side diff view. Best-effort: the flag
 /// file vanishing is what actually drives the layout restore.
 fn nvim_diff_close(sock: &Path) {
@@ -427,6 +448,8 @@ pub enum Msg {
     ToggleHelp,
     /// Open the About page (#66) in the focused window's editor pane.
     OpenAbout,
+    /// Open the window switcher (#78): a popup list of the open projects.
+    OpenWindowList,
     /// Toggle fullscreen of the focused pane, hiding the other two (#40).
     ZoomPane,
     /// Go to the Notes window (position 0), creating it — with a fresh
@@ -500,6 +523,10 @@ struct Window {
     /// This is THE Notes window (its dir is `notes_dir()`), so it lives at
     /// position 0 and `tab_new` makes a new timestamped note (#70).
     notes: bool,
+    /// Monotonic tick of when this window was last focused, newest highest.
+    /// `mod-N` numbers projects by this rather than by creation order, so the
+    /// last project you were in is always `mod-1` (#77).
+    used: u64,
 }
 
 /// Slot index for a role: editor 0, shell 1, ai 2. Used to index `Window.active`.
@@ -665,10 +692,17 @@ fn diff_overlay_rect(w: &Window, cols: u16, rows: u16) -> Rect {
 /// A watcher thread waits for nvim's flag file to vanish (Esc / close / exit)
 /// and then sends `Msg::DiffClosed` so the saved layout comes back. Returns
 /// false (layout untouched) when the editor didn't respond.
+/// What the full-window diff view should show: a file's working-tree diff
+/// (HEAD vs the file on disk), or that file between two commits (#74).
+enum DiffTarget<'a> {
+    File(&'a Path),
+    FileRev(&'a Path, &'a str, &'a str),
+}
+
 fn open_diff_view(
     windows: &mut [Window],
     cur: usize,
-    path: &Path,
+    target: DiffTarget<'_>,
     diff_zoom: &mut Option<DiffZoom>,
     cfg: &Config,
     size: (u16, u16),
@@ -680,7 +714,13 @@ fn open_diff_view(
     // A stale flag (earlier crash) must not make the watcher fire instantly;
     // nvim re-creates it during the open call below.
     let _ = std::fs::remove_file(&flag);
-    if !nvim_diff_open(&nvim_sock(ed), path) {
+    let opened = match target {
+        DiffTarget::File(path) => nvim_diff_open(&nvim_sock(ed), path),
+        DiffTarget::FileRev(path, base, head) => {
+            nvim_diff_open_rev(&nvim_sock(ed), path, base, head)
+        }
+    };
+    if !opened {
         return Ok(false);
     }
     if diff_zoom.is_none() {
@@ -852,7 +892,55 @@ fn new_window(
         // The Notes window is the one pinned to the Notes repo; this also
         // re-marks it after a session restore, which keys off the dir (#70).
         notes: spec.dir == notes_dir(),
+        // Ordered behind every window already in use, so a newly opened project
+        // slots in as the least-recent until you switch to it (#77).
+        used: 0,
     })
+}
+
+/// Project windows ordered most-recently-used first, skipping the current one
+/// (you're already there) and Notes (pinned to `mod-0`). `mod-N` selects the
+/// Nth of these, so `mod-1` is always the project you were in last (#77).
+fn mru_order(windows: &[Window], cur: usize) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..windows.len())
+        .filter(|&i| i != cur && !windows[i].notes)
+        .collect();
+    // Newest first; ties (never-visited windows) keep their creation order.
+    idx.sort_by_key(|&i| (std::cmp::Reverse(windows[i].used), i));
+    idx
+}
+
+/// Left-to-right order of the tab strip (#77): Notes stays pinned to the far
+/// left as `mod-0`, then the current window (no number), then the other projects
+/// by recency. Projects shuffle as you use them, so "the project I was just in"
+/// is always the tab right after the current one, and always `mod-1`.
+fn tab_order(windows: &[Window], cur: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..windows.len())
+        .filter(|&i| windows[i].notes && i != cur)
+        .collect();
+    if cur < windows.len() {
+        order.push(cur);
+    }
+    order.extend(mru_order(windows, cur));
+    order
+}
+
+/// The `mod-N` number shown on each window's tab: `0` for Notes, its recency
+/// position for the rest, and `None` for the current window — pressing a number
+/// to get where you already are is wasted (#77).
+fn tab_numbers(windows: &[Window], cur: usize) -> Vec<Option<usize>> {
+    let order = mru_order(windows, cur);
+    (0..windows.len())
+        .map(|i| {
+            if windows[i].notes {
+                Some(0)
+            } else if i == cur {
+                None
+            } else {
+                order.iter().position(|&j| j == i).map(|p| p + 1)
+            }
+        })
+        .collect()
 }
 
 /// Spawn the three panes (editor + terminal + AI) for `spec`, ids from `base`.
@@ -1360,7 +1448,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let listener = UnixListener::bind(sock).context("binding server socket")?;
 
     let (cfg, _) = Config::load();
-    let prefix = cfg.prefix_byte();
+    let prefix = cfg.prefix_chord();
     // Shared so the `Ctrl-a ?` editor can rebind keys live: reader-thread
     // parsers and the event loop all see the same mapping.
     let keys = Arc::new(Mutex::new(cfg.keys));
@@ -1573,6 +1661,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     }
     // Land on the first real project window when there is one, not Notes.
     let mut cur = windows.iter().position(|w| !w.notes).unwrap_or(0);
+    // Monotonic clock behind `mod-N`'s recency order (#77); the window we start
+    // on is stamped as the newest below.
+    let mut use_tick: u64 = 0;
     let mut help: Option<HelpState> = None;
     let mut copy: Option<CopyMode> = None;
     let mut msel: Option<MouseSel> = None;
@@ -1582,6 +1673,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // A "new Claude tab: resume or fresh?" chooser is showing (#54); the next
     // key (r/n/Esc) resolves it.
     let mut ai_tab_prompt = false;
+    // The window switcher is up (#78); it owns input until Enter/Esc.
+    let mut switcher: Option<WinSwitcher> = None;
     let mut diff: Option<DiffList> = None;
     let mut diff_zoom: Option<DiffZoom> = None;
     // Editor fullscreen while a grug-far search is open (#53), mirroring the
@@ -1638,7 +1731,36 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     }
                 }
                 Msg::Input(bytes) => {
-                    if ai_tab_prompt {
+                    if let Some(sw) = switcher.as_mut() {
+                        // Modal: arrows move, everything else filters/picks (#78).
+                        let mut done = false;
+                        let mut pick = None;
+                        if bytes.starts_with(b"\x1b[A") {
+                            sw.step(&windows, cur, -1);
+                        } else if bytes.starts_with(b"\x1b[B") {
+                            sw.step(&windows, cur, 1);
+                        } else {
+                            for &b in bytes.iter() {
+                                if let Some(i) = sw.feed(&windows, cur, b, &mut done) {
+                                    pick = Some(i);
+                                }
+                                if done {
+                                    break;
+                                }
+                            }
+                        }
+                        if done {
+                            switcher = None;
+                        }
+                        if let Some(i) = pick {
+                            if i != cur {
+                                exit_copy(&mut copy, &mut windows);
+                                cur = i;
+                            }
+                        }
+                        dirty = true;
+                        needs_clear = true;
+                    } else if ai_tab_prompt {
                         // Modal chooser for a new Claude tab (#54): r resume,
                         // n new, Esc/Ctrl-c cancel; other keys ignored.
                         match bytes.first().copied().unwrap_or(0) {
@@ -1788,11 +1910,15 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 diff = None;
                                 needs_clear = true;
                             }
-                            DiffAction::Open(p) => {
+                            DiffAction::Open { path, rev } => {
+                                let target = match &rev {
+                                    Some((b, h)) => DiffTarget::FileRev(&path, b, h),
+                                    None => DiffTarget::File(&path),
+                                };
                                 if !open_diff_view(
                                     &mut windows,
                                     cur,
-                                    &p,
+                                    target,
                                     &mut diff_zoom,
                                     &cfg,
                                     size,
@@ -1903,18 +2029,27 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                     }
                                 } else if press && cb & 3 == 0 && cb & 32 == 0 {
                                     if let Some(i) = dl.row_at(&rect, px, py) {
-                                        dl.select(i);
-                                        if let Some(p) = dl.entry_path(i) {
+                                        // In the commit list a click marks the
+                                        // row; elsewhere it opens the file (#74).
+                                        if let DiffAction::Open { path, rev } = dl.click(i) {
+                                            let target = match &rev {
+                                                Some((b, h)) => DiffTarget::FileRev(&path, b, h),
+                                                None => DiffTarget::File(&path),
+                                            };
                                             if !open_diff_view(
                                                 &mut windows,
                                                 cur,
-                                                &p,
+                                                target,
                                                 &mut diff_zoom,
                                                 &cfg,
                                                 size,
                                                 &tx,
                                             )? {
-                                                dl.set_note("editor didn't respond — try again");
+                                                if let Some(dl) = diff.as_mut() {
+                                                    dl.set_note(
+                                                        "editor didn't respond — try again",
+                                                    );
+                                                }
                                             }
                                             needs_clear = true;
                                         }
@@ -2097,6 +2232,16 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     } else {
                         Some(HelpState::new())
                     };
+                    dirty = true;
+                    needs_clear = true;
+                }
+                Msg::OpenWindowList => {
+                    // Open the switcher fresh each time — a stale filter from
+                    // the last visit would hide most of the list (#78).
+                    switcher = Some(WinSwitcher {
+                        filter: String::new(),
+                        sel: 0,
+                    });
                     dirty = true;
                     needs_clear = true;
                 }
@@ -2476,7 +2621,13 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     }
                 }
                 Msg::SelectWindow(n) => {
-                    if n < windows.len() && n != cur {
+                    // `mod-N` counts back through recently-used projects rather
+                    // than indexing the window list, so `mod-1` is always the
+                    // one you just came from (#77).
+                    let target = n
+                        .checked_sub(1)
+                        .and_then(|p| mru_order(&windows, cur).get(p).copied());
+                    if let Some(n) = target {
                         exit_copy(&mut copy, &mut windows);
                         cur = n;
                         // The git-diff panel follows the current project (#60):
@@ -2561,6 +2712,16 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     break;
                 }
             }
+        }
+
+        // Stamp the window we ended the batch on as the most recently used, so
+        // `mod-N` numbering reflects where you've actually been (#77). Keying
+        // off the tick rather than each `cur = …` site catches every way the
+        // current window changes (select, new, close, Notes).
+        if windows[cur].used != use_tick {
+            use_tick += 1;
+            windows[cur].used = use_tick;
+            dirty = true;
         }
 
         if quit {
@@ -2699,6 +2860,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     picker.as_ref(),
                     wtform.as_ref(),
                     ai_tab_prompt,
+                    switcher.as_ref(),
                     dl,
                     &right_info,
                     ksnap,
@@ -2746,6 +2908,12 @@ fn run_client(sock: &Path) -> Result<()> {
     let mut out = io::stdout();
     enable_raw_mode().context("enabling raw mode")?;
     queue!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
+    // Ask for the kitty keyboard protocol in "disambiguate" mode (#67) so chords
+    // with no legacy encoding — Ctrl-Space, the prefix — arrive as distinct CSI-u
+    // events. Terminals without it ignore the push; the server re-encodes every
+    // non-prefix event back to legacy bytes before any pane sees it, so nothing
+    // downstream changes. TerminalGuard pops it on every exit path.
+    out.write_all(b"\x1b[>1u")?;
     out.flush()?;
     let _guard = TerminalGuard;
 
@@ -2867,6 +3035,54 @@ fn relayout(panes: &mut [Pane], layout: &Layout, cols: u16, rows: u16) -> Result
     Ok(())
 }
 
+/// Parse a kitty key event's parameters (`code[:shifted:base][;mods[:type]]`,
+/// #67) into `(code, ctrl, alt)`. Shift is ignored: the terminal already sends
+/// the shifted code point, so the modifier adds nothing we act on.
+fn parse_key_event(params: &[u8]) -> Option<(u32, bool, bool)> {
+    let s = std::str::from_utf8(params).ok()?;
+    let mut fields = s.split(';');
+    // Sub-parameters after `:` describe alternate keys we don't use.
+    let code: u32 = fields.next()?.split(':').next()?.parse().ok()?;
+    // The modifier field is a bitmask + 1; absent means no modifiers. Bit 0 is
+    // shift, 1 alt, 2 ctrl.
+    let mods: u32 = fields
+        .next()
+        .and_then(|f| f.split(':').next())
+        .and_then(|m| m.parse::<u32>().ok())
+        .unwrap_or(1)
+        .saturating_sub(1);
+    Some((code, mods & 0b100 != 0, mods & 0b010 != 0))
+}
+
+/// Re-encode a key event as the bytes a terminal without the kitty protocol
+/// would have sent, so panes see exactly what they always have (#67). Empty when
+/// there's no legacy encoding (Ctrl-Space is NUL, which is why it can be a
+/// prefix in the first place).
+fn legacy_bytes(code: u32, ctrl: bool, alt: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Alt is the classic ESC prefix.
+    if alt {
+        out.push(0x1b);
+    }
+    match (ctrl, char::from_u32(code)) {
+        // Ctrl masks bits 6/7, and only over the ASCII range that maps onto a
+        // control code — Ctrl-Space (NUL) and friends have no usable byte.
+        (true, Some(c)) if c.is_ascii() => {
+            let b = (c as u8).to_ascii_uppercase() & 0x1f;
+            if b == 0 {
+                return Vec::new();
+            }
+            out.push(b);
+        }
+        (false, Some(c)) => {
+            let mut buf = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        }
+        _ => return Vec::new(),
+    }
+    out
+}
+
 /// Reader state: what we're in the middle of parsing on the stdin byte stream.
 enum InState {
     /// Normal keystrokes.
@@ -2875,7 +3091,8 @@ enum InState {
     Prefix,
     /// Saw `ESC`; might be the start of a CSI/mouse sequence.
     Esc,
-    /// Saw `ESC [`; a `<` next means an SGR mouse sequence.
+    /// Saw `ESC [`; a `<` next means an SGR mouse sequence, otherwise we collect
+    /// parameters until the final byte (`u` = a kitty key event, #67).
     Csi,
     /// Inside an SGR mouse sequence (`ESC [ < ...`), collecting `cb;x;y`.
     Mouse,
@@ -2889,28 +3106,163 @@ enum InState {
 struct InputParser {
     state: InState,
     mouse: Vec<u8>,
+    /// Parameter bytes of the CSI sequence being collected (#67).
+    csi: Vec<u8>,
     passthrough: Vec<u8>,
-    prefix: u8,
+    /// The chord that opens a command. `prefix.byte` is `None` for a chord with
+    /// no legacy encoding (Ctrl-Space), which only a kitty-protocol terminal can
+    /// deliver — `fallback` then keeps Ctrl-a live so no terminal locks the user
+    /// out (#67).
+    prefix: config::Prefix,
+    fallback: Option<u8>,
+    /// The prefix was pressed and a mouse sequence arrived before the command
+    /// key did (#76). Moving the mouse isn't a keystroke, so it must not spend
+    /// the prefix: the sequence is parsed as usual and the prefix re-arms after
+    /// it, leaving `Ctrl-a`, twitch, `1` working like `Ctrl-a 1`.
+    prefix_pending: bool,
     /// Shared with the event loop so live rebinds (the `Ctrl-a ?` editor) take
     /// effect immediately: the parser reads the current mapping on each prefix.
     keys: Arc<Mutex<Keys>>,
 }
 
 impl InputParser {
-    fn new(prefix: u8, keys: Arc<Mutex<Keys>>) -> InputParser {
+    fn new(prefix: config::Prefix, keys: Arc<Mutex<Keys>>) -> InputParser {
         InputParser {
             state: InState::Normal,
             mouse: Vec::new(),
+            csi: Vec::new(),
             passthrough: Vec::new(),
-            prefix: prefix.max(1),
+            // Ctrl-a stays live only when the configured prefix can't be typed
+            // without the kitty protocol; otherwise it's an ordinary key.
+            fallback: prefix.byte.is_none().then_some(0x01),
+            prefix,
+            prefix_pending: false,
             keys,
         }
+    }
+
+    /// Whether byte `b` opens a command: the configured prefix, or the Ctrl-a
+    /// fallback when the configured one is CSI-u only.
+    fn is_prefix_byte(&self, b: u8) -> bool {
+        self.prefix.byte == Some(b) || self.fallback == Some(b)
     }
 
     /// Flush buffered passthrough as a `Msg::Input` into `out`.
     fn flush(&mut self, out: &mut Vec<Msg>) {
         if !self.passthrough.is_empty() {
             out.push(Msg::Input(std::mem::take(&mut self.passthrough)));
+        }
+    }
+
+    /// Resolve the key pressed after the prefix into a command. Shared by the
+    /// byte path and the kitty key-event path (#67), which translates its chord
+    /// to the same byte first.
+    fn command(&mut self, b: u8, out: &mut Vec<Msg>) {
+        let k = *self.keys.lock().unwrap();
+        let c = b as char;
+        let cmd = if c == k.quit {
+            Some(Msg::Quit)
+        } else if c == k.cycle {
+            Some(Msg::FocusNext)
+        } else if c == k.toggle_editor {
+            Some(Msg::Toggle(PaneRole::Editor))
+        } else if c == k.toggle_shell {
+            Some(Msg::Toggle(PaneRole::Shell))
+        } else if c == k.toggle_ai {
+            Some(Msg::Toggle(PaneRole::Ai))
+        } else if c == k.focus_left {
+            Some(Msg::Focus(FocusDir::Left))
+        } else if c == k.focus_down {
+            Some(Msg::Focus(FocusDir::Down))
+        } else if c == k.focus_up {
+            Some(Msg::Focus(FocusDir::Up))
+        } else if c == k.focus_right {
+            Some(Msg::Focus(FocusDir::Right))
+        } else if c == k.help {
+            Some(Msg::ToggleHelp)
+        } else if c == k.about {
+            Some(Msg::OpenAbout)
+        } else if c == k.win_list {
+            Some(Msg::OpenWindowList)
+        } else if c == k.zoom {
+            Some(Msg::ZoomPane)
+        } else if c == k.picker {
+            Some(Msg::OpenPicker)
+        } else if c == k.win_new {
+            Some(Msg::NewWindow)
+        } else if c == k.win_close {
+            Some(Msg::CloseWindow)
+        } else if c == k.tab_new {
+            Some(Msg::TabNew)
+        } else if c == k.tab_next {
+            Some(Msg::TabCycle(1))
+        } else if c == k.tab_prev {
+            Some(Msg::TabCycle(-1))
+        } else if c == k.tab_close {
+            Some(Msg::TabClose)
+        } else if c == k.copy {
+            Some(Msg::CopyMode)
+        } else if c == k.git_diff {
+            Some(Msg::ToggleDiff)
+        } else if c == k.detach {
+            Some(Msg::Detach)
+        } else if c == k.reload {
+            Some(Msg::Reload)
+        } else if c == k.fresh {
+            Some(Msg::ClearSession)
+        } else if b == b'0' {
+            Some(Msg::OpenNotes)
+        } else if b.is_ascii_digit() {
+            // Notes owns index 0 (mod-0), so mod-N selects index N (#70).
+            Some(Msg::SelectWindow((b - b'0') as usize))
+        } else if self.is_prefix_byte(b) {
+            // prefix prefix -> a literal prefix byte to the child.
+            self.passthrough.push(b);
+            None
+        } else {
+            None
+        };
+        if let Some(m) = cmd {
+            self.flush(out);
+            out.push(m);
+        }
+    }
+
+    /// Handle a kitty key event (`ESC [ code ; mods u`, #67). The prefix chord
+    /// opens a command; everything else is re-encoded to the bytes a plain
+    /// terminal would have sent, because the panes below us (bash/readline
+    /// especially) don't speak the protocol — only the outer client does.
+    fn key_event(&mut self, params: &[u8], out: &mut Vec<Msg>) {
+        let Some(ev) = parse_key_event(params) else {
+            self.prefix_pending = false;
+            return;
+        };
+        let (code, ctrl, alt) = ev;
+        if code == self.prefix.code && ctrl == self.prefix.ctrl && alt == self.prefix.alt {
+            // The prefix itself: arm it (pressing it twice sends one literally,
+            // matching the byte path).
+            if matches!(self.state, InState::Prefix) && !self.prefix_pending {
+                self.passthrough
+                    .extend_from_slice(&legacy_bytes(code, ctrl, alt));
+                self.state = InState::Normal;
+            } else {
+                self.prefix_pending = false;
+                self.state = InState::Prefix;
+            }
+            return;
+        }
+        let bytes = legacy_bytes(code, ctrl, alt);
+        // A parked prefix (#76) or one armed by this very chord resolves against
+        // the translated byte, so `Ctrl-Space` then `1` works like any command.
+        let armed = self.prefix_pending || matches!(self.state, InState::Prefix);
+        self.prefix_pending = false;
+        if armed {
+            self.state = InState::Normal;
+            if let Some(&first) = bytes.first() {
+                self.command(first, out);
+            }
+        } else {
+            self.passthrough.extend_from_slice(&bytes);
         }
     }
 
@@ -2921,7 +3273,7 @@ impl InputParser {
             let last = i + 1 == n;
             match self.state {
                 InState::Normal => match b {
-                    _ if b == self.prefix => self.state = InState::Prefix,
+                    _ if self.is_prefix_byte(b) => self.state = InState::Prefix,
                     // A bare ESC (last byte of the chunk) is a real Esc keypress:
                     // pass it straight through. Terminals deliver escape
                     // sequences (arrows, mouse) atomically, so an ESC that isn't
@@ -2932,80 +3284,26 @@ impl InputParser {
                     0x1b => self.state = InState::Esc,
                     _ => self.passthrough.push(b),
                 },
+                // An ESC here starts a sequence, not a command: park the prefix
+                // and pick it back up once the sequence is parsed (#76). A lone
+                // ESC (last byte of the chunk) is a real keypress — same rule as
+                // in `Normal` — and cancels the prefix as it always has.
+                InState::Prefix if b == 0x1b && !last => {
+                    self.prefix_pending = true;
+                    self.state = InState::Esc;
+                }
                 InState::Prefix => {
                     self.state = InState::Normal;
-                    let k = *self.keys.lock().unwrap();
-                    let c = b as char;
-                    let cmd = if c == k.quit {
-                        Some(Msg::Quit)
-                    } else if c == k.cycle {
-                        Some(Msg::FocusNext)
-                    } else if c == k.toggle_editor {
-                        Some(Msg::Toggle(PaneRole::Editor))
-                    } else if c == k.toggle_shell {
-                        Some(Msg::Toggle(PaneRole::Shell))
-                    } else if c == k.toggle_ai {
-                        Some(Msg::Toggle(PaneRole::Ai))
-                    } else if c == k.focus_left {
-                        Some(Msg::Focus(FocusDir::Left))
-                    } else if c == k.focus_down {
-                        Some(Msg::Focus(FocusDir::Down))
-                    } else if c == k.focus_up {
-                        Some(Msg::Focus(FocusDir::Up))
-                    } else if c == k.focus_right {
-                        Some(Msg::Focus(FocusDir::Right))
-                    } else if c == k.help {
-                        Some(Msg::ToggleHelp)
-                    } else if c == k.about {
-                        Some(Msg::OpenAbout)
-                    } else if c == k.zoom {
-                        Some(Msg::ZoomPane)
-                    } else if c == k.picker {
-                        Some(Msg::OpenPicker)
-                    } else if c == k.win_new {
-                        Some(Msg::NewWindow)
-                    } else if c == k.win_close {
-                        Some(Msg::CloseWindow)
-                    } else if c == k.tab_new {
-                        Some(Msg::TabNew)
-                    } else if c == k.tab_next {
-                        Some(Msg::TabCycle(1))
-                    } else if c == k.tab_prev {
-                        Some(Msg::TabCycle(-1))
-                    } else if c == k.tab_close {
-                        Some(Msg::TabClose)
-                    } else if c == k.copy {
-                        Some(Msg::CopyMode)
-                    } else if c == k.git_diff {
-                        Some(Msg::ToggleDiff)
-                    } else if c == k.detach {
-                        Some(Msg::Detach)
-                    } else if c == k.reload {
-                        Some(Msg::Reload)
-                    } else if c == k.fresh {
-                        Some(Msg::ClearSession)
-                    } else if b == b'0' {
-                        Some(Msg::OpenNotes)
-                    } else if b.is_ascii_digit() {
-                        // Notes owns index 0 (mod-0), so mod-N selects index N (#70).
-                        Some(Msg::SelectWindow((b - b'0') as usize))
-                    } else if b == self.prefix {
-                        // prefix prefix -> a literal prefix byte to the child.
-                        self.passthrough.push(self.prefix);
-                        None
-                    } else {
-                        None
-                    };
-                    if let Some(m) = cmd {
-                        self.flush(out);
-                        out.push(m);
-                    }
+                    self.command(b, out);
                 }
                 InState::Esc => match b {
                     b'[' => self.state = InState::Csi,
                     _ => {
+                        // Not a sequence: this was a real Esc keypress, which
+                        // cancels a parked prefix like any other non-command key.
+                        self.prefix_pending = false;
                         self.passthrough.push(0x1b);
-                        if b == self.prefix {
+                        if self.is_prefix_byte(b) {
                             self.state = InState::Prefix;
                         } else if b == 0x1b {
                             self.state = InState::Esc;
@@ -3016,18 +3314,37 @@ impl InputParser {
                     }
                 },
                 InState::Csi => {
-                    if b == b'<' {
+                    if self.csi.is_empty() && b == b'<' {
                         self.state = InState::Mouse;
                         self.mouse.clear();
-                    } else {
-                        self.passthrough.extend_from_slice(b"\x1b[");
-                        self.passthrough.push(b);
+                    } else if (0x40..=0x7e).contains(&b) {
+                        // Final byte: `u` is a kitty key event (#67), anything
+                        // else is an ordinary sequence (arrows, Home, …).
                         self.state = InState::Normal;
+                        let params = std::mem::take(&mut self.csi);
+                        if b == b'u' {
+                            self.key_event(&params, out);
+                        } else {
+                            // A real key: it isn't a prefix binding, so it spends
+                            // a parked prefix and goes to the pane as-is.
+                            self.prefix_pending = false;
+                            self.passthrough.extend_from_slice(b"\x1b[");
+                            self.passthrough.extend_from_slice(&params);
+                            self.passthrough.push(b);
+                        }
+                    } else {
+                        self.csi.push(b);
                     }
                 }
                 InState::Mouse => {
                     if b == b'M' || b == b'm' {
-                        self.state = InState::Normal;
+                        // Re-arm a prefix the mouse interrupted (#76).
+                        self.state = if self.prefix_pending {
+                            self.prefix_pending = false;
+                            InState::Prefix
+                        } else {
+                            InState::Normal
+                        };
                         if let Some(ev) = parse_mouse(&self.mouse, b == b'M') {
                             self.flush(out);
                             out.push(ev);
@@ -3121,6 +3438,7 @@ fn render(
     picker: Option<&Picker>,
     wtform: Option<&WorktreeForm>,
     ai_prompt: bool,
+    switcher: Option<&WinSwitcher>,
     diff: Option<&DiffList>,
     right_info: &str,
     keys: Keys,
@@ -3218,6 +3536,9 @@ fn render(
             w.focus_id == w.active[1],
         )?;
     }
+    if let Some(sw) = switcher {
+        sw.render(out, windows, cur, cols, rows)?;
+    }
     if ai_prompt {
         draw_ai_tab_prompt(out, cols, rows)?;
     }
@@ -3225,6 +3546,182 @@ fn render(
     out.extend_from_slice(b"\x1b[?2026l");
     out.flush()?;
     Ok(())
+}
+
+/// The window switcher (#78): a modal list of the open projects, filtered by
+/// typing and picked by Enter or by the window's `mod-N` number.
+struct WinSwitcher {
+    /// Typed filter; empty means "show everything", and only then do digits
+    /// jump to a window instead of filtering (project names contain digits).
+    filter: String,
+    /// Highlighted position within the filtered rows.
+    sel: usize,
+}
+
+/// One row of the switcher: which window, and the `mod-N` number it answers to
+/// (`None` for the current window, which has no number).
+struct WinRow {
+    idx: usize,
+    number: Option<usize>,
+}
+
+impl WinSwitcher {
+    /// Rows in the order they're shown: the recency-numbered projects first
+    /// (`mod-1` at the top, which is what you're usually reaching for), then
+    /// Notes, then the window you're already in.
+    fn rows(windows: &[Window], cur: usize) -> Vec<WinRow> {
+        let numbers = tab_numbers(windows, cur);
+        let mut rows: Vec<WinRow> = (0..windows.len())
+            .map(|idx| WinRow {
+                idx,
+                number: numbers[idx],
+            })
+            .collect();
+        rows.sort_by_key(|r| match r.number {
+            Some(0) => (1, 0), // Notes
+            Some(n) => (0, n), // projects, most recent first
+            None => (2, 0),    // the current window
+        });
+        rows
+    }
+
+    /// Rows surviving the filter (case-insensitive substring of the title).
+    fn filtered(&self, windows: &[Window], cur: usize) -> Vec<WinRow> {
+        let f = self.filter.to_lowercase();
+        Self::rows(windows, cur)
+            .into_iter()
+            .filter(|r| f.is_empty() || windows[r.idx].title.to_lowercase().contains(&f))
+            .collect()
+    }
+
+    /// Handle a key. `Some(idx)` selects that window and closes the switcher;
+    /// the caller closes it on `None` only when `done` is set.
+    fn feed(&mut self, windows: &[Window], cur: usize, b: u8, done: &mut bool) -> Option<usize> {
+        let rows = self.filtered(windows, cur);
+        match b {
+            0x1b | 0x03 => *done = true, // Esc / Ctrl-c
+            b'\r' | b'\n' => {
+                *done = true;
+                return rows.get(self.sel).map(|r| r.idx);
+            }
+            // A digit with nothing typed yet is the window's own number.
+            b'0'..=b'9' if self.filter.is_empty() => {
+                let n = (b - b'0') as usize;
+                *done = true;
+                return rows.iter().find(|r| r.number == Some(n)).map(|r| r.idx);
+            }
+            0x7f | 0x08 => {
+                self.filter.pop();
+                self.sel = 0;
+            }
+            0x20..=0x7e => {
+                self.filter.push(b as char);
+                self.sel = 0;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Move the highlight, clamped to the filtered rows.
+    fn step(&mut self, windows: &[Window], cur: usize, delta: i32) {
+        let n = self.filtered(windows, cur).len();
+        if n == 0 {
+            return;
+        }
+        self.sel = (self.sel as i64 + delta as i64).clamp(0, n as i64 - 1) as usize;
+    }
+
+    /// Draw the popup centered over the screen.
+    fn render(
+        &self,
+        out: &mut Vec<u8>,
+        windows: &[Window],
+        cur: usize,
+        cols: u16,
+        rows_h: u16,
+    ) -> Result<()> {
+        let rows = self.filtered(windows, cur);
+        let hint = " type to filter · number jumps · Enter open · Esc cancel ";
+        let widest = rows
+            .iter()
+            .map(|r| windows[r.idx].title.chars().count() + 6)
+            .chain(std::iter::once(hint.chars().count()))
+            .max()
+            .unwrap_or(20);
+        let iw = widest.min(cols.saturating_sub(4) as usize);
+        let bw = iw as u16 + 2;
+        // Rows + the filter line + the hint line + both borders.
+        let bh = rows.len() as u16 + 4;
+        if bw > cols || bh > rows_h {
+            return Ok(());
+        }
+        let x = (cols - bw) / 2;
+        let y = (rows_h - bh) / 2;
+        let line = |s: &str| -> String {
+            let t: String = s.chars().take(iw).collect();
+            format!("{t}{}", " ".repeat(iw.saturating_sub(t.chars().count())))
+        };
+        queue!(
+            out,
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            cursor::MoveTo(x, y),
+            Print(format!("┌{}┐", "─".repeat(iw))),
+            SetAttribute(Attribute::Reset),
+        )?;
+        // Filter line, so you can see what you've typed.
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 1),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+            SetForegroundColor(Color::White),
+            Print(line(&format!(" › {}▏", self.filter))),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+        )?;
+        for (i, r) in rows.iter().enumerate() {
+            let w = &windows[r.idx];
+            let tag = match r.number {
+                Some(n) => format!("{n}"),
+                None => "•".to_string(), // where you are now
+            };
+            queue!(
+                out,
+                cursor::MoveTo(x, y + 2 + i as u16),
+                SetForegroundColor(Color::Cyan),
+                Print("│"),
+            )?;
+            if i == self.sel {
+                queue!(
+                    out,
+                    SetBackgroundColor(Color::Cyan),
+                    SetForegroundColor(Color::Black)
+                )?;
+            } else {
+                queue!(out, ResetColor)?;
+            }
+            queue!(out, Print(line(&format!(" {tag}  {}", w.title))))?;
+            queue!(out, ResetColor, SetForegroundColor(Color::Cyan), Print("│"))?;
+        }
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 2 + rows.len() as u16),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+            SetForegroundColor(Color::DarkGrey),
+            Print(line(hint)),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+            cursor::MoveTo(x, y + 3 + rows.len() as u16),
+            Print(format!("└{}┘", "─".repeat(iw))),
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            cursor::Hide,
+        )?;
+        Ok(())
+    }
 }
 
 /// Draw the "new Claude tab: resume or fresh?" chooser, centered (#54).
@@ -3322,12 +3819,19 @@ fn draw_status(
     // cell and scroll the whole layout up (#55). Fit a scrolling window of tabs
     // (always including the current one) into the space between " forge " and
     // the right-aligned info, with ‹/› markers for hidden tabs.
-    let labels: Vec<String> = windows
+    // Notes keeps mod-0 (#70); projects are numbered by recency and the current
+    // window shows no number at all, matching what `mod-N` actually does (#77).
+    let numbers = tab_numbers(windows, cur);
+    // The strip itself is ordered by recency (#77): the project you're on sits
+    // first with no number, then mod-1, mod-2, … behind it, with Notes (mod-0)
+    // pinned to the end. So the tab you'd reach for is always in the same place.
+    let order = tab_order(windows, cur);
+    let labels: Vec<String> = order
         .iter()
-        .enumerate()
-        // Notes is pinned at index 0 (mod-0); projects follow at 1.. (mod-1..),
-        // so the tab number is the 0-based index (#70).
-        .map(|(i, w)| format!(" {}:{} ", i, w.title))
+        .map(|&i| match numbers[i] {
+            Some(n) => format!(" {}:{} ", n, windows[i].title),
+            None => format!(" {} ", windows[i].title),
+        })
         .collect();
     let widths: Vec<usize> = labels.iter().map(|s| s.chars().count()).collect();
     let rwidth = if right_info.is_empty() {
@@ -3337,7 +3841,10 @@ fn draw_status(
     };
     // Leave the final column untouched so nothing triggers an auto-wrap/scroll.
     let avail = (cols as usize).saturating_sub(rwidth + 1);
-    let (start, end) = visible_tabs(&widths, cur, avail);
+    // Scrolling anchors on wherever the current window landed in the strip
+    // (position 1 when Notes is pinned ahead of it).
+    let anchor = order.iter().position(|&i| i == cur).unwrap_or(0);
+    let (start, end) = visible_tabs(&widths, anchor, avail);
     if start > 0 {
         queue!(
             out,
@@ -3346,7 +3853,8 @@ fn draw_status(
             Print("‹")
         )?;
     }
-    for (i, w) in windows.iter().enumerate().take(end).skip(start) {
+    for (slot, &i) in order.iter().enumerate().take(end).skip(start) {
+        let w = &windows[i];
         let (bg, fg) = if i == cur {
             (Color::Cyan, Color::Black)
         } else if w.attention {
@@ -3362,9 +3870,9 @@ fn draw_status(
             (Color::DarkGrey, Color::White)
         };
         queue!(out, SetBackgroundColor(bg), SetForegroundColor(fg))?;
-        queue!(out, Print(&labels[i]))?;
+        queue!(out, Print(&labels[slot]))?;
     }
-    if end < windows.len() {
+    if end < order.len() {
         queue!(
             out,
             SetBackgroundColor(Color::DarkGrey),
@@ -4044,7 +4552,7 @@ fn draw_help(
     let mut left: Vec<(String, bool)> = Vec::new();
     left.push(("Prefix — Ctrl-a + key".to_string(), false));
     for (i, (field, label)) in config::EDITABLE.iter().enumerate() {
-        let key = k.get(field).map(|c| c.to_string()).unwrap_or_default();
+        let key = k.get(field).map(config::key_label).unwrap_or_default();
         let sel = h.editing && i == h.sel;
         let marker = if sel { "›" } else { " " };
         left.push((format!("{marker} Ctrl-a {key:<2}  {label}"), sel));
@@ -4066,7 +4574,12 @@ fn draw_help(
     }
     right.push((String::new(), false));
     right.push(("Fixed".to_string(), false));
-    right.push(("  Ctrl-a 1..9    jump to window".to_string(), false));
+    // Recency order, not creation order: 1 is the project you were in last, and
+    // the one you're in now has no number (#77).
+    right.push((
+        "  Ctrl-a 1..9    jump to window (1 = last used)".to_string(),
+        false,
+    ));
     right.push(("  click / wheel  focus / scroll".to_string(), false));
     right.push((
         "  gd gr gi gt    definition/refs/impl/type".to_string(),
@@ -4292,6 +4805,10 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let mut out = io::stdout();
+        // Pop the kitty keyboard flags first (#67) — leaving them pushed would
+        // hand the user's shell a terminal that reports Esc as CSI 27u. A pop
+        // with nothing pushed is ignored, so this is safe on every exit path.
+        let _ = out.write_all(b"\x1b[<u");
         let _ = queue!(out, cursor::Show, DisableMouseCapture, LeaveAlternateScreen);
         let _ = out.flush();
         let _ = disable_raw_mode();
@@ -4433,7 +4950,75 @@ mod tests {
     }
 
     fn parser() -> InputParser {
-        InputParser::new(0x01, Arc::new(Mutex::new(Keys::default())))
+        InputParser::new(
+            config::Prefix::ctrl_a(),
+            Arc::new(Mutex::new(Keys::default())),
+        )
+    }
+
+    /// A parser whose prefix is Ctrl-Space: no legacy byte, CSI-u only (#67).
+    fn ctrl_space_parser() -> InputParser {
+        InputParser::new(
+            config::Prefix {
+                byte: None,
+                code: 32,
+                ctrl: true,
+                alt: false,
+            },
+            Arc::new(Mutex::new(Keys::default())),
+        )
+    }
+
+    #[test]
+    fn ctrl_space_prefix_via_kitty_protocol() {
+        // Ctrl-Space arrives as CSI 32;5u and opens a command: then 'c' toggles
+        // the AI pane, exactly as Ctrl-a c does on the byte path (#67).
+        let mut p = ctrl_space_parser();
+        let mut out = Vec::new();
+        p.feed(b"\x1b[32;5u", &mut out);
+        assert!(out.is_empty(), "the prefix alone emits nothing");
+        p.feed(b"c", &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Toggle(PaneRole::Ai)]));
+
+        // Ctrl-a stays live as a fallback, so a terminal without the protocol
+        // can never leave the session un-drivable.
+        let mut out = Vec::new();
+        p.feed(&[0x01, b'c'], &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Toggle(PaneRole::Ai)]));
+    }
+
+    #[test]
+    fn key_events_reach_panes_as_legacy_bytes() {
+        // Panes don't speak the protocol, so every non-prefix event is
+        // re-encoded to what a plain terminal would have sent (#67).
+        assert_eq!(legacy_bytes(27, false, false), vec![0x1b], "Esc");
+        assert_eq!(legacy_bytes(97, false, false), b"a".to_vec());
+        assert_eq!(legacy_bytes(97, true, false), vec![0x01], "Ctrl-a");
+        assert_eq!(legacy_bytes(97, false, true), vec![0x1b, b'a'], "Alt-a");
+        assert!(
+            legacy_bytes(32, true, false).is_empty(),
+            "Ctrl-Space is NUL"
+        );
+
+        // Disambiguate mode reports Esc as CSI 27u; the shell must still see 0x1b.
+        let mut p = ctrl_space_parser();
+        let mut out = Vec::new();
+        p.feed(b"\x1b[27u", &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == &[0x1b]));
+
+        // An ordinary CSI sequence (arrow) passes through untouched.
+        let mut out = Vec::new();
+        p.feed(b"\x1b[1;5A", &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == b"\x1b[1;5A"));
+    }
+
+    #[test]
+    fn parses_key_event_params() {
+        assert_eq!(parse_key_event(b"32;5"), Some((32, true, false)));
+        assert_eq!(parse_key_event(b"27"), Some((27, false, false)), "no mods");
+        // Sub-parameters (alternate keys, event type) are ignored.
+        assert_eq!(parse_key_event(b"97:65;3:1"), Some((97, false, true)));
+        assert_eq!(parse_key_event(b"junk"), None);
     }
 
     #[test]
@@ -4443,6 +5028,39 @@ mod tests {
         let mut out = Vec::new();
         parser().feed(&[0x1b], &mut out);
         assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == &[0x1b]));
+    }
+
+    #[test]
+    fn mouse_motion_doesnt_eat_the_prefix() {
+        // #76: prefix, then the mouse twitches before the command key. The
+        // motion is dispatched as a mouse event and the prefix survives it, so
+        // `Ctrl-a` … `1` still selects window 1 instead of typing a literal 1.
+        let mut p = parser();
+        let mut out = Vec::new();
+        p.feed(&[0x01], &mut out);
+        p.feed(b"\x1b[<35;10;5M", &mut out);
+        assert!(
+            matches!(out.as_slice(), [Msg::Mouse { .. }]),
+            "the motion is still parsed as a mouse event"
+        );
+        out.clear();
+        p.feed(b"1", &mut out);
+        assert!(
+            matches!(out.as_slice(), [Msg::SelectWindow(1)]),
+            "the prefix re-arms after the sequence"
+        );
+    }
+
+    #[test]
+    fn prefix_then_arrow_key_is_not_swallowed() {
+        // An arrow after the prefix isn't a binding: it spends the prefix and
+        // reaches the pane as the keypress it is, rather than leaking `[A` as
+        // literal text (#76).
+        let mut p = parser();
+        let mut out = Vec::new();
+        p.feed(&[0x01], &mut out);
+        p.feed(b"\x1b[A", &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == b"\x1b[A"));
     }
 
     #[test]
@@ -4460,6 +5078,117 @@ mod tests {
         let mut out = Vec::new();
         parser().feed(&[0x01, b'c'], &mut out);
         assert!(matches!(out.as_slice(), [Msg::Toggle(PaneRole::Ai)]));
+    }
+
+    /// A window with just enough shape for the numbering helpers.
+    fn win(title: &str, notes: bool, used: u64) -> Window {
+        Window {
+            panes: Vec::new(),
+            layout: Layout::Leaf(0),
+            focus_id: 0,
+            active: [0; 3],
+            dir: PathBuf::from("/tmp"),
+            title: title.to_string(),
+            show_editor: true,
+            show_shell: true,
+            show_ai: true,
+            attention: false,
+            last_ai_bell: 0,
+            zoom_prev: None,
+            notes,
+            used,
+        }
+    }
+
+    #[test]
+    fn window_numbers_follow_recency() {
+        // Notes, plus three projects last visited in the order c, a, b.
+        let ws = [
+            win("notes", true, 0),
+            win("a", false, 7),
+            win("b", false, 5),
+            win("c", false, 9),
+        ];
+        // Current is "c": the others rank by recency, most recent first.
+        let order = mru_order(&ws, 3);
+        assert_eq!(
+            order
+                .iter()
+                .map(|&i| ws[i].title.as_str())
+                .collect::<Vec<_>>(),
+            ["a", "b"],
+            "mod-1 is the project used most recently before this one"
+        );
+        // The strip leads with the current window, then recency, Notes last.
+        assert_eq!(
+            tab_order(&ws, 3)
+                .iter()
+                .map(|&i| ws[i].title.as_str())
+                .collect::<Vec<_>>(),
+            ["notes", "c", "a", "b"],
+            "Notes stays pinned far left; current next, then recency"
+        );
+        let nums = tab_numbers(&ws, 3);
+        assert_eq!(nums[0], Some(0), "Notes keeps mod-0");
+        assert_eq!(nums[3], None, "the current window has no number");
+        assert_eq!((nums[1], nums[2]), (Some(1), Some(2)));
+
+        // Switch to "a": "c" is now the last-used, so it becomes mod-1 —
+        // bouncing between two projects is always mod-1.
+        let mut ws = ws;
+        ws[1].used = 10;
+        assert_eq!(tab_numbers(&ws, 1)[3], Some(1));
+    }
+
+    #[test]
+    fn switcher_filters_and_picks_by_number() {
+        let ws = [
+            win("notes", true, 0),
+            win("alpha", false, 7),
+            win("beta", false, 5),
+            win("gamma", false, 9),
+        ];
+        let cur = 3; // "gamma"
+        let mut sw = WinSwitcher {
+            filter: String::new(),
+            sel: 0,
+        };
+        // Rows lead with the numbered projects, then Notes, then where you are.
+        let rows = sw.filtered(&ws, cur);
+        assert_eq!(
+            rows.iter()
+                .map(|r| ws[r.idx].title.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta", "notes", "gamma"]
+        );
+
+        // A digit on an empty filter jumps to that window.
+        let mut done = false;
+        assert_eq!(sw.feed(&ws, cur, b'2', &mut done), Some(2));
+        assert!(done, "picking closes the switcher");
+
+        // Typing filters instead, and digits then belong to the filter.
+        let mut sw = WinSwitcher {
+            filter: String::new(),
+            sel: 0,
+        };
+        let mut done = false;
+        for &b in b"bet" {
+            assert_eq!(sw.feed(&ws, cur, b, &mut done), None);
+        }
+        let rows = sw.filtered(&ws, cur);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(ws[rows[0].idx].title, "beta");
+        assert_eq!(sw.feed(&ws, cur, b'\r', &mut done), Some(2));
+
+        // Esc picks nothing.
+        let mut sw = WinSwitcher {
+            filter: String::new(),
+            sel: 0,
+        };
+        let mut done = false;
+        assert_eq!(sw.feed(&ws, cur, 0x1b, &mut done), None);
+        assert!(done);
     }
 
     #[test]

@@ -98,7 +98,7 @@ do
   local pkeys = {
     toggle_editor = "e", toggle_shell = "t", toggle_ai = "c",
     git_diff = "g", win_new = "n", copy = "v", help = "?",
-    tab_next = "]", tab_prev = "[",
+    tab_next = "]", tab_prev = "[", win_list = "Tab",
     focus_left = "h", focus_down = "j", focus_up = "k", focus_right = "l",
   }
   local praw = vim.env.CODEFORGE_PREFIX_KEYS
@@ -717,6 +717,7 @@ require("lazy").setup({
           {
             "Session",
             { CFKeys.pdisp("win_new"), "new window" },
+            { CFKeys.pdisp("win_list"), "switch window" },
             { CFKeys.pdisp("copy"), "scroll/copy" },
             { CFKeys.pdisp("help"), "all keys" },
           },
@@ -1468,7 +1469,7 @@ local function cf_diff_step(delta)
   -- doesn't re-shell it each time (#56).
   local files = st.files
   if not files or #files == 0 then
-    files = vim.fn.systemlist({ "git", "-C", st.root, "diff", "--name-only", "HEAD" })
+    files = cf_diff_file_list(st.root, st.rev)
     st.files = files
   end
   if not files or #files == 0 then
@@ -1524,7 +1525,8 @@ function _G.CodeForgeDiffSwap(path)
     return _G.CodeForgeDiffOpen(path)
   end
   local rel = path:sub(#st.root + 2)
-  local head = vim.fn.systemlist({ "git", "-C", st.root, "show", "HEAD:" .. rel })
+  local left_rev = st.rev and st.rev.base or "HEAD"
+  local head = vim.fn.systemlist({ "git", "-C", st.root, "show", left_rev .. ":" .. rel })
   local untracked = false
   if vim.v.shell_error ~= 0 then
     head = {}
@@ -1533,13 +1535,23 @@ function _G.CodeForgeDiffSwap(path)
 
   local old_right = st.right_buf
   vim.api.nvim_set_current_win(st.right_win)
-  vim.cmd("edit " .. vim.fn.fnameescape(path))
-  local right_buf = vim.api.nvim_get_current_buf()
-  local ft = vim.bo.filetype
+  local right_buf, ft
+  if st.rev then
+    -- Range view: the right side is a revision scratch, not a file on disk.
+    vim.cmd("enew")
+    right_buf = vim.api.nvim_get_current_buf()
+    ft = vim.filetype.match({ filename = rel }) or ""
+    cf_diff_fill_rev_buf(right_buf, st.root, st.rev.head, rel, ft)
+    vim.wo[st.right_win].winbar = "  " .. st.rev.head .. " · ]/[ next/prev file · Tab side · Esc list"
+  else
+    vim.cmd("edit " .. vim.fn.fnameescape(path))
+    right_buf = vim.api.nvim_get_current_buf()
+    ft = vim.bo.filetype
+  end
 
   vim.bo[st.left_buf].modifiable = true
   vim.api.nvim_buf_set_lines(st.left_buf, 0, -1, false, head)
-  pcall(vim.api.nvim_buf_set_name, st.left_buf, "HEAD: " .. rel)
+  pcall(vim.api.nvim_buf_set_name, st.left_buf, left_rev .. ": " .. rel)
   vim.bo[st.left_buf].modifiable = false
   vim.bo[st.left_buf].filetype = ft
 
@@ -1558,7 +1570,7 @@ function _G.CodeForgeDiffSwap(path)
     buffer = right_buf,
     callback = function()
       vim.schedule(function()
-        st.files = vim.fn.systemlist({ "git", "-C", st.root, "diff", "--name-only", "HEAD" })
+        st.files = cf_diff_file_list(st.root, st.rev)
         cf_diff_recompute_hunks()
         cf_diff_map_refresh()
       end)
@@ -1573,7 +1585,46 @@ function _G.CodeForgeDiffSwap(path)
   return "ok"
 end
 
-function _G.CodeForgeDiffOpen(path)
+-- Read `rel` at revision `rev`, as lines. Second return is true when the file
+-- doesn't exist there (added on one side, deleted on the other) — that side
+-- renders empty, so the diff shows the file as wholly added/removed.
+local function cf_diff_show(root, rev, rel)
+  local lines = vim.fn.systemlist({ "git", "-C", root, "show", rev .. ":" .. rel })
+  if vim.v.shell_error ~= 0 then
+    return {}, true
+  end
+  return lines, false
+end
+
+-- The changed files ]/[ steps through: the working tree's vs HEAD, or the two
+-- commits' against each other when a range is open (#74).
+function cf_diff_file_list(root, rev)
+  if rev then
+    return vim.fn.systemlist({ "git", "-C", root, "diff", "--name-only", rev.base, rev.head })
+  end
+  return vim.fn.systemlist({ "git", "-C", root, "diff", "--name-only", "HEAD" })
+end
+
+-- Load `rel` at `rev` into `buf` as a read-only scratch, named `rev: path` so
+-- the tabline and `:ls` say which side you're on (#74).
+function cf_diff_fill_rev_buf(buf, root, rev, rel, ft)
+  local lines = cf_diff_show(root, rev, rel)
+  local bo = vim.bo[buf]
+  bo.modifiable = true
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  pcall(vim.api.nvim_buf_set_name, buf, rev .. ": " .. rel)
+  bo.buftype = "nofile"
+  bo.bufhidden = "wipe"
+  bo.swapfile = false
+  bo.modifiable = false
+  bo.filetype = ft
+end
+
+-- Open the side-by-side view on `path`. With no revs it's the working-tree
+-- diff: HEAD on the left, the editable file on the right. With `base`/`head`
+-- (#74) it's a commit range: both sides are read-only scratches of the file at
+-- those revisions, so the same view serves the diff panel's commit browser.
+function _G.CodeForgeDiffOpen(path, base, head_rev)
   if vim.g.codeforge_diff_tab and vim.api.nvim_tabpage_is_valid(vim.g.codeforge_diff_tab) then
     _G.CodeForgeDiffClose()
   end
@@ -1582,27 +1633,37 @@ function _G.CodeForgeDiffOpen(path)
   if vim.v.shell_error ~= 0 or not root or root == "" then
     return "err: not a git repository"
   end
-  local rel = path:sub(#root + 2)
-  local head = vim.fn.systemlist({ "git", "-C", root, "show", "HEAD:" .. rel })
-  local untracked = false
-  if vim.v.shell_error ~= 0 then
-    head = {} -- new/untracked file: the whole right side shows as added
-    untracked = true
+  local rev = nil
+  if base and base ~= "" and head_rev and head_rev ~= "" then
+    rev = { base = base, head = head_rev }
   end
+  local rel = path:sub(#root + 2)
+  local left_rev = rev and rev.base or "HEAD"
+  local head, untracked = cf_diff_show(root, left_rev, rel)
 
   vim.cmd("tab split")
   local tab = vim.api.nvim_get_current_tabpage()
-  vim.cmd("edit " .. vim.fn.fnameescape(path))
-  local right_win = vim.api.nvim_get_current_win()
-  local right_buf = vim.api.nvim_get_current_buf()
-  local ft = vim.bo.filetype
+  local right_win, right_buf, ft
+  if rev then
+    -- Right half is a revision too: a scratch, not the working file.
+    vim.cmd("enew")
+    right_win = vim.api.nvim_get_current_win()
+    right_buf = vim.api.nvim_get_current_buf()
+    ft = vim.filetype.match({ filename = rel }) or ""
+    cf_diff_fill_rev_buf(right_buf, root, rev.head, rel, ft)
+  else
+    vim.cmd("edit " .. vim.fn.fnameescape(path))
+    right_win = vim.api.nvim_get_current_win()
+    right_buf = vim.api.nvim_get_current_buf()
+    ft = vim.bo.filetype
+  end
 
-  -- Left half: the HEAD version as a read-only scratch that wipes on close.
+  -- Left half: the base version as a read-only scratch that wipes on close.
   vim.cmd("leftabove vnew")
   local left_win = vim.api.nvim_get_current_win()
   local left_buf = vim.api.nvim_get_current_buf()
   vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, head)
-  pcall(vim.api.nvim_buf_set_name, left_buf, "HEAD: " .. rel)
+  pcall(vim.api.nvim_buf_set_name, left_buf, left_rev .. ": " .. rel)
   local bo = vim.bo[left_buf]
   bo.buftype = "nofile"
   bo.bufhidden = "wipe"
@@ -1616,8 +1677,12 @@ function _G.CodeForgeDiffOpen(path)
 
   -- Label the sides and put the keys where they're discoverable. Softer
   -- filler glyph for lines that only exist on the other side.
-  vim.wo[left_win].winbar = "  HEAD · read-only"
-  vim.wo[right_win].winbar = "  %t · ]/[ next/prev file · Tab side · Esc list"
+  vim.wo[left_win].winbar = "  " .. left_rev .. " · read-only"
+  if rev then
+    vim.wo[right_win].winbar = "  " .. rev.head .. " · ]/[ next/prev file · Tab side · Esc list"
+  else
+    vim.wo[right_win].winbar = "  %t · ]/[ next/prev file · Tab side · Esc list"
+  end
   vim.wo[left_win].fillchars = "diff: "
   vim.wo[right_win].fillchars = "diff: "
   -- The global scrolloff (6) pins the cursor that many rows below the top, so
@@ -1642,9 +1707,13 @@ function _G.CodeForgeDiffOpen(path)
     map_buf = map_buf,
     map_win = nil,
     aug = aug,
+    -- The commit range being shown, or nil for the working tree (#74).
+    rev = rev,
     -- Changed-file list for ]/[ stepping, cached so it isn't re-shelled each
-    -- step; refreshed here and on save (#56).
-    files = vim.fn.systemlist({ "git", "-C", root, "diff", "--name-only", "HEAD" }),
+    -- step; refreshed here and on save (#56). In a range it's the files that
+    -- differ between the two commits, so stepping walks the same set the diff
+    -- panel listed.
+    files = cf_diff_file_list(root, rev),
   }
 
   -- Esc closes; Tab hops sides; Space-z zooms; ] / [ step files; Enter folds
@@ -1707,7 +1776,7 @@ function _G.CodeForgeDiffOpen(path)
     callback = function()
       vim.schedule(function()
         if cf_diff then
-          cf_diff.files = vim.fn.systemlist({ "git", "-C", root, "diff", "--name-only", "HEAD" })
+          cf_diff.files = cf_diff_file_list(root, cf_diff.rev)
         end
         cf_diff_recompute_hunks()
         cf_diff_map_refresh()
@@ -1747,6 +1816,12 @@ function _G.CodeForgeDiffOpen(path)
   cf_diff_map_refresh()
   vim.fn.writefile({}, cf_diff_flag())
   return "ok"
+end
+
+-- What forge calls for a commit-range diff (#74): the same view as a
+-- working-tree diff, with both sides pinned to revisions.
+function _G.CodeForgeDiffOpenRev(path, base, head)
+  return _G.CodeForgeDiffOpen(path, base, head)
 end
 
 function _G.CodeForgeDiffClose()

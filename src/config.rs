@@ -179,6 +179,18 @@ pub fn disp_token(tok: &str) -> String {
         .replace("M-", "Meta-")
 }
 
+/// How a binding reads on screen. Printable keys are themselves; a control key
+/// (Tab is the switcher's default, #78) would render as an invisible cell or a
+/// literal tab, so name it instead.
+pub fn key_label(ch: char) -> String {
+    match ch {
+        '\t' => "Tab".to_string(),
+        ' ' => "Space".to_string(),
+        c if (c as u32) < 0x20 => format!("^{}", (b'@' + c as u8) as char),
+        c => c.to_string(),
+    }
+}
+
 /// Single-character keybindings pressed after the prefix.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default)]
@@ -222,6 +234,9 @@ pub struct Keys {
     /// Open the About page (#66): bundled docs on how CodeForge is built,
     /// shown in the editor pane.
     pub about: char,
+    /// Open the window switcher (#78): a popup list of the open projects,
+    /// picked by typing a name or pressing its recency number.
+    pub win_list: char,
     /// Fullscreen the focused pane, hiding the other two; press again to
     /// restore the previous layout (#40).
     pub zoom: char,
@@ -279,6 +294,9 @@ impl Default for Keys {
             copy: 'v',
             git_diff: 'g',
             about: 'i',
+            // Tab: the switcher is the "where else am I working?" key, and Tab
+            // is what every other app uses for it.
+            win_list: '\t',
             zoom: 'z',
         }
     }
@@ -287,13 +305,14 @@ impl Default for Keys {
 /// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
 /// `(config field, human label)`. Focus keys are listed individually so each
 /// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
-pub const EDITABLE: [(&str, &str); 24] = [
+pub const EDITABLE: [(&str, &str); 25] = [
     ("toggle_editor", "show/hide editor"),
     ("toggle_shell", "show/hide terminal"),
     ("toggle_ai", "show/hide Claude"),
     ("zoom", "fullscreen focused pane"),
     ("git_diff", "git diff (changed files)"),
     ("about", "about / how it's built"),
+    ("win_list", "window switcher (open projects)"),
     ("tab_new", "new terminal/Claude tab"),
     ("tab_next", "next tab (focused slot)"),
     ("tab_prev", "prev tab (focused slot)"),
@@ -341,6 +360,7 @@ impl Keys {
             "copy" => self.copy,
             "git_diff" => self.git_diff,
             "about" => self.about,
+            "win_list" => self.win_list,
             "zoom" => self.zoom,
             _ => return None,
         })
@@ -352,7 +372,7 @@ impl Keys {
     pub fn env_string(&self) -> String {
         self.bindings()
             .iter()
-            .map(|(name, ch)| format!("{name}={ch}"))
+            .map(|(name, ch)| format!("{name}={}", key_label(*ch)))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -383,6 +403,7 @@ impl Keys {
             "copy" => self.copy = ch,
             "git_diff" => self.git_diff = ch,
             "about" => self.about = ch,
+            "win_list" => self.win_list = ch,
             "zoom" => self.zoom = ch,
             _ => return false,
         }
@@ -413,7 +434,7 @@ impl Keys {
     }
 
     /// All (action, key) bindings, for help display and conflict checking.
-    fn bindings(&self) -> [(&'static str, char); 24] {
+    fn bindings(&self) -> [(&'static str, char); 25] {
         [
             ("focus_left", self.focus_left),
             ("focus_down", self.focus_down),
@@ -438,6 +459,7 @@ impl Keys {
             ("copy", self.copy),
             ("git_diff", self.git_diff),
             ("about", self.about),
+            ("win_list", self.win_list),
             ("zoom", self.zoom),
         ]
     }
@@ -511,10 +533,11 @@ impl Config {
         }
     }
 
-    /// The prefix as a raw byte (e.g. `"C-a"` -> 0x01). An unusable spec (see
-    /// `parse_prefix`) falls back to Ctrl-a so the session is never un-drivable.
-    pub fn prefix_byte(&self) -> u8 {
-        parse_prefix(&self.prefix).unwrap_or(0x01)
+    /// The prefix chord (e.g. `"C-a"` -> byte 0x01, `"C-space"` -> CSI-u only).
+    /// An unusable spec (see `parse_prefix`) falls back to Ctrl-a so the session
+    /// is never un-drivable.
+    pub fn prefix_chord(&self) -> Prefix {
+        parse_prefix(&self.prefix).unwrap_or_else(|_| Prefix::ctrl_a())
     }
 }
 
@@ -624,39 +647,76 @@ fn persist_kv(field: &str, value: &str, section: &str) {
     let _ = std::fs::write(&path, out);
 }
 
-/// Parse a prefix spec into the raw byte the terminal sends.
-///
-/// `"C-a"` -> 0x01, `"C-b"` -> 0x02; the literal `"space"` -> 0x20; a bare
-/// single char is taken literally. Returns `Err(reason)` for a spec that would
-/// make the session un-drivable, so the caller can warn and fall back to Ctrl-a:
-///   - `Ctrl-S` / `Ctrl-Q` (0x13 / 0x11) are terminal flow-control — they freeze
-///     and unfreeze screen output, so using one as a prefix hangs the terminal.
-///   - anything resolving to NUL (0x00), e.g. `"C-space"`, which most terminals
-///     don't send (and the input parser treats NUL as "no prefix" anyway).
-fn parse_prefix(s: &str) -> Result<u8, String> {
+/// A prefix keypress. `byte` is what a plain terminal sends, and is `None` for
+/// a chord with no unambiguous legacy encoding — Ctrl-Space is NUL, which
+/// terminals don't reliably send (#67). `code`/`ctrl`/`alt` are the kitty
+/// keyboard-protocol form (CSI-u), which does distinguish it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Prefix {
+    pub byte: Option<u8>,
+    /// Unicode code point of the base key (Space is 32).
+    pub code: u32,
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
+impl Prefix {
+    /// The Ctrl-a fallback: always available, and what an unusable spec resolves
+    /// to. Also stays live as a second prefix when the configured one is CSI-u
+    /// only, so a terminal without the protocol can never lock the user out.
+    pub fn ctrl_a() -> Prefix {
+        Prefix {
+            byte: Some(0x01),
+            code: 'a' as u32,
+            ctrl: true,
+            alt: false,
+        }
+    }
+}
+
+/// Parse a prefix spec (`"C-a"`, `"C-space"`, `"C-b"`) into the chord to match.
+fn parse_prefix(s: &str) -> Result<Prefix, String> {
     let s = s.trim();
-    let byte = if let Some(rest) = s.strip_prefix("C-").or_else(|| s.strip_prefix("c-")) {
-        let rest = rest.trim();
-        let base = if rest.eq_ignore_ascii_case("space") {
-            b' '
-        } else if let Some(c) = rest.bytes().next() {
-            c
-        } else {
-            return Err("nothing after \"C-\"".into());
-        };
-        // Ctrl masks bits 6/7: 'a' (0x61) -> 0x01; Space (0x20) -> 0x00.
-        base & 0x1f
-    } else if s.eq_ignore_ascii_case("space") {
-        b' '
-    } else if let Some(c) = s.bytes().next() {
-        c
+    let (ctrl, rest) = match s.strip_prefix("C-").or_else(|| s.strip_prefix("c-")) {
+        Some(rest) => (true, rest.trim()),
+        None => (false, s),
+    };
+    let code = if rest.eq_ignore_ascii_case("space") {
+        b' ' as u32
+    } else if let Some(c) = rest.chars().next() {
+        c as u32
+    } else if ctrl {
+        return Err("nothing after \"C-\"".into());
     } else {
         return Err("empty prefix".into());
     };
+    // Ctrl masks bits 6/7: 'a' (0x61) -> 0x01; Space (0x20) -> 0x00.
+    let byte = match (ctrl, u8::try_from(code)) {
+        (true, Ok(b)) => Some(b & 0x1f),
+        (false, Ok(b)) => Some(b),
+        // A non-ASCII base key has no legacy byte; CSI-u only.
+        (_, Err(_)) => None,
+    };
     match byte {
-        0x00 => Err("resolves to NUL, which terminals don't reliably send".into()),
-        0x11 | 0x13 => Err("Ctrl-S/Ctrl-Q are terminal flow-control and freeze the screen".into()),
-        b => Ok(b),
+        // Flow control freezes the screen with no way out from inside.
+        Some(0x11) | Some(0x13) => {
+            Err("Ctrl-S/Ctrl-Q are terminal flow-control and freeze the screen".into())
+        }
+        // NUL isn't reliably sent, so the chord is CSI-u only (#67) — usable in
+        // a terminal speaking the kitty keyboard protocol, and Ctrl-a stays live
+        // as a fallback everywhere else.
+        Some(0x00) => Ok(Prefix {
+            byte: None,
+            code,
+            ctrl,
+            alt: false,
+        }),
+        b => Ok(Prefix {
+            byte: b,
+            code,
+            ctrl,
+            alt: false,
+        }),
     }
 }
 
@@ -664,9 +724,12 @@ fn parse_prefix(s: &str) -> Result<u8, String> {
 const DEFAULT_TOML: &str = r#"# CodeForge configuration.
 # Edit and restart forge. Every field is optional.
 
-# Command prefix (tmux-style). Examples: "C-a", "C-b", "C-o".
-# Avoid Ctrl-S / Ctrl-Q (terminal flow-control — they freeze the screen) and
-# Ctrl-Space (sends NUL); those fall back to Ctrl-a with a startup warning.
+# Command prefix (tmux-style). Examples: "C-a", "C-b", "C-o", "C-space".
+# Avoid Ctrl-S / Ctrl-Q (terminal flow-control — they freeze the screen); they
+# fall back to Ctrl-a with a startup warning.
+# "C-space" needs a terminal speaking the kitty keyboard protocol (WezTerm,
+# kitty, foot, Ghostty, Alacritty 0.13+) — it is NUL in the legacy encoding.
+# Where the protocol is missing, Ctrl-a keeps working as a fallback prefix.
 prefix = "C-a"
 
 # Where the project picker looks. Defaults to $DDN_PROJECTS, then ~/projects.
@@ -729,8 +792,10 @@ tab_close = "w"  # close the active tab in the focused slot
 copy = "v"       # copy/scroll mode on the focused pane (scroll, select, copy)
 git_diff = "g"   # git diff list; pick a file for a side-by-side editable diff
 about = "i"      # About page: bundled docs on how CodeForge is built
+win_list = "\t"  # window switcher: list open projects, pick by name or number
 zoom = "z"       # fullscreen the focused pane (hide the other two); again restores
-# also: prefix + 1..9 jumps to that window
+# also: prefix + 1..9 jumps to a window, numbered by recency (1 = last used);
+# the current window has no number and Notes is always 0
 
 # Editor (nvim) keybindings — full chords passed through to Neovim, so the
 # finder/explorer/tab keys and the splash cheatsheet all read from here.
@@ -753,6 +818,20 @@ goto_line      = "Space l"      # jump to a line: type digits, live, no Enter
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// A control-key binding (Tab, the switcher's default) must read as a name
+    /// everywhere it's shown — an invisible cell in the overlay or a literal tab
+    /// in the splash's env var would make it undiscoverable (#78).
+    #[test]
+    fn control_keys_display_by_name() {
+        assert_eq!(key_label('\t'), "Tab");
+        assert_eq!(key_label('g'), "g");
+        let env = Keys::default().env_string();
+        assert!(
+            env.lines().any(|l| l == "win_list=Tab"),
+            "splash env carries the readable label, got {env:?}"
+        );
+    }
 
     // Serialize tests that set the process-global XDG_CONFIG_HOME env var.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -836,19 +915,26 @@ mod tests {
 
     #[test]
     fn prefix_parsing_and_guards() {
-        assert_eq!(parse_prefix("C-a"), Ok(0x01));
-        assert_eq!(parse_prefix("C-b"), Ok(0x02));
-        assert_eq!(parse_prefix("space"), Ok(0x20));
-        assert_eq!(parse_prefix("x"), Ok(b'x'));
-        // Unusable specs are rejected (never returned as a live byte).
-        assert!(parse_prefix("C-s").is_err()); // XOFF: froze the terminal
+        assert_eq!(parse_prefix("C-a").unwrap().byte, Some(0x01));
+        assert_eq!(parse_prefix("C-b").unwrap().byte, Some(0x02));
+        assert_eq!(parse_prefix("space").unwrap().byte, Some(0x20));
+        assert_eq!(parse_prefix("x").unwrap().byte, Some(b'x'));
+        // Flow control is still rejected outright: it freezes the terminal.
+        assert!(parse_prefix("C-s").is_err()); // XOFF
         assert!(parse_prefix("C-q").is_err()); // XON
-        assert!(parse_prefix("C-space").is_err()); // NUL
-                                                   // prefix_byte falls back to Ctrl-a for any rejected spec.
+
+        // Ctrl-Space is NUL, so it has no legacy byte — but it IS a distinct
+        // kitty key event (#67), so it parses as a CSI-u-only chord rather than
+        // being rejected.
+        let p = parse_prefix("C-space").unwrap();
+        assert_eq!(p.byte, None);
+        assert_eq!((p.code, p.ctrl), (32, true));
+
+        // An unusable spec still falls back to Ctrl-a rather than locking up.
         let c = Config {
-            prefix: "C-space".into(),
+            prefix: "C-s".into(),
             ..Config::default()
         };
-        assert_eq!(c.prefix_byte(), 0x01);
+        assert_eq!(c.prefix_chord(), Prefix::ctrl_a());
     }
 }
