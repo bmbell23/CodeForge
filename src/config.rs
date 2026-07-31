@@ -44,6 +44,11 @@ pub struct Config {
     pub status_weather: bool,
     pub status_date: bool,
     pub status_clock: bool,
+    /// Ask the terminal for the kitty keyboard protocol (#67), which is what
+    /// makes chords like Ctrl-Space distinguishable. Off by default: terminals
+    /// that half-support it can mangle ordinary keys (arrows arriving as stray
+    /// text), and the fallback prefix keeps working either way.
+    pub kitty_keys: bool,
     /// Per-action keybindings (single chars, pressed after the prefix).
     pub keys: Keys,
     /// Editor (nvim) keybindings. Unlike `keys` these are full chords passed
@@ -237,6 +242,10 @@ pub struct Keys {
     /// Open the window switcher (#78): a popup list of the open projects,
     /// picked by typing a name or pressing its recency number.
     pub win_list: char,
+    /// Open the favorites list for this repo (#80).
+    pub favorites: char,
+    /// Favorite / unfavorite the file open in the editor (#80).
+    pub favorite_toggle: char,
     /// Fullscreen the focused pane, hiding the other two; press again to
     /// restore the previous layout (#40).
     pub zoom: char,
@@ -262,6 +271,8 @@ impl Default for Config {
             status_weather: true,
             status_date: true,
             status_clock: true,
+            // Opt-in: see the field's comment (#67).
+            kitty_keys: false,
             keys: Keys::default(),
             editor_keys: EditorKeys::default(),
         }
@@ -297,6 +308,8 @@ impl Default for Keys {
             // Tab: the switcher is the "where else am I working?" key, and Tab
             // is what every other app uses for it.
             win_list: '\t',
+            favorites: 'b',
+            favorite_toggle: 'B',
             zoom: 'z',
         }
     }
@@ -305,7 +318,7 @@ impl Default for Keys {
 /// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
 /// `(config field, human label)`. Focus keys are listed individually so each
 /// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
-pub const EDITABLE: [(&str, &str); 25] = [
+pub const EDITABLE: [(&str, &str); 27] = [
     ("toggle_editor", "show/hide editor"),
     ("toggle_shell", "show/hide terminal"),
     ("toggle_ai", "show/hide Claude"),
@@ -313,6 +326,8 @@ pub const EDITABLE: [(&str, &str); 25] = [
     ("git_diff", "git diff (changed files)"),
     ("about", "about / how it's built"),
     ("win_list", "window switcher (open projects)"),
+    ("favorites", "favorite files (this repo)"),
+    ("favorite_toggle", "favorite / unfavorite this file"),
     ("tab_new", "new terminal/Claude tab"),
     ("tab_next", "next tab (focused slot)"),
     ("tab_prev", "prev tab (focused slot)"),
@@ -361,6 +376,8 @@ impl Keys {
             "git_diff" => self.git_diff,
             "about" => self.about,
             "win_list" => self.win_list,
+            "favorites" => self.favorites,
+            "favorite_toggle" => self.favorite_toggle,
             "zoom" => self.zoom,
             _ => return None,
         })
@@ -404,6 +421,8 @@ impl Keys {
             "git_diff" => self.git_diff = ch,
             "about" => self.about = ch,
             "win_list" => self.win_list = ch,
+            "favorites" => self.favorites = ch,
+            "favorite_toggle" => self.favorite_toggle = ch,
             "zoom" => self.zoom = ch,
             _ => return false,
         }
@@ -434,7 +453,7 @@ impl Keys {
     }
 
     /// All (action, key) bindings, for help display and conflict checking.
-    fn bindings(&self) -> [(&'static str, char); 25] {
+    fn bindings(&self) -> [(&'static str, char); 27] {
         [
             ("focus_left", self.focus_left),
             ("focus_down", self.focus_down),
@@ -460,6 +479,8 @@ impl Keys {
             ("git_diff", self.git_diff),
             ("about", self.about),
             ("win_list", self.win_list),
+            ("favorites", self.favorites),
+            ("favorite_toggle", self.favorite_toggle),
             ("zoom", self.zoom),
         ]
     }
@@ -727,10 +748,16 @@ const DEFAULT_TOML: &str = r#"# CodeForge configuration.
 # Command prefix (tmux-style). Examples: "C-a", "C-b", "C-o", "C-space".
 # Avoid Ctrl-S / Ctrl-Q (terminal flow-control — they freeze the screen); they
 # fall back to Ctrl-a with a startup warning.
-# "C-space" needs a terminal speaking the kitty keyboard protocol (WezTerm,
-# kitty, foot, Ghostty, Alacritty 0.13+) — it is NUL in the legacy encoding.
-# Where the protocol is missing, Ctrl-a keeps working as a fallback prefix.
+# "C-space" also needs kitty_keys = true below.
 prefix = "C-a"
+
+# Ask the terminal for the kitty keyboard protocol, which is what makes chords
+# with no legacy encoding (Ctrl-Space) usable as the prefix. Needs a terminal
+# that speaks it: WezTerm with enable_kitty_keyboard = true, kitty, foot,
+# Ghostty, Alacritty 0.13+. Left off by default because a terminal that only
+# half-implements it can mangle ordinary keys — arrows arriving as stray text.
+# With it off, a "C-space" prefix falls back to Ctrl-a.
+kitty_keys = false
 
 # Where the project picker looks. Defaults to $DDN_PROJECTS, then ~/projects.
 # projects_root = "/home/you/projects"
@@ -793,6 +820,8 @@ copy = "v"       # copy/scroll mode on the focused pane (scroll, select, copy)
 git_diff = "g"   # git diff list; pick a file for a side-by-side editable diff
 about = "i"      # About page: bundled docs on how CodeForge is built
 win_list = "\t"  # window switcher: list open projects, pick by name or number
+favorites = "b"  # favorite files for this repo (shared across its worktrees/clones)
+favorite_toggle = "B"  # favorite / unfavorite the file open in the editor
 zoom = "z"       # fullscreen the focused pane (hide the other two); again restores
 # also: prefix + 1..9 jumps to a window, numbered by recency (1 = last used);
 # the current window has no number and Notes is always 0

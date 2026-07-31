@@ -43,6 +43,7 @@
 //! `claude --resume`. Panes are never destroyed, only hidden.
 
 mod config;
+mod favorites;
 mod gitdiff;
 mod layout;
 mod pane;
@@ -297,6 +298,26 @@ fn grug_flag(id: usize) -> PathBuf {
     PathBuf::from(p)
 }
 
+/// The absolute path of the file the editor is currently showing, for
+/// favouriting it (#80). `None` when nvim isn't reachable or is on a scratch
+/// buffer with no file.
+fn nvim_current_file(sock: &Path) -> Option<PathBuf> {
+    if !sock.exists() {
+        return None;
+    }
+    let out = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg("expand('%:p')")
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
+}
+
 /// Ask the editor to open CodeForge's side-by-side diff (#18) on `file`.
 /// True only when nvim confirms — the caller zooms the layout on success.
 fn nvim_diff_open(sock: &Path, file: &Path) -> bool {
@@ -450,6 +471,10 @@ pub enum Msg {
     OpenAbout,
     /// Open the window switcher (#78): a popup list of the open projects.
     OpenWindowList,
+    /// Open the favorites list for the current repo (#80).
+    OpenFavorites,
+    /// Favorite / unfavorite the file open in the editor (#80).
+    ToggleFavorite,
     /// Toggle fullscreen of the focused pane, hiding the other two (#40).
     ZoomPane,
     /// Go to the Notes window (position 0), creating it — with a fresh
@@ -691,6 +716,21 @@ fn diff_overlay_rect(w: &Window, cols: u16, rows: u16) -> Rect {
 /// snapshot the pane layout, zoom the editor, and RPC nvim to build the view.
 /// A watcher thread waits for nvim's flag file to vanish (Esc / close / exit)
 /// and then sends `Msg::DiffClosed` so the saved layout comes back. Returns
+/// Why the diff handoff failed, for the panel's footer — "nothing happened" is
+/// the worst possible feedback when the editor doesn't take the file (#74).
+fn diff_open_failure(windows: &[Window], cur: usize) -> String {
+    let ed = windows[cur].active[0];
+    let sock = nvim_sock(ed);
+    if !sock.exists() {
+        format!(
+            "no editor RPC socket ({}) — is nvim running?",
+            sock.display()
+        )
+    } else {
+        "editor didn't respond — try again".to_string()
+    }
+}
+
 /// false (layout untouched) when the editor didn't respond.
 /// What the full-window diff view should show: a file's working-tree diff
 /// (HEAD vs the file on disk), or that file between two commits (#74).
@@ -896,6 +936,19 @@ fn new_window(
         // slots in as the least-recent until you switch to it (#77).
         used: 0,
     })
+}
+
+/// Directories that already have a window, so the picker can leave them out and
+/// callers can focus the existing window instead of opening a duplicate (#82).
+fn open_dirs(windows: &[Window]) -> Vec<PathBuf> {
+    windows.iter().map(|w| w.dir.clone()).collect()
+}
+
+/// The window already showing `dir`, if there is one. Two windows on one
+/// directory means two editors over the same working tree — the second one's
+/// writes silently fight the first's.
+fn window_for_dir(windows: &[Window], dir: &Path) -> Option<usize> {
+    windows.iter().position(|w| w.dir == dir)
 }
 
 /// Project windows ordered most-recently-used first, skipping the current one
@@ -1618,6 +1671,21 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         });
     }
 
+    // A saved session (or a command line naming the same project twice) can
+    // carry duplicate directories; keep the first of each so a restore can't
+    // resurrect two windows over one working tree (#82).
+    let mut seen_dirs: Vec<PathBuf> = Vec::new();
+    let specs: Vec<WindowSpec> = specs
+        .into_iter()
+        .filter(|s| {
+            let fresh = !seen_dirs.contains(&s.dir);
+            if fresh {
+                seen_dirs.push(s.dir.clone());
+            }
+            fresh
+        })
+        .collect();
+
     let mut windows: Vec<Window> = Vec::new();
     let mut next_id: usize = 0;
     for spec in &specs {
@@ -1675,6 +1743,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let mut ai_tab_prompt = false;
     // The window switcher is up (#78); it owns input until Enter/Esc.
     let mut switcher: Option<WinSwitcher> = None;
+    // The favorites list is up (#80); modal in the same way.
+    let mut favs: Option<FavList> = None;
+    // Transient confirmation for a favorite toggle, shown on the status bar
+    // until the next one — the editor pane gives no feedback of its own.
+    let mut fav_note: Option<String> = None;
     let mut diff: Option<DiffList> = None;
     let mut diff_zoom: Option<DiffZoom> = None;
     // Editor fullscreen while a grug-far search is open (#53), mirroring the
@@ -1731,13 +1804,48 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     }
                 }
                 Msg::Input(bytes) => {
-                    if let Some(sw) = switcher.as_mut() {
+                    if let Some(fl) = favs.as_mut() {
+                        // Modal: arrows move, typing filters, Enter opens (#80).
+                        let mut done = false;
+                        let mut pick = None;
+                        if bytes.starts_with(b"\x1b[A") || bytes.starts_with(b"\x1bOA") {
+                            fl.step(-1);
+                        } else if bytes.starts_with(b"\x1b[B") || bytes.starts_with(b"\x1bOB") {
+                            fl.step(1);
+                        } else {
+                            for &b in bytes.iter() {
+                                if let Some(p) = fl.feed(b, &mut done) {
+                                    pick = Some(p);
+                                }
+                                if done {
+                                    break;
+                                }
+                            }
+                        }
+                        if done {
+                            favs = None;
+                        }
+                        if let Some(path) = pick {
+                            let w = &mut windows[cur];
+                            let ed = w.active[role_index(PaneRole::Editor)];
+                            nvim_open_file(&nvim_sock(ed), &path);
+                            if !w.show_editor {
+                                w.show_editor = true;
+                                refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                                let (c, r) = size;
+                                relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                            }
+                            w.focus_id = ed;
+                        }
+                        dirty = true;
+                        needs_clear = true;
+                    } else if let Some(sw) = switcher.as_mut() {
                         // Modal: arrows move, everything else filters/picks (#78).
                         let mut done = false;
                         let mut pick = None;
-                        if bytes.starts_with(b"\x1b[A") {
+                        if bytes.starts_with(b"\x1b[A") || bytes.starts_with(b"\x1bOA") {
                             sw.step(&windows, cur, -1);
-                        } else if bytes.starts_with(b"\x1b[B") {
+                        } else if bytes.starts_with(b"\x1b[B") || bytes.starts_with(b"\x1bOB") {
                             sw.step(&windows, cur, 1);
                         } else {
                             for &b in bytes.iter() {
@@ -1755,6 +1863,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         if let Some(i) = pick {
                             if i != cur {
                                 exit_copy(&mut copy, &mut windows);
+                                use_tick += 1;
+                                windows[cur].used = use_tick;
                                 cur = i;
                             }
                         }
@@ -1841,6 +1951,19 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             PickerAction::Chosen(dir) => {
                                 picker = None;
                                 needs_clear = true;
+                                // Belt and braces: the picker already hides open
+                                // projects, but a typed/stale path could still
+                                // name one. Focus that window rather than open a
+                                // second editor over the same tree (#82).
+                                if let Some(i) = window_for_dir(&windows, &dir) {
+                                    if i != cur {
+                                        use_tick += 1;
+                                        windows[cur].used = use_tick;
+                                        cur = i;
+                                    }
+                                    dirty = true;
+                                    continue;
+                                }
                                 let (c, r) = size;
                                 let area = r.saturating_sub(1);
                                 let base = next_id;
@@ -1924,8 +2047,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                     size,
                                     &tx,
                                 )? {
+                                    let why = diff_open_failure(&windows, cur);
                                     if let Some(dl) = diff.as_mut() {
-                                        dl.set_note("editor didn't respond — try again");
+                                        dl.set_note(&why);
                                     }
                                 }
                                 needs_clear = true;
@@ -2046,9 +2170,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                                 &tx,
                                             )? {
                                                 if let Some(dl) = diff.as_mut() {
-                                                    dl.set_note(
-                                                        "editor didn't respond — try again",
-                                                    );
+                                                    dl.set_note(&diff_open_failure(&windows, cur));
                                                 }
                                             }
                                             needs_clear = true;
@@ -2245,6 +2367,26 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                     needs_clear = true;
                 }
+                Msg::OpenFavorites => {
+                    favs = Some(FavList::new(&windows[cur].dir));
+                    dirty = true;
+                    needs_clear = true;
+                }
+                Msg::ToggleFavorite => {
+                    // Favorite whatever the editor is showing; the confirmation
+                    // rides the status bar's right side (#80).
+                    let w = &windows[cur];
+                    let ed = w.active[role_index(PaneRole::Editor)];
+                    fav_note = match nvim_current_file(&nvim_sock(ed)) {
+                        Some(file) => match favorites::toggle(&w.dir, &file) {
+                            Some(true) => Some("favorited".to_string()),
+                            Some(false) => Some("unfavorited".to_string()),
+                            None => Some("not inside a git repo".to_string()),
+                        },
+                        None => Some("no file in the editor".to_string()),
+                    };
+                    dirty = true;
+                }
                 Msg::OpenAbout => {
                     // Show the bundled docs (#66) as an editor buffer: reveal +
                     // focus the editor, then RPC-open the cached ABOUT.md.
@@ -2343,8 +2485,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         // return focus to the panel (over the terminal pane) so
                         // Esc/arrows drive the list again instead of the editor
                         // that just had focus for scrolling the diff (#51).
-                        if diff.is_some() {
-                            diff = Some(DiffList::new(&windows[cur].dir));
+                        if let Some(dl) = diff.as_mut() {
+                            // Refresh in place, so Esc from the full-screen view
+                            // returns to the list you left — a commit range
+                            // included (#74).
+                            dl.refresh();
                             let w = &mut windows[cur];
                             if w.show_shell {
                                 w.focus_id = w.active[1];
@@ -2417,7 +2562,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         None
                     } else {
                         picker_new_window = false;
-                        Some(Picker::new(proot.clone()))
+                        Some(Picker::new_excluding(proot.clone(), &open_dirs(&windows)))
                     };
                     dirty = true;
                     needs_clear = true;
@@ -2426,7 +2571,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     exit_copy(&mut copy, &mut windows);
                     help = None;
                     diff = None;
-                    picker = Some(Picker::new(proot.clone()));
+                    picker = Some(Picker::new_excluding(proot.clone(), &open_dirs(&windows)));
                     picker_new_window = true;
                     dirty = true;
                     needs_clear = true;
@@ -2657,6 +2802,17 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         Ok(dir) => {
                             wtform = None;
                             needs_clear = true;
+                            // A worktree that already has a window (re-created
+                            // over an existing path) focuses it instead (#82).
+                            if let Some(i) = window_for_dir(&windows, &dir) {
+                                if i != cur {
+                                    use_tick += 1;
+                                    windows[cur].used = use_tick;
+                                    cur = i;
+                                }
+                                dirty = true;
+                                continue;
+                            }
                             let (c, r) = size;
                             let area = r.saturating_sub(1);
                             let base = next_id;
@@ -2834,7 +2990,12 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 if cfg.status_clock {
                     segs.push(now.format("%H:%M").to_string());
                 }
-                let right_info = segs.join("  ");
+                // A favorite toggle has no other feedback — the editor pane
+                // looks identical — so lead the status bar with it (#80).
+                let right_info = match &fav_note {
+                    Some(n) => format!("★ {n}   {}", segs.join("  ")),
+                    None => segs.join("  "),
+                };
                 framebuf.clear();
                 let ksnap = *keys.lock().unwrap();
                 let eksnap = editor_keys.lock().unwrap().clone();
@@ -2861,6 +3022,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     wtform.as_ref(),
                     ai_tab_prompt,
                     switcher.as_ref(),
+                    favs.as_ref(),
                     dl,
                     &right_info,
                     ksnap,
@@ -2910,11 +3072,14 @@ fn run_client(sock: &Path) -> Result<()> {
     queue!(out, EnterAlternateScreen, EnableMouseCapture, cursor::Hide)?;
     // Ask for the kitty keyboard protocol in "disambiguate" mode (#67) so chords
     // with no legacy encoding — Ctrl-Space, the prefix — arrive as distinct CSI-u
-    // events. Terminals without it ignore the push; the server re-encodes every
-    // non-prefix event back to legacy bytes before any pane sees it, so nothing
-    // downstream changes. TerminalGuard pops it on every exit path.
-    out.write_all(b"\x1b[>1u")?;
-    out.flush()?;
+    // events. Opt-in (`kitty_keys`): a terminal that half-implements it can
+    // mangle ordinary keys, and that is not worth risking for a session that
+    // works fine on the byte path. TerminalGuard pops it on every exit path.
+    let (ccfg, _) = Config::load();
+    if ccfg.kitty_keys {
+        out.write_all(b"\x1b[>1u")?;
+        out.flush()?;
+    }
     let _guard = TerminalGuard;
 
     // Current write half; swapped out during a reconnect. The input/resize
@@ -3052,6 +3217,26 @@ fn parse_key_event(params: &[u8]) -> Option<(u32, bool, bool)> {
         .unwrap_or(1)
         .saturating_sub(1);
     Some((code, mods & 0b100 != 0, mods & 0b010 != 0))
+}
+
+/// Whether a modified-arrow parameter (`1;<mods>`) carries modifiers beyond the
+/// shift/alt/ctrl set that panes actually understand. Terminals in enhanced
+/// keyboard modes report extra bits (super/hyper/caps/num), and readline prints
+/// the tail of a sequence it can't parse as literal text — "29A" (#74). Those
+/// get flattened to a plain arrow; ordinary Ctrl-/Alt-arrows pass through so
+/// nvim still sees them.
+fn exotic_modifier(params: &[u8]) -> bool {
+    let Some(rest) = params.strip_prefix(b"1;") else {
+        return false;
+    };
+    match std::str::from_utf8(rest)
+        .ok()
+        .and_then(|s| s.split(':').next()?.parse::<u32>().ok())
+    {
+        // mods is a bitmask + 1; 2..=8 covers shift/alt/ctrl and their combos.
+        Some(m) => !(2..=8).contains(&m),
+        None => true,
+    }
 }
 
 /// Re-encode a key event as the bytes a terminal without the kitty protocol
@@ -3324,6 +3509,17 @@ impl InputParser {
                         let params = std::mem::take(&mut self.csi);
                         if b == b'u' {
                             self.key_event(&params, out);
+                        } else if matches!(b, b'A'..=b'D' | b'H' | b'F') && exotic_modifier(&params)
+                        {
+                            // A modified arrow/Home/End (`ESC [ 1;<mods> A`).
+                            // Panes and overlays only understand the plain form:
+                            // readline prints the tail of anything else as
+                            // literal text ("29A"), and the diff panel's parser
+                            // gives up on it. Drop the modifier and forward the
+                            // legacy sequence (#74).
+                            self.prefix_pending = false;
+                            self.passthrough.extend_from_slice(b"\x1b[");
+                            self.passthrough.push(b);
                         } else {
                             // A real key: it isn't a prefix binding, so it spends
                             // a parked prefix and goes to the pane as-is.
@@ -3439,6 +3635,7 @@ fn render(
     wtform: Option<&WorktreeForm>,
     ai_prompt: bool,
     switcher: Option<&WinSwitcher>,
+    favs: Option<&FavList>,
     diff: Option<&DiffList>,
     right_info: &str,
     keys: Keys,
@@ -3538,6 +3735,9 @@ fn render(
     }
     if let Some(sw) = switcher {
         sw.render(out, windows, cur, cols, rows)?;
+    }
+    if let Some(fl) = favs {
+        fl.render(out, cols, rows)?;
     }
     if ai_prompt {
         draw_ai_tab_prompt(out, cols, rows)?;
@@ -3715,6 +3915,148 @@ impl WinSwitcher {
             SetForegroundColor(Color::Cyan),
             Print("│"),
             cursor::MoveTo(x, y + 3 + rows.len() as u16),
+            Print(format!("└{}┘", "─".repeat(iw))),
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            cursor::Hide,
+        )?;
+        Ok(())
+    }
+}
+
+/// The favorites list (#80): the repo's favorite files, filtered by typing and
+/// opened with Enter. Favorites are shared by every worktree and clone of the
+/// repo, so an entry can be missing in *this* checkout — those are listed
+/// dimmed and can't be opened, rather than silently dropped.
+struct FavList {
+    entries: Vec<favorites::Favorite>,
+    filter: String,
+    sel: usize,
+}
+
+impl FavList {
+    fn new(dir: &Path) -> FavList {
+        FavList {
+            entries: favorites::list(dir),
+            filter: String::new(),
+            sel: 0,
+        }
+    }
+
+    /// Indices of the entries matching the filter.
+    fn matches(&self) -> Vec<usize> {
+        let f = self.filter.to_lowercase();
+        (0..self.entries.len())
+            .filter(|&i| f.is_empty() || self.entries[i].rel.to_lowercase().contains(&f))
+            .collect()
+    }
+
+    fn step(&mut self, delta: i32) {
+        let n = self.matches().len();
+        if n > 0 {
+            self.sel = (self.sel as i64 + delta as i64).clamp(0, n as i64 - 1) as usize;
+        }
+    }
+
+    /// Handle a key; `Some(path)` opens that file and closes the list.
+    fn feed(&mut self, b: u8, done: &mut bool) -> Option<PathBuf> {
+        match b {
+            0x1b | 0x03 => *done = true,
+            b'\r' | b'\n' => {
+                let hit = self.matches().get(self.sel).map(|&i| &self.entries[i]);
+                // A favorite missing here can't be opened; leave the list up so
+                // it's clear which entry was refused.
+                if let Some(f) = hit.filter(|f| f.exists) {
+                    *done = true;
+                    return Some(f.abs.clone());
+                }
+            }
+            0x7f | 0x08 => {
+                self.filter.pop();
+                self.sel = 0;
+            }
+            0x20..=0x7e => {
+                self.filter.push(b as char);
+                self.sel = 0;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn render(&self, out: &mut Vec<u8>, cols: u16, rows_h: u16) -> Result<()> {
+        let hits = self.matches();
+        let hint = if self.entries.is_empty() {
+            " no favorites yet — Ctrl-a B favorites the editor's file "
+        } else {
+            " type to filter · Enter open · Esc cancel "
+        };
+        let widest = hits
+            .iter()
+            .map(|&i| self.entries[i].rel.chars().count() + 4)
+            .chain(std::iter::once(hint.chars().count()))
+            .max()
+            .unwrap_or(20);
+        let iw = widest.min(cols.saturating_sub(4) as usize);
+        let bw = iw as u16 + 2;
+        let bh = hits.len() as u16 + 4;
+        if bw > cols || bh > rows_h {
+            return Ok(());
+        }
+        let (x, y) = ((cols - bw) / 2, (rows_h - bh) / 2);
+        let line = |s: &str| -> String {
+            let t: String = s.chars().take(iw).collect();
+            format!("{t}{}", " ".repeat(iw.saturating_sub(t.chars().count())))
+        };
+        queue!(
+            out,
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            cursor::MoveTo(x, y),
+            Print(format!("┌{}┐", "─".repeat(iw))),
+            SetAttribute(Attribute::Reset),
+            cursor::MoveTo(x, y + 1),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+            SetForegroundColor(Color::White),
+            Print(line(&format!(" ★ {}▏", self.filter))),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+        )?;
+        for (row, &i) in hits.iter().enumerate() {
+            let f = &self.entries[i];
+            queue!(
+                out,
+                cursor::MoveTo(x, y + 2 + row as u16),
+                SetForegroundColor(Color::Cyan),
+                Print("│"),
+            )?;
+            if row == self.sel {
+                queue!(
+                    out,
+                    SetBackgroundColor(Color::Cyan),
+                    SetForegroundColor(Color::Black)
+                )?;
+            } else if !f.exists {
+                // Dimmed: the favorite belongs to the repo but not this checkout.
+                queue!(out, ResetColor, SetForegroundColor(Color::DarkGrey))?;
+            } else {
+                queue!(out, ResetColor, SetForegroundColor(Color::White))?;
+            }
+            let mark = if f.exists { " " } else { "!" };
+            queue!(out, Print(line(&format!(" {mark} {}", f.rel))))?;
+            queue!(out, ResetColor, SetForegroundColor(Color::Cyan), Print("│"))?;
+        }
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 2 + hits.len() as u16),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+            SetForegroundColor(Color::DarkGrey),
+            Print(line(hint)),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+            cursor::MoveTo(x, y + 3 + hits.len() as u16),
             Print(format!("└{}┘", "─".repeat(iw))),
             ResetColor,
             SetAttribute(Attribute::Reset),
@@ -5064,6 +5406,26 @@ mod tests {
     }
 
     #[test]
+    fn modified_arrows_reach_panes_as_plain_arrows() {
+        // Some terminals report arrows with a modifier parameter
+        // (`ESC [ 1;29 A`). readline prints the tail of that as literal text
+        // ("29A") and the diff panel's parser can't read it, so forge forwards
+        // the plain legacy form instead (#74).
+        let mut out = Vec::new();
+        parser().feed(b"\x1b[1;29A", &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == b"\x1b[A"));
+
+        // An unmodified arrow is untouched, and a non-arrow CSI still passes
+        // through with its parameters intact.
+        let mut out = Vec::new();
+        parser().feed(b"\x1b[B", &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == b"\x1b[B"));
+        let mut out = Vec::new();
+        parser().feed(b"\x1b[200~", &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Input(b)] if b == b"\x1b[200~"));
+    }
+
+    #[test]
     fn esc_sequence_not_split() {
         // An arrow key (ESC [ A) arrives atomically and passes through intact,
         // not mistaken for a lone Esc.
@@ -5138,6 +5500,38 @@ mod tests {
         let mut ws = ws;
         ws[1].used = 10;
         assert_eq!(tab_numbers(&ws, 1)[3], Some(1));
+    }
+
+    /// Walking a sequence of switches: the order must always read most-recent
+    /// first, including the window just left (#77).
+    #[test]
+    fn recency_order_tracks_a_switch_sequence() {
+        let mut ws = vec![
+            win("notes", true, 0),
+            win("a", false, 0),
+            win("b", false, 0),
+            win("c", false, 0),
+        ];
+        let mut tick = 0u64;
+        let mut cur = 1; // start on "a"
+        let switch = |ws: &mut Vec<Window>, cur: &mut usize, to: usize, tick: &mut u64| {
+            *tick += 1;
+            ws[*cur].used = *tick;
+            *cur = to;
+        };
+        switch(&mut ws, &mut cur, 2, &mut tick); // a -> b
+        switch(&mut ws, &mut cur, 3, &mut tick); // b -> c
+        let names = |ws: &Vec<Window>, cur: usize| {
+            mru_order(ws, cur)
+                .iter()
+                .map(|&i| ws[i].title.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&ws, cur), ["b", "a"], "just-left window is mod-1");
+        switch(&mut ws, &mut cur, 1, &mut tick); // c -> a
+        assert_eq!(names(&ws, cur), ["c", "b"], "and again after bouncing");
+        switch(&mut ws, &mut cur, 3, &mut tick); // a -> c
+        assert_eq!(names(&ws, cur), ["a", "b"]);
     }
 
     #[test]

@@ -331,6 +331,35 @@ impl DiffList {
         }
     }
 
+    /// Re-read the list currently on screen, keeping the mode and the picked
+    /// range. Used when the full-screen diff closes (#74): rebuilding the panel
+    /// from scratch there would drop you back on the working-tree list instead
+    /// of the commit range you were browsing.
+    pub fn refresh(&mut self) {
+        let Some(root) = self.root.clone() else {
+            return;
+        };
+        match (self.mode, &self.range) {
+            (Mode::Range, Some((b, h))) => {
+                if let Ok(e) = load_range(&root, &b.sha, &h.sha) {
+                    self.entries = e;
+                }
+            }
+            (Mode::Log, _) => {
+                if let Ok(c) = load_log(&root) {
+                    self.commits = c;
+                }
+            }
+            _ => {
+                if let Ok(e) = load(&root) {
+                    self.entries = e;
+                }
+            }
+        }
+        self.sel = self.sel.min(self.len().saturating_sub(1));
+        self.note = None;
+    }
+
     /// A click on row `i`: marks a commit in the log, opens a file elsewhere.
     pub fn click(&mut self, i: usize) -> DiffAction {
         self.select(i);
@@ -443,7 +472,11 @@ impl DiffList {
                     _ => {}
                 },
                 1 => {
-                    if b == b'[' {
+                    // Both encodings of an arrow key: CSI (`ESC [ A`) and SS3
+                    // (`ESC O A`), which terminals send in application-cursor
+                    // mode — treating SS3's `O` as "not a sequence" made arrows
+                    // read as Esc and step the panel back instead (#74).
+                    if b == b'[' || b == b'O' {
                         self.esc = 2;
                     } else {
                         // A non-`[` byte right after ESC: not a sequence we
@@ -456,6 +489,14 @@ impl DiffList {
                     }
                 }
                 _ => {
+                    // Parameters (`ESC [ 1;5 A`) come before the final byte, so
+                    // skip them rather than treating the first digit as the end
+                    // of the sequence — that made modified arrows do nothing
+                    // and dropped the rest of the sequence into the list as
+                    // stray keys (#74).
+                    if b.is_ascii_digit() || b == b';' {
+                        continue;
+                    }
                     self.esc = 0;
                     match b {
                         b'A' => self.scroll(-1),
@@ -1037,6 +1078,45 @@ mod tests {
         assert!(matches!(dl.feed_bytes(&[0x1b]), DiffAction::Cancel));
     }
 
+    /// Terminals in application-cursor mode send SS3 arrows (`ESC O A`), not
+    /// CSI. Treating the `O` as an unknown byte made every arrow press read as
+    /// Esc and step the panel back, so only j/k appeared to work (#74).
+    /// An arrow carrying a modifier parameter still moves the selection, and
+    /// its digits don't leak into the list as keystrokes (#74).
+    #[test]
+    fn modified_arrows_move_the_selection() {
+        let mut dl = fixture(3);
+        assert!(matches!(dl.feed_bytes(b"\x1b[1;29B"), DiffAction::None));
+        assert_eq!(dl.sel, 1);
+        assert!(matches!(dl.feed_bytes(b"\x1b[1;5A"), DiffAction::None));
+        assert_eq!(dl.sel, 0);
+        assert!(matches!(dl.mode, Mode::Worktree), "and never dismisses");
+    }
+
+    #[test]
+    fn ss3_arrows_move_the_selection() {
+        let mut dl = fixture(3);
+        assert!(matches!(dl.feed_bytes(b"\x1bOB"), DiffAction::None));
+        assert_eq!(dl.sel, 1, "SS3 down moves the selection");
+        assert!(matches!(dl.feed_bytes(b"\x1bOA"), DiffAction::None));
+        assert_eq!(dl.sel, 0, "SS3 up moves it back");
+        // The panel is still open — an arrow must not dismiss it.
+        assert!(matches!(dl.mode, Mode::Worktree));
+
+        // Same in the commit list.
+        dl.commits = (0..3)
+            .map(|i| Commit {
+                sha: format!("sha{i}"),
+                subject: "s".into(),
+                when: "now".into(),
+            })
+            .collect();
+        dl.mode = Mode::Log;
+        dl.feed_bytes(b"\x1bOB");
+        assert_eq!(dl.sel, 1);
+        assert!(matches!(dl.mode, Mode::Log), "arrows don't step back");
+    }
+
     /// The commit list is modal: Space marks, Enter diffs, Esc steps back to
     /// the file list rather than closing the panel (#74).
     #[test]
@@ -1099,5 +1179,75 @@ mod tests {
         dl.scroll(99);
         assert_eq!(dl.sel, 19, "scroll clamps to the last commit");
         assert_eq!(dl.window(5), (15, 5));
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use std::process::Command as C;
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = C::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Driving the panel the way a user does: `l` to the commit list, mark two
+    /// commits, Enter to diff them, then Enter on a file must hand back an Open
+    /// carrying the range (#74).
+    #[test]
+    fn enter_on_a_file_in_a_range_opens_it() {
+        let dir = std::env::temp_dir().join(format!("cf-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_in(&dir, &["init", "-q"]);
+        git_in(&dir, &["config", "user.email", "t@t"]);
+        git_in(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "first"]);
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        git_in(&dir, &["commit", "-qam", "second"]);
+
+        let mut dl = DiffList::new(&dir);
+        dl.feed_bytes(b"l");
+        assert!(matches!(dl.mode, Mode::Log), "l enters the commit list");
+        assert_eq!(dl.commits.len(), 2);
+        dl.feed_bytes(b" ");
+        dl.feed_bytes(b"j");
+        dl.feed_bytes(b" ");
+        assert_eq!(dl.marks.len(), 2);
+        dl.feed_bytes(b"\r");
+        assert!(
+            matches!(dl.mode, Mode::Range),
+            "enter diffs the marks: {:?}",
+            dl.note
+        );
+        assert_eq!(dl.entries.len(), 1, "a.txt changed between them");
+
+        match dl.feed_bytes(b"\r") {
+            DiffAction::Open { path, rev } => {
+                assert_eq!(path, dir.join("a.txt"));
+                assert!(rev.is_some(), "the open carries the range");
+            }
+            _ => panic!("enter on a file must open it; note={:?}", dl.note),
+        }
+
+        // Closing the full-screen diff refreshes the panel in place: you come
+        // back to the range you were browsing, not the working-tree list (#74).
+        dl.refresh();
+        assert!(matches!(dl.mode, Mode::Range), "still on the range");
+        assert_eq!(dl.entries.len(), 1);
+        assert!(dl.range.is_some(), "the picked commits survive");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

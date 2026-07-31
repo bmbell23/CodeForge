@@ -40,8 +40,14 @@ pub struct Picker {
 }
 
 impl Picker {
-    pub fn new(root: PathBuf) -> Picker {
-        let mut all = list_dirs(&root);
+    /// List `root`'s projects. `open` are directories already showing in a
+    /// window — they're left out, since a second window on the same directory
+    /// gives two editors over one working tree (#82).
+    pub fn new_excluding(root: PathBuf, open: &[PathBuf]) -> Picker {
+        let mut all: Vec<String> = list_dirs(&root)
+            .into_iter()
+            .filter(|name| !open.iter().any(|d| d == &root.join(name)))
+            .collect();
         all.sort_by_key(|s| s.to_lowercase());
         let mut p = Picker {
             root,
@@ -53,6 +59,11 @@ impl Picker {
         };
         p.refilter();
         p
+    }
+
+    /// Every project under `root` — the startup picker, where nothing is open.
+    pub fn new(root: PathBuf) -> Picker {
+        Picker::new_excluding(root, &[])
     }
 
     fn refilter(&mut self) {
@@ -327,4 +338,32 @@ fn list_dirs(root: &Path) -> Vec<String> {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod open_filter_tests {
+    use super::*;
+
+    /// Projects that already have a window are left out of the picker, so a
+    /// second window can't be opened over the same working tree (#82).
+    #[test]
+    fn picker_hides_already_open_projects() {
+        let root = std::env::temp_dir().join(format!("cf-pick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+
+        let all = Picker::new(root.clone());
+        assert_eq!(all.all.len(), 3, "startup lists every project");
+
+        let p = Picker::new_excluding(root.clone(), &[root.join("beta")]);
+        assert_eq!(p.all, vec!["alpha".to_string(), "gamma".to_string()]);
+        assert!(
+            !p.all.contains(&"beta".to_string()),
+            "open project is hidden"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
