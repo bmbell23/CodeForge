@@ -475,6 +475,10 @@ pub enum Msg {
     OpenFavorites,
     /// Favorite / unfavorite the file open in the editor (#80).
     ToggleFavorite,
+    /// Open the worktree manager (#83).
+    OpenWorktrees,
+    /// A background classification finished: worktree path -> state (#83).
+    WorktreeState(PathBuf, worktree::WtState),
     /// Toggle fullscreen of the focused pane, hiding the other two (#40).
     ZoomPane,
     /// Go to the Notes window (position 0), creating it — with a fresh
@@ -936,6 +940,20 @@ fn new_window(
         // slots in as the least-recent until you switch to it (#77).
         used: 0,
     })
+}
+
+/// Move to window `to`, stamping the window being left as most-recently-used.
+/// Every path that changes the current window goes through here: stamping only
+/// the window being *entered* leaves the one you just left with an old tick, so
+/// it sorts below windows untouched for ages and `mod-1` stops meaning "back
+/// where I was" (#77).
+fn switch_window(windows: &mut [Window], cur: &mut usize, to: usize, tick: &mut u64) {
+    if to >= windows.len() || to == *cur {
+        return;
+    }
+    *tick += 1;
+    windows[*cur].used = *tick;
+    *cur = to;
 }
 
 /// Directories that already have a window, so the picker can leave them out and
@@ -1745,6 +1763,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let mut switcher: Option<WinSwitcher> = None;
     // The favorites list is up (#80); modal in the same way.
     let mut favs: Option<FavList> = None;
+    // The worktree manager is up (#83).
+    let mut wtman: Option<WtManager> = None;
     // Transient confirmation for a favorite toggle, shown on the status bar
     // until the next one — the editor pane gives no feedback of its own.
     let mut fav_note: Option<String> = None;
@@ -1804,7 +1824,61 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     }
                 }
                 Msg::Input(bytes) => {
-                    if let Some(fl) = favs.as_mut() {
+                    if let Some(m) = wtman.as_mut() {
+                        // Modal (#83). Deletion runs here so it can also close
+                        // any forge window sitting on the worktree first.
+                        let mut done = false;
+                        let mut doomed = Vec::new();
+                        if bytes.starts_with(b"\x1b[A") || bytes.starts_with(b"\x1bOA") {
+                            m.step(-1);
+                        } else if bytes.starts_with(b"\x1b[B") || bytes.starts_with(b"\x1bOB") {
+                            m.step(1);
+                        } else {
+                            for &b in bytes.iter() {
+                                doomed.extend(m.feed(b, &mut done));
+                                if done {
+                                    break;
+                                }
+                            }
+                        }
+                        let mut failures = Vec::new();
+                        for e in &doomed {
+                            // Close a window on this worktree first: deleting the
+                            // directory under a live nvim/shell would leave broken
+                            // panes writing to a path that no longer exists.
+                            if let Some(i) = window_for_dir(&windows, &e.path) {
+                                for p in &mut windows[i].panes {
+                                    p.kill();
+                                }
+                                windows.remove(i);
+                                if cur >= windows.len() {
+                                    cur = windows.len().saturating_sub(1);
+                                }
+                            }
+                            if let Err(err) = worktree::delete(e) {
+                                failures.push(format!("{}: {err:#}", e.name));
+                            }
+                        }
+                        if !doomed.is_empty() {
+                            if windows.is_empty() {
+                                // Every window is gone; there is nothing left to
+                                // render, so leave rather than show an empty shell.
+                                quit = true;
+                            }
+                            let m = wtman.get_or_insert_with(|| WtManager::new(&proot, &tx));
+                            *m = WtManager::new(&proot, &tx);
+                            m.note = Some(if failures.is_empty() {
+                                format!("deleted {}", doomed.len())
+                            } else {
+                                failures.join("; ")
+                            });
+                        }
+                        if done {
+                            wtman = None;
+                        }
+                        dirty = true;
+                        needs_clear = true;
+                    } else if let Some(fl) = favs.as_mut() {
                         // Modal: arrows move, typing filters, Enter opens (#80).
                         let mut done = false;
                         let mut pick = None;
@@ -1861,12 +1935,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             switcher = None;
                         }
                         if let Some(i) = pick {
-                            if i != cur {
-                                exit_copy(&mut copy, &mut windows);
-                                use_tick += 1;
-                                windows[cur].used = use_tick;
-                                cur = i;
-                            }
+                            exit_copy(&mut copy, &mut windows);
+                            switch_window(&mut windows, &mut cur, i, &mut use_tick);
                         }
                         dirty = true;
                         needs_clear = true;
@@ -1956,11 +2026,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 // name one. Focus that window rather than open a
                                 // second editor over the same tree (#82).
                                 if let Some(i) = window_for_dir(&windows, &dir) {
-                                    if i != cur {
-                                        use_tick += 1;
-                                        windows[cur].used = use_tick;
-                                        cur = i;
-                                    }
+                                    switch_window(&mut windows, &mut cur, i, &mut use_tick);
                                     dirty = true;
                                     continue;
                                 }
@@ -2366,6 +2432,17 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     });
                     dirty = true;
                     needs_clear = true;
+                }
+                Msg::OpenWorktrees => {
+                    wtman = Some(WtManager::new(&proot, &tx));
+                    dirty = true;
+                    needs_clear = true;
+                }
+                Msg::WorktreeState(path, state) => {
+                    if let Some(m) = wtman.as_mut() {
+                        m.apply(&path, state);
+                        dirty = true;
+                    }
                 }
                 Msg::OpenFavorites => {
                     favs = Some(FavList::new(&windows[cur].dir));
@@ -2774,7 +2851,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         .and_then(|p| mru_order(&windows, cur).get(p).copied());
                     if let Some(n) = target {
                         exit_copy(&mut copy, &mut windows);
-                        cur = n;
+                        switch_window(&mut windows, &mut cur, n, &mut use_tick);
                         // The git-diff panel follows the current project (#60):
                         // if it's open, rebuild it for the new window's repo and
                         // reveal + focus the terminal pane it lives over, just
@@ -2805,11 +2882,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             // A worktree that already has a window (re-created
                             // over an existing path) focuses it instead (#82).
                             if let Some(i) = window_for_dir(&windows, &dir) {
-                                if i != cur {
-                                    use_tick += 1;
-                                    windows[cur].used = use_tick;
-                                    cur = i;
-                                }
+                                switch_window(&mut windows, &mut cur, i, &mut use_tick);
                                 dirty = true;
                                 continue;
                             }
@@ -3023,6 +3096,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     ai_tab_prompt,
                     switcher.as_ref(),
                     favs.as_ref(),
+                    wtman.as_ref(),
                     dl,
                     &right_info,
                     ksnap,
@@ -3076,7 +3150,10 @@ fn run_client(sock: &Path) -> Result<()> {
     // mangle ordinary keys, and that is not worth risking for a session that
     // works fine on the byte path. TerminalGuard pops it on every exit path.
     let (ccfg, _) = Config::load();
-    if ccfg.kitty_keys {
+    // A prefix with no legacy encoding (C-space) is unusable without the
+    // protocol, so asking for that prefix implies asking for the protocol —
+    // requiring a second flag would just silently fall back to Ctrl-a (#67).
+    if ccfg.kitty_keys || ccfg.prefix_chord().byte.is_none() {
         out.write_all(b"\x1b[>1u")?;
         out.flush()?;
     }
@@ -3422,8 +3499,22 @@ impl InputParser {
             self.prefix_pending = false;
             return;
         };
-        let (code, ctrl, alt) = ev;
-        if code == self.prefix.code && ctrl == self.prefix.ctrl && alt == self.prefix.alt {
+        let (mut code, ctrl, alt) = ev;
+        // Some terminals report Ctrl-Space as NUL rather than Space+ctrl; they
+        // mean the same keypress.
+        if ctrl && code == 0 {
+            code = 32;
+        }
+        let bytes = legacy_bytes(code, ctrl, alt);
+        // The fallback prefix must work in *every* encoding, not just as a raw
+        // byte: with the protocol on, this terminal reports Ctrl-a as a key
+        // event too, and passing it to the pane left no way to drive the
+        // session at all (#67). Never let a key that would be the prefix on the
+        // byte path slip through here.
+        let is_fallback = bytes.len() == 1 && self.fallback == Some(bytes[0]);
+        if (code == self.prefix.code && ctrl == self.prefix.ctrl && alt == self.prefix.alt)
+            || is_fallback
+        {
             // The prefix itself: arm it (pressing it twice sends one literally,
             // matching the byte path).
             if matches!(self.state, InState::Prefix) && !self.prefix_pending {
@@ -3436,7 +3527,6 @@ impl InputParser {
             }
             return;
         }
-        let bytes = legacy_bytes(code, ctrl, alt);
         // A parked prefix (#76) or one armed by this very chord resolves against
         // the translated byte, so `Ctrl-Space` then `1` works like any command.
         let armed = self.prefix_pending || matches!(self.state, InState::Prefix);
@@ -3636,6 +3726,7 @@ fn render(
     ai_prompt: bool,
     switcher: Option<&WinSwitcher>,
     favs: Option<&FavList>,
+    wtman: Option<&WtManager>,
     diff: Option<&DiffList>,
     right_info: &str,
     keys: Keys,
@@ -3738,6 +3829,9 @@ fn render(
     }
     if let Some(fl) = favs {
         fl.render(out, cols, rows)?;
+    }
+    if let Some(m) = wtman {
+        m.render(out, cols, rows)?;
     }
     if ai_prompt {
         draw_ai_tab_prompt(out, cols, rows)?;
@@ -3915,6 +4009,317 @@ impl WinSwitcher {
             SetForegroundColor(Color::Cyan),
             Print("│"),
             cursor::MoveTo(x, y + 3 + rows.len() as u16),
+            Print(format!("└{}┘", "─".repeat(iw))),
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            cursor::Hide,
+        )?;
+        Ok(())
+    }
+}
+
+/// The worktree manager (#83): every linked worktree under the projects root,
+/// classified dirty / pending / clean, with deletion of the clean ones. Clones
+/// never appear — `list_worktrees` only returns linked worktrees, so there is no
+/// path from this UI to removing sfaos/k8s/auto/infra themselves.
+struct WtManager {
+    entries: Vec<worktree::WtEntry>,
+    sel: usize,
+    /// How many classifications are still running, for the "updating…" line.
+    pending: usize,
+    /// Confirmation in progress: what would be deleted, and what's typed so far.
+    confirm: Option<(WtTarget, String)>,
+    /// Result of the last delete, shown in the footer.
+    note: Option<String>,
+}
+
+/// What a confirmation is about to destroy.
+#[derive(Clone)]
+enum WtTarget {
+    One(usize),
+    AllClean,
+}
+
+impl WtManager {
+    /// Build the list and kick off one classification per worktree. Each runs on
+    /// its own thread and reports back as a message, so a slow `git fetch` on one
+    /// worktree never blocks the list or the event loop.
+    fn new(root: &Path, tx: &Sender<Msg>) -> WtManager {
+        let entries = worktree::list_worktrees(root);
+        for e in &entries {
+            let (path, tx) = (e.path.clone(), tx.clone());
+            thread::spawn(move || {
+                let state = worktree::classify(&path);
+                let _ = tx.send(Msg::WorktreeState(path, state));
+            });
+        }
+        WtManager {
+            pending: entries.len(),
+            entries,
+            sel: 0,
+            confirm: None,
+            note: None,
+        }
+    }
+
+    /// Record a finished classification.
+    fn apply(&mut self, path: &Path, state: worktree::WtState) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
+            e.state = state;
+            self.pending = self.pending.saturating_sub(1);
+        }
+    }
+
+    fn clean_indices(&self) -> Vec<usize> {
+        (0..self.entries.len())
+            .filter(|&i| self.entries[i].deletable())
+            .collect()
+    }
+
+    fn step(&mut self, delta: i32) {
+        let n = self.entries.len();
+        if n > 0 {
+            self.sel = (self.sel as i64 + delta as i64).clamp(0, n as i64 - 1) as usize;
+        }
+    }
+
+    /// Handle a key. Returns the worktrees to delete once a confirmation is
+    /// satisfied; `done` closes the manager.
+    fn feed(&mut self, b: u8, done: &mut bool) -> Vec<worktree::WtEntry> {
+        // A confirmation owns every key until it's satisfied or abandoned.
+        if let Some((target, typed)) = self.confirm.as_mut() {
+            match b {
+                0x1b | 0x03 => self.confirm = None,
+                b'\r' | b'\n' => {
+                    if typed == "DELETE" {
+                        let target = target.clone();
+                        self.confirm = None;
+                        return match target {
+                            WtTarget::One(i) => self.entries.get(i).cloned().into_iter().collect(),
+                            WtTarget::AllClean => self
+                                .clean_indices()
+                                .into_iter()
+                                .filter_map(|i| self.entries.get(i).cloned())
+                                .collect(),
+                        };
+                    }
+                    self.note = Some("type DELETE exactly to confirm".into());
+                }
+                0x7f | 0x08 => {
+                    typed.pop();
+                }
+                0x20..=0x7e => typed.push(b as char),
+                _ => {}
+            }
+            return Vec::new();
+        }
+        match b {
+            0x1b | 0x03 | b'q' => *done = true,
+            b'j' => self.step(1),
+            b'k' => self.step(-1),
+            b'd' => match self.entries.get(self.sel) {
+                Some(e) if e.deletable() => {
+                    self.confirm = Some((WtTarget::One(self.sel), String::new()))
+                }
+                Some(_) => self.note = Some("only clean worktrees can be deleted".into()),
+                None => {}
+            },
+            b'a' => {
+                if self.clean_indices().is_empty() {
+                    self.note = Some("nothing clean to delete".into());
+                } else {
+                    self.confirm = Some((WtTarget::AllClean, String::new()));
+                }
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn render(&self, out: &mut Vec<u8>, cols: u16, rows_h: u16) -> Result<()> {
+        // The confirmation replaces the list: nothing else should be competing
+        // for attention while an irreversible delete is being confirmed.
+        if let Some((target, typed)) = &self.confirm {
+            return self.render_confirm(out, cols, rows_h, target, typed);
+        }
+        let title = if self.pending > 0 {
+            format!(" worktrees · updating… ({} left) ", self.pending)
+        } else {
+            format!(
+                " worktrees · {} clean of {} ",
+                self.clean_indices().len(),
+                self.entries.len()
+            )
+        };
+        let hint = match &self.note {
+            Some(n) => format!(" {n} "),
+            None => " j/k move · d delete · a delete all clean · Esc close ".to_string(),
+        };
+        let widest = self
+            .entries
+            .iter()
+            .map(|e| e.name.chars().count() + 12)
+            .chain([title.chars().count(), hint.chars().count()])
+            .max()
+            .unwrap_or(30);
+        let iw = widest.min(cols.saturating_sub(4) as usize);
+        let bw = iw as u16 + 2;
+        let bh = self.entries.len().max(1) as u16 + 4;
+        if bw > cols || bh > rows_h {
+            return Ok(());
+        }
+        let (x, y) = ((cols - bw) / 2, (rows_h - bh) / 2);
+        let pad = |s: &str| -> String {
+            let t: String = s.chars().take(iw).collect();
+            format!("{t}{}", " ".repeat(iw.saturating_sub(t.chars().count())))
+        };
+        let t: String = title.chars().take(iw).collect();
+        queue!(
+            out,
+            SetForegroundColor(Color::Cyan),
+            SetAttribute(Attribute::Bold),
+            cursor::MoveTo(x, y),
+            Print(format!(
+                "┌{t}{}┐",
+                "─".repeat(iw.saturating_sub(t.chars().count()))
+            )),
+            SetAttribute(Attribute::Reset),
+        )?;
+        let mut row = 0u16;
+        if self.entries.is_empty() {
+            queue!(
+                out,
+                cursor::MoveTo(x, y + 1),
+                SetForegroundColor(Color::Cyan),
+                Print("│"),
+                SetForegroundColor(Color::DarkGrey),
+                Print(pad(" no worktrees under the projects root")),
+                SetForegroundColor(Color::Cyan),
+                Print("│"),
+            )?;
+            row = 1;
+        }
+        for (i, e) in self.entries.iter().enumerate() {
+            let (label, colour) = match e.state {
+                worktree::WtState::Unknown => ("  …    ", Color::DarkGrey),
+                worktree::WtState::Dirty => ("dirty  ", Color::Red),
+                worktree::WtState::Pending => ("pending", Color::Yellow),
+                worktree::WtState::Clean => ("clean  ", Color::Green),
+                worktree::WtState::Error(_) => ("error  ", Color::Red),
+            };
+            queue!(
+                out,
+                cursor::MoveTo(x, y + 1 + i as u16),
+                ResetColor,
+                SetForegroundColor(Color::Cyan),
+                Print("│"),
+            )?;
+            if i == self.sel {
+                queue!(
+                    out,
+                    SetBackgroundColor(Color::Cyan),
+                    SetForegroundColor(Color::Black)
+                )?;
+            } else {
+                queue!(out, ResetColor, SetForegroundColor(colour))?;
+            }
+            let reason = match e.state {
+                worktree::WtState::Error(why) => format!("  ({why})"),
+                _ => String::new(),
+            };
+            queue!(out, Print(pad(&format!(" {label} {}{reason}", e.name))))?;
+            queue!(out, ResetColor, SetForegroundColor(Color::Cyan), Print("│"))?;
+            row = i as u16 + 1;
+        }
+        let h: String = hint.chars().take(iw).collect();
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 1 + row),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+            SetForegroundColor(Color::DarkGrey),
+            Print(pad(&h)),
+            SetForegroundColor(Color::Cyan),
+            Print("│"),
+            cursor::MoveTo(x, y + 2 + row),
+            Print(format!("└{}┘", "─".repeat(iw))),
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            cursor::Hide,
+        )?;
+        Ok(())
+    }
+
+    /// The confirmation: red, explicit about what dies, and requiring DELETE to
+    /// be typed in full.
+    fn render_confirm(
+        &self,
+        out: &mut Vec<u8>,
+        cols: u16,
+        rows_h: u16,
+        target: &WtTarget,
+        typed: &str,
+    ) -> Result<()> {
+        let names: Vec<String> = match target {
+            WtTarget::One(i) => self
+                .entries
+                .get(*i)
+                .map(|e| e.name.clone())
+                .into_iter()
+                .collect(),
+            WtTarget::AllClean => self
+                .clean_indices()
+                .into_iter()
+                .map(|i| self.entries[i].name.clone())
+                .collect(),
+        };
+        let mut lines: Vec<String> = vec![
+            format!(" DELETE {} worktree(s):", names.len()),
+            String::new(),
+        ];
+        lines.extend(names.iter().map(|n| format!("   {n}")));
+        lines.push(String::new());
+        lines.push(" removes the worktree, its branch, and its".to_string());
+        lines.push(" directory. This cannot be undone.".to_string());
+        lines.push(String::new());
+        lines.push(format!(" type DELETE to confirm: {typed}▏"));
+        let iw = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(30)
+            .min(cols.saturating_sub(4) as usize);
+        let (bw, bh) = (iw as u16 + 2, lines.len() as u16 + 2);
+        if bw > cols || bh > rows_h {
+            return Ok(());
+        }
+        let (x, y) = ((cols - bw) / 2, (rows_h - bh) / 2);
+        queue!(
+            out,
+            SetForegroundColor(Color::Red),
+            SetAttribute(Attribute::Bold),
+            cursor::MoveTo(x, y),
+            Print(format!("┌{}┐", "─".repeat(iw))),
+        )?;
+        for (i, l) in lines.iter().enumerate() {
+            let t: String = l.chars().take(iw).collect();
+            queue!(
+                out,
+                cursor::MoveTo(x, y + 1 + i as u16),
+                SetForegroundColor(Color::Red),
+                Print("│"),
+                SetForegroundColor(Color::White),
+                Print(format!(
+                    "{t}{}",
+                    " ".repeat(iw.saturating_sub(t.chars().count()))
+                )),
+                SetForegroundColor(Color::Red),
+                Print("│"),
+            )?;
+        }
+        queue!(
+            out,
+            cursor::MoveTo(x, y + 1 + lines.len() as u16),
             Print(format!("└{}┘", "─".repeat(iw))),
             ResetColor,
             SetAttribute(Attribute::Reset),
@@ -4195,7 +4600,17 @@ fn draw_status(
             Print("‹")
         )?;
     }
+    // Budget for the tab run: the space left after the ‹/› markers we're about
+    // to print. Labels are clipped against it — one tab wider than the row
+    // would otherwise wrap, and a wrap on the status row doubles its height and
+    // scrolls the whole layout (#55).
+    let mut room = avail
+        .saturating_sub(usize::from(start > 0))
+        .saturating_sub(usize::from(end < order.len()));
     for (slot, &i) in order.iter().enumerate().take(end).skip(start) {
+        if room == 0 {
+            break;
+        }
         let w = &windows[i];
         let (bg, fg) = if i == cur {
             (Color::Cyan, Color::Black)
@@ -4212,7 +4627,9 @@ fn draw_status(
             (Color::DarkGrey, Color::White)
         };
         queue!(out, SetBackgroundColor(bg), SetForegroundColor(fg))?;
-        queue!(out, Print(&labels[slot]))?;
+        let label: String = labels[slot].chars().take(room).collect();
+        room -= label.chars().count();
+        queue!(out, Print(&label))?;
     }
     if end < order.len() {
         queue!(
@@ -4230,7 +4647,9 @@ fn draw_status(
         if w + 1 < cols {
             queue!(
                 out,
-                cursor::MoveTo(cols - w, y),
+                // One column short of the edge: printing into the last cell of
+                // the last row makes the terminal wrap and scroll (#55).
+                cursor::MoveTo(cols - w - 1, y),
                 SetBackgroundColor(Color::DarkGrey),
                 SetForegroundColor(Color::White),
                 Print(text),
@@ -5273,10 +5692,51 @@ mod tests {
             assert!(used <= 20, "run width {used} exceeds avail");
         }
 
-        // A current tab wider than the budget still returns just that tab.
+        // A current tab wider than the budget still returns just that tab —
+        // draw_status clips the label to the row, since printing it in full
+        // would wrap and double the status bar's height (#55).
         let w = vec![3, 3, 50, 3];
         let (s, e) = visible_tabs(&w, 2, 10);
         assert_eq!((s, e), (2, 3));
+    }
+
+    /// The whole tab strip must fit one row, whatever the titles are: a wrap on
+    /// the status row doubles its height and scrolls the layout (#55).
+    #[test]
+    fn status_row_never_overflows() {
+        // The clipping draw_status applies, mirrored here so the arithmetic is
+        // covered: markers first, then labels against what's left.
+        let fit = |widths: &[usize], start: usize, end: usize, avail: usize| -> usize {
+            let mut room = avail
+                .saturating_sub(usize::from(start > 0))
+                .saturating_sub(usize::from(end < widths.len()));
+            let mut printed = usize::from(start > 0) + usize::from(end < widths.len());
+            for w in &widths[start..end] {
+                if room == 0 {
+                    break;
+                }
+                let take = (*w).min(room);
+                room -= take;
+                printed += take;
+            }
+            printed
+        };
+
+        // One absurdly long title, far wider than the terminal.
+        let w = vec![3, 3, 50, 3];
+        let (s, e) = visible_tabs(&w, 2, 10);
+        assert!(fit(&w, s, e, 10) <= 10, "a single wide tab is clipped");
+
+        // Many tabs, every current position.
+        let w = vec![9; 12];
+        for cur in 0..12 {
+            let (s, e) = visible_tabs(&w, cur, 40);
+            assert!(fit(&w, s, e, 40) <= 40, "cur {cur} overflows the row");
+        }
+
+        // Degenerate widths.
+        assert!(fit(&[80], 0, 1, 20) <= 20);
+        assert!(fit(&[5, 5], 0, 2, 3) <= 3);
     }
 
     #[test]
@@ -5326,6 +5786,32 @@ mod tests {
         // can never leave the session un-drivable.
         let mut out = Vec::new();
         p.feed(&[0x01, b'c'], &mut out);
+        assert!(matches!(out.as_slice(), [Msg::Toggle(PaneRole::Ai)]));
+    }
+
+    /// The Ctrl-a fallback must survive *every* encoding. With the protocol on,
+    /// this terminal reports Ctrl-a as a key event too; forwarding that to the
+    /// pane left no working prefix at all and locked the session (#67).
+    #[test]
+    fn fallback_prefix_works_as_a_key_event() {
+        let mut p = ctrl_space_parser();
+        let mut out = Vec::new();
+        // Ctrl-a reported as CSI 97;5u, then 'c'.
+        p.feed(b"\x1b[97;5u", &mut out);
+        assert!(
+            out.is_empty(),
+            "the fallback prefix emits nothing on its own"
+        );
+        p.feed(b"c", &mut out);
+        assert!(
+            matches!(out.as_slice(), [Msg::Toggle(PaneRole::Ai)]),
+            "Ctrl-a still opens a command when it arrives as a key event"
+        );
+
+        // Ctrl-Space reported as NUL+ctrl rather than Space+ctrl is the same key.
+        let mut out = Vec::new();
+        p.feed(b"\x1b[0;5u", &mut out);
+        p.feed(b"c", &mut out);
         assert!(matches!(out.as_slice(), [Msg::Toggle(PaneRole::Ai)]));
     }
 
@@ -5502,8 +5988,11 @@ mod tests {
         assert_eq!(tab_numbers(&ws, 1)[3], Some(1));
     }
 
-    /// Walking a sequence of switches: the order must always read most-recent
-    /// first, including the window just left (#77).
+    /// Walking a sequence of switches through the real `switch_window`: the
+    /// order must always read most-recent first, including the window just
+    /// left. An earlier version of this test drove a local closure instead of
+    /// the production path, and passed while the real code stamped only the
+    /// window being entered — leaving the one you just left sorted last (#77).
     #[test]
     fn recency_order_tracks_a_switch_sequence() {
         let mut ws = vec![
@@ -5511,27 +6000,39 @@ mod tests {
             win("a", false, 0),
             win("b", false, 0),
             win("c", false, 0),
+            win("d", false, 0),
         ];
         let mut tick = 0u64;
-        let mut cur = 1; // start on "a"
-        let switch = |ws: &mut Vec<Window>, cur: &mut usize, to: usize, tick: &mut u64| {
-            *tick += 1;
-            ws[*cur].used = *tick;
-            *cur = to;
-        };
-        switch(&mut ws, &mut cur, 2, &mut tick); // a -> b
-        switch(&mut ws, &mut cur, 3, &mut tick); // b -> c
+        let mut cur = 1; // "a"
         let names = |ws: &Vec<Window>, cur: usize| {
             mru_order(ws, cur)
                 .iter()
                 .map(|&i| ws[i].title.clone())
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names(&ws, cur), ["b", "a"], "just-left window is mod-1");
-        switch(&mut ws, &mut cur, 1, &mut tick); // c -> a
-        assert_eq!(names(&ws, cur), ["c", "b"], "and again after bouncing");
-        switch(&mut ws, &mut cur, 3, &mut tick); // a -> c
-        assert_eq!(names(&ws, cur), ["a", "b"]);
+
+        switch_window(&mut ws, &mut cur, 2, &mut tick); // a -> b
+        assert_eq!(names(&ws, cur)[0], "a", "the window just left is mod-1");
+        switch_window(&mut ws, &mut cur, 3, &mut tick); // b -> c
+        assert_eq!(names(&ws, cur), ["b", "a", "d"]);
+
+        // Bouncing between two projects: the other one stays mod-1 forever,
+        // never drifting to the end of the strip.
+        for _ in 0..4 {
+            switch_window(&mut ws, &mut cur, 1, &mut tick); // -> a
+            assert_eq!(names(&ws, cur)[0], "c", "bounce: mod-1 is where we were");
+            switch_window(&mut ws, &mut cur, 3, &mut tick); // -> c
+            assert_eq!(names(&ws, cur)[0], "a", "bounce back: still mod-1");
+        }
+
+        // Never-visited windows sort last, not first.
+        assert_eq!(names(&ws, cur).last().unwrap(), "d");
+
+        // Switching to where you already are changes nothing.
+        let before = names(&ws, cur);
+        let same = cur;
+        switch_window(&mut ws, &mut cur, same, &mut tick);
+        assert_eq!(names(&ws, cur), before);
     }
 
     #[test]

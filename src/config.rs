@@ -246,6 +246,8 @@ pub struct Keys {
     pub favorites: char,
     /// Favorite / unfavorite the file open in the editor (#80).
     pub favorite_toggle: char,
+    /// Worktree manager (#83): status per worktree, delete the clean ones.
+    pub worktrees: char,
     /// Fullscreen the focused pane, hiding the other two; press again to
     /// restore the previous layout (#40).
     pub zoom: char,
@@ -310,6 +312,7 @@ impl Default for Keys {
             win_list: '\t',
             favorites: 'b',
             favorite_toggle: 'B',
+            worktrees: 'D',
             zoom: 'z',
         }
     }
@@ -318,7 +321,7 @@ impl Default for Keys {
 /// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
 /// `(config field, human label)`. Focus keys are listed individually so each
 /// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
-pub const EDITABLE: [(&str, &str); 27] = [
+pub const EDITABLE: [(&str, &str); 28] = [
     ("toggle_editor", "show/hide editor"),
     ("toggle_shell", "show/hide terminal"),
     ("toggle_ai", "show/hide Claude"),
@@ -328,6 +331,7 @@ pub const EDITABLE: [(&str, &str); 27] = [
     ("win_list", "window switcher (open projects)"),
     ("favorites", "favorite files (this repo)"),
     ("favorite_toggle", "favorite / unfavorite this file"),
+    ("worktrees", "worktrees: status / delete clean"),
     ("tab_new", "new terminal/Claude tab"),
     ("tab_next", "next tab (focused slot)"),
     ("tab_prev", "prev tab (focused slot)"),
@@ -378,6 +382,7 @@ impl Keys {
             "win_list" => self.win_list,
             "favorites" => self.favorites,
             "favorite_toggle" => self.favorite_toggle,
+            "worktrees" => self.worktrees,
             "zoom" => self.zoom,
             _ => return None,
         })
@@ -423,6 +428,7 @@ impl Keys {
             "win_list" => self.win_list = ch,
             "favorites" => self.favorites = ch,
             "favorite_toggle" => self.favorite_toggle = ch,
+            "worktrees" => self.worktrees = ch,
             "zoom" => self.zoom = ch,
             _ => return false,
         }
@@ -453,7 +459,7 @@ impl Keys {
     }
 
     /// All (action, key) bindings, for help display and conflict checking.
-    fn bindings(&self) -> [(&'static str, char); 27] {
+    fn bindings(&self) -> [(&'static str, char); 28] {
         [
             ("focus_left", self.focus_left),
             ("focus_down", self.focus_down),
@@ -481,6 +487,7 @@ impl Keys {
             ("win_list", self.win_list),
             ("favorites", self.favorites),
             ("favorite_toggle", self.favorite_toggle),
+            ("worktrees", self.worktrees),
             ("zoom", self.zoom),
         ]
     }
@@ -754,9 +761,10 @@ prefix = "C-a"
 # Ask the terminal for the kitty keyboard protocol, which is what makes chords
 # with no legacy encoding (Ctrl-Space) usable as the prefix. Needs a terminal
 # that speaks it: WezTerm with enable_kitty_keyboard = true, kitty, foot,
-# Ghostty, Alacritty 0.13+. Left off by default because a terminal that only
-# half-implements it can mangle ordinary keys — arrows arriving as stray text.
-# With it off, a "C-space" prefix falls back to Ctrl-a.
+# Ghostty, Alacritty 0.13+. Off by default, since a terminal that only
+# half-implements it can report ordinary keys in odd forms.
+# Setting prefix = "C-space" turns this on by itself — that prefix cannot work
+# without the protocol, so it would otherwise just fall back to Ctrl-a.
 kitty_keys = false
 
 # Where the project picker looks. Defaults to $DDN_PROJECTS, then ~/projects.
@@ -822,6 +830,7 @@ about = "i"      # About page: bundled docs on how CodeForge is built
 win_list = "\t"  # window switcher: list open projects, pick by name or number
 favorites = "b"  # favorite files for this repo (shared across its worktrees/clones)
 favorite_toggle = "B"  # favorite / unfavorite the file open in the editor
+worktrees = "D"  # worktree manager: per-worktree status, delete clean worktrees
 zoom = "z"       # fullscreen the focused pane (hide the other two); again restores
 # also: prefix + 1..9 jumps to a window, numbered by recency (1 = last used);
 # the current window has no number and Notes is always 0
@@ -958,6 +967,11 @@ mod tests {
         let p = parse_prefix("C-space").unwrap();
         assert_eq!(p.byte, None);
         assert_eq!((p.code, p.ctrl), (32, true));
+
+        // A CSI-u-only prefix implies the protocol: the client keys the push
+        // off `byte.is_none()`, so "C-space" needs no second flag (#67).
+        assert!(parse_prefix("C-space").unwrap().byte.is_none());
+        assert!(parse_prefix("C-a").unwrap().byte.is_some());
 
         // An unusable spec still falls back to Ctrl-a rather than locking up.
         let c = Config {

@@ -99,7 +99,7 @@ do
     toggle_editor = "e", toggle_shell = "t", toggle_ai = "c",
     git_diff = "g", win_new = "n", copy = "v", help = "?",
     tab_next = "]", tab_prev = "[", win_list = "Tab",
-    favorites = "b", favorite_toggle = "B",
+    favorites = "b", favorite_toggle = "B", worktrees = "D",
     focus_left = "h", focus_down = "j", focus_up = "k", focus_right = "l",
   }
   local praw = vim.env.CODEFORGE_PREFIX_KEYS
@@ -720,6 +720,7 @@ require("lazy").setup({
             { CFKeys.pdisp("win_new"), "new window" },
             { CFKeys.pdisp("win_list"), "switch window" },
             { CFKeys.pdisp("favorites", "favorite_toggle"), "favorites / mark" },
+            { CFKeys.pdisp("worktrees"), "worktrees / cleanup" },
             { CFKeys.pdisp("copy"), "scroll/copy" },
             { CFKeys.pdisp("help"), "all keys" },
           },

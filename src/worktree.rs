@@ -247,3 +247,269 @@ mod tests {
         assert_eq!(upstream_or_default("12.9"), "12.9");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Worktree manager (#83): discovery, status, deletion.
+// ---------------------------------------------------------------------------
+
+/// How ready a worktree is to be thrown away.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum WtState {
+    /// Remote state not checked yet — the list shows these as "updating…".
+    Unknown,
+    /// Uncommitted changes present.
+    Dirty,
+    /// Committed work the remote doesn't have.
+    Pending,
+    /// Nothing uncommitted, nothing unpushed: safe to delete.
+    Clean,
+    /// Couldn't be classified (fetch failed, no upstream, …); never deletable.
+    Error(&'static str),
+}
+
+/// One row of the manager.
+#[derive(Clone, Debug)]
+pub struct WtEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub state: WtState,
+}
+
+impl WtEntry {
+    /// Only a positively-clean worktree may be deleted. Everything else —
+    /// dirty, pending, unknown, unclassifiable — is listed but refused.
+    pub fn deletable(&self) -> bool {
+        self.state == WtState::Clean
+    }
+}
+
+/// Whether `dir` is a *linked* worktree rather than a clone's main checkout.
+/// In a linked worktree git's per-worktree dir differs from the shared common
+/// dir; in a clone they're the same. Clones (sfaos, k8s, auto, infra…) must
+/// never be deletable, so anything that fails this test is not offered (#83).
+pub fn is_linked_worktree(dir: &Path) -> bool {
+    let git_dir = git_out(dir, &["rev-parse", "--absolute-git-dir"]);
+    let common = git_out(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    );
+    match (git_dir, common) {
+        (Some(g), Some(c)) => {
+            let (g, c) = (g.trim(), c.trim());
+            !g.is_empty() && !c.is_empty() && g != c
+        }
+        _ => false,
+    }
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Every linked worktree directly under `root`, sorted by name. Clones are
+/// skipped: they aren't linked worktrees, so they can't reach the delete path.
+pub fn list_worktrees(root: &Path) -> Vec<WtEntry> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<WtEntry> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && is_linked_worktree(p))
+        .map(|path| WtEntry {
+            name: path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path,
+            state: WtState::Unknown,
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Classify one worktree. Fetches first so "unpushed" is judged against current
+/// remote state — `fetch` only updates remote-tracking refs, so the worktree
+/// being inspected is never modified (a `pull` could conflict or fail on a
+/// dirty tree, which is precisely the case we most need to classify).
+pub fn classify(dir: &Path) -> WtState {
+    // Bounded: a hung network must not freeze the list.
+    let _ = Command::new("timeout")
+        .arg("20")
+        .arg("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["fetch", "--quiet"])
+        .output();
+
+    match git_out(dir, &["status", "--porcelain"]) {
+        Some(s) if !s.trim().is_empty() => return WtState::Dirty,
+        None => return WtState::Error("status failed"),
+        _ => {}
+    }
+    // Commits the upstream doesn't have. No upstream at all means the work
+    // exists nowhere else, which is the same risk as unpushed commits.
+    match git_out(dir, &["rev-list", "--count", "@{u}..HEAD"]) {
+        Some(n) if n.trim() == "0" => WtState::Clean,
+        Some(_) => WtState::Pending,
+        None => WtState::Error("no upstream"),
+    }
+}
+
+/// Delete a worktree: its registration, its directory, and its branch — the
+/// same three steps as `wt rm`. Refuses anything that isn't a linked worktree,
+/// so a clone can never be removed through this path (#83).
+pub fn delete(entry: &WtEntry) -> Result<()> {
+    if !is_linked_worktree(&entry.path) {
+        bail!("{} is not a linked worktree — refusing", entry.name);
+    }
+    if !entry.deletable() {
+        bail!("{} is not clean — refusing", entry.name);
+    }
+    let branch = git_out(&entry.path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map(|s| s.trim().to_string())
+        .filter(|b| !b.is_empty() && b != "HEAD");
+    // The common dir is where the worktree is registered; run the removal from
+    // there, since the worktree's own directory is about to vanish.
+    let common = git_out(
+        &entry.path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(|s| PathBuf::from(s.trim().to_string()))
+    .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    .context("locating the clone that owns this worktree")?;
+
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(&common)
+        .args(["worktree", "remove", "--force"])
+        .arg(&entry.path)
+        .output()
+        .context("git worktree remove")?;
+    if !out.status.success() {
+        // Match `wt rm`'s fallback: a worktree whose registration is already
+        // broken still has a directory to clear.
+        std::fs::remove_dir_all(&entry.path)
+            .with_context(|| format!("removing {}", entry.path.display()))?;
+        let _ = Command::new("git")
+            .arg("-C")
+            .arg(&common)
+            .args(["worktree", "prune"])
+            .output();
+    }
+    if let Some(branch) = branch {
+        // `-d` not `-D`: the worktree was verified clean, so the branch is
+        // merged/pushed and this succeeds. If it somehow refuses, that's a
+        // signal worth surfacing rather than forcing past.
+        let b = Command::new("git")
+            .arg("-C")
+            .arg(&common)
+            .args(["branch", "-d", &branch])
+            .output()
+            .context("git branch -d")?;
+        if !b.status.success() {
+            bail!(
+                "worktree removed, but branch {branch} kept: {}",
+                String::from_utf8_lossy(&b.stderr).trim()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod manager_tests {
+    use super::*;
+
+    fn git_in(dir: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// A clone is never a linked worktree, so it can't reach the delete path —
+    /// and `delete` refuses it outright even if asked directly (#83).
+    #[test]
+    fn clones_are_never_deletable() {
+        let tmp = std::env::temp_dir().join(format!("cf-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (clone, wt) = (tmp.join("clone"), tmp.join("clone-TICKET-x"));
+        std::fs::create_dir_all(&clone).unwrap();
+        git_in(&clone, &["init", "-q"]);
+        git_in(&clone, &["config", "user.email", "t@t"]);
+        git_in(&clone, &["config", "user.name", "t"]);
+        std::fs::write(clone.join("a.txt"), "x\n").unwrap();
+        git_in(&clone, &["add", "."]);
+        git_in(&clone, &["commit", "-qm", "first"]);
+        git_in(
+            &clone,
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "side"],
+        );
+
+        assert!(
+            !is_linked_worktree(&clone),
+            "a clone is not a linked worktree"
+        );
+        assert!(is_linked_worktree(&wt), "the worktree is");
+
+        // Discovery under the projects root offers the worktree, never the clone.
+        let found = list_worktrees(&tmp);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "clone-TICKET-x");
+
+        // Even handed the clone directly, delete refuses it.
+        let forged = WtEntry {
+            name: "clone".into(),
+            path: clone.clone(),
+            state: WtState::Clean,
+        };
+        let err = delete(&forged).unwrap_err().to_string();
+        assert!(err.contains("not a linked worktree"), "got {err}");
+        assert!(clone.join("a.txt").exists(), "the clone is untouched");
+
+        // A worktree that isn't clean is refused too, whatever the caller says.
+        let dirty = WtEntry {
+            name: "clone-TICKET-x".into(),
+            path: wt.clone(),
+            state: WtState::Dirty,
+        };
+        assert!(delete(&dirty)
+            .unwrap_err()
+            .to_string()
+            .contains("not clean"));
+        assert!(wt.exists(), "and survives");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Uncommitted changes classify as dirty — the check that keeps real work
+    /// out of the deletable set.
+    #[test]
+    fn dirty_worktrees_are_not_clean() {
+        let tmp = std::env::temp_dir().join(format!("cf-wt2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        git_in(&tmp, &["init", "-q"]);
+        git_in(&tmp, &["config", "user.email", "t@t"]);
+        git_in(&tmp, &["config", "user.name", "t"]);
+        std::fs::write(tmp.join("a.txt"), "x\n").unwrap();
+        git_in(&tmp, &["add", "."]);
+        git_in(&tmp, &["commit", "-qm", "first"]);
+        std::fs::write(tmp.join("a.txt"), "changed\n").unwrap();
+        assert_eq!(classify(&tmp), WtState::Dirty);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}
