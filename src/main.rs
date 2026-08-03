@@ -1125,7 +1125,10 @@ fn build_editor(
         let _ = std::fs::remove_file(diff_flag(id)); // stale diff flag (#18)
         c.arg("--listen");
         c.arg(&sock);
-        if !cfg.wrap {
+        // Notes is prose and always wraps (#85), whatever the global setting.
+        // This `-c` runs *after* the first file loads, so it would otherwise
+        // clobber init.lua's per-window Notes wrap on the opening buffer.
+        if !cfg.wrap && *dir != notes_dir() {
             c.arg("-c");
             c.arg("set nowrap");
         }
@@ -3466,6 +3469,12 @@ impl InputParser {
             Some(Msg::CopyMode)
         } else if c == k.git_diff {
             Some(Msg::ToggleDiff)
+        } else if c == k.worktrees {
+            Some(Msg::OpenWorktrees)
+        } else if c == k.favorites {
+            Some(Msg::OpenFavorites)
+        } else if c == k.favorite_toggle {
+            Some(Msg::ToggleFavorite)
         } else if c == k.detach {
             Some(Msg::Detach)
         } else if c == k.reload {

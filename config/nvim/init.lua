@@ -253,6 +253,22 @@ do
         vim.keymap.set("n", "<M-d>", cf_notes_delete, vim.tbl_extend("force", o, { desc = "Notes: delete this note" }))
       end,
     })
+    -- Notes are prose, not code (#85): wrap long lines, and strip the gutter
+    -- (line numbers + signcolumn) so a terminal-side drag-select copies the
+    -- text alone. Window-local, set on every window that shows a Notes buffer —
+    -- other editors keep `nowrap` and their line numbers.
+    vim.api.nvim_create_autocmd({ "BufWinEnter", "WinEnter" }, {
+      pattern = notes_dir .. "/*",
+      callback = function()
+        local w = vim.wo
+        w.wrap = true
+        w.linebreak = true -- break at word boundaries, not mid-word
+        w.breakindent = true
+        w.number = false
+        w.relativenumber = false
+        w.signcolumn = "no"
+      end,
+    })
   end
 end
 
