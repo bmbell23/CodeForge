@@ -51,7 +51,13 @@ headless API client — **the IDE must not burn API tokens on its own.**
 - **NEVER** lock the user out through config (e.g. a prefix key that freezes the
   session) — validate and fall back with a warning.
 
-### 5. The shared clone is a shared resource
+### 5. All work lands on `main`
+- **ALWAYS** work on `main`; **NEVER** create or work from a feature branch.
+- **ALWAYS** push an approved commit — the shared clone's binary is built from
+  what's checked out, so an unpushed branch silently diverges what every user
+  runs from what `main` says. See `behavior.md` for the incident this comes from.
+
+### 6. The shared clone is a shared resource
 - One clone at `/home/bbell/projects/CodeForge` on NFS serves the whole team; the
   launcher runs the **installed release binary** from it.
 - **ALWAYS** treat a `cargo build --release` / `scripts/install.sh` as affecting

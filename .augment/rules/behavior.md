@@ -82,6 +82,26 @@ memory, not local docs. The next session trusts the issues.
    scoped), **Implementation** (what changed + why, with commit SHAs), and
    **Testing** (how it was verified).
 
+### Work on `main`. Always.
+
+**NEVER create a feature branch. NEVER work off a branch other than `main`.**
+There is no branch-and-merge flow in this repo — commits land on `main` and get
+pushed.
+
+Why this is not negotiable: the shared clone's *installed release binary* is
+built from whatever is checked out. A local branch means the binary everyone
+rides and `main` say different things, and the next checkout or `forge`
+fast-forward silently reverts every user. That is exactly what happened on
+2026-08-02: three days of work (#74, #76, #77, #78, #67, #80, #82, #83, #84)
+sat on an unpushed local branch, the clone was checked out to `main`, and the
+next rebuild took the prefix, the window switcher, tab recency, favorites, and
+the worktree manager away from the user with no warning.
+
+- Before starting work, verify you are on `main` (`git status -sb`).
+- If you find the clone on any other branch, say so **before** touching code.
+- After an approved commit, **push it**. An unpushed commit on the shared clone
+  is a landmine, not a checkpoint.
+
 Builds/installs are explicit: the launcher runs the *installed* release binary
 from the shared clone. If a change only becomes visible after `cargo build
 --release` or `scripts/install.sh`, say so plainly and ask who runs it — never
