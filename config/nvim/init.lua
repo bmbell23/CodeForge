@@ -1479,6 +1479,26 @@ end
 -- Walks the same set the forge diff list shows (`git diff --name-only HEAD`),
 -- wrapping around, and reopens the diff on that file. `]`/`[` are bound to this;
 -- `]c`/`[c` stay the native within-file hunk motions (nvim disambiguates).
+-- The right side's winbar (#87, #89). With the buffer tabs hidden this is the
+-- only thing naming the file, so it carries the full path (or the revision, in
+-- a range view) plus this file's position in the changed set — `3/12` — so you
+-- can tell how far through the list you are. `%` is doubled: winbar is a
+-- statusline expression and a literal `%` in a path would be read as an item.
+-- Defined above its call sites: a `local` declared later would compile to a nil
+-- global inside the functions below.
+local function cf_diff_winbar(label, files, rel)
+  local pos = ""
+  if files and #files > 0 then
+    for i, f in ipairs(files) do
+      if f == rel then
+        pos = string.format(" · %d/%d", i, #files)
+        break
+      end
+    end
+  end
+  return "  " .. label:gsub("%%", "%%%%") .. pos .. " · ]/[ next/prev file · Tab side · Esc list"
+end
+
 local function cf_diff_step(delta)
   local st = cf_diff
   if not st then
@@ -1501,7 +1521,14 @@ local function cf_diff_step(delta)
       break
     end
   end
-  local nxt = ((idx - 1 + delta) % #files) + 1
+  -- Don't wrap (#88): stepping past either end closes the view and drops you
+  -- back on the changed-file list, the same place Esc goes. Wrapping silently
+  -- restarted the list, so there was no way to tell you'd seen everything.
+  local nxt = idx + delta
+  if nxt < 1 or nxt > #files then
+    _G.CodeForgeDiffClose()
+    return
+  end
   -- Swap the file in the open view instead of tearing it down and rebuilding
   -- (#56) — much snappier, and it keeps the flag so forge sees no close.
   _G.CodeForgeDiffSwap(st.root .. "/" .. files[nxt])
@@ -1561,11 +1588,15 @@ function _G.CodeForgeDiffSwap(path)
     right_buf = vim.api.nvim_get_current_buf()
     ft = vim.filetype.match({ filename = rel }) or ""
     cf_diff_fill_rev_buf(right_buf, st.root, st.rev.head, rel, ft)
-    vim.wo[st.right_win].winbar = "  " .. st.rev.head .. " · ]/[ next/prev file · Tab side · Esc list"
+    vim.wo[st.right_win].winbar = cf_diff_winbar(st.rev.head, st.files, rel)
   else
     vim.cmd("edit " .. vim.fn.fnameescape(path))
     right_buf = vim.api.nvim_get_current_buf()
     ft = vim.bo.filetype
+    -- The winbar names the file literally now (#87) and carries the X/N counter
+    -- (#89), so stepping has to rewrite it — `%t` used to track the buffer on
+    -- its own.
+    vim.wo[st.right_win].winbar = cf_diff_winbar(vim.fn.fnamemodify(path, ":~"), st.files, rel)
   end
 
   vim.bo[st.left_buf].modifiable = true
@@ -1659,6 +1690,9 @@ function _G.CodeForgeDiffOpen(path, base, head_rev)
   local rel = path:sub(#root + 2)
   local left_rev = rev and rev.base or "HEAD"
   local head, untracked = cf_diff_show(root, left_rev, rel)
+  -- Needed before the winbar (for the X/N counter) and reused as the cached
+  -- stepping list below, so it's only shelled once.
+  local files = cf_diff_file_list(root, rev)
 
   vim.cmd("tab split")
   local tab = vim.api.nvim_get_current_tabpage()
@@ -1698,9 +1732,9 @@ function _G.CodeForgeDiffOpen(path, base, head_rev)
   -- filler glyph for lines that only exist on the other side.
   vim.wo[left_win].winbar = "  " .. left_rev .. " · read-only"
   if rev then
-    vim.wo[right_win].winbar = "  " .. rev.head .. " · ]/[ next/prev file · Tab side · Esc list"
+    vim.wo[right_win].winbar = cf_diff_winbar(rev.head, files, rel)
   else
-    vim.wo[right_win].winbar = "  %t · ]/[ next/prev file · Tab side · Esc list"
+    vim.wo[right_win].winbar = cf_diff_winbar(vim.fn.fnamemodify(path, ":~"), files, rel)
   end
   vim.wo[left_win].fillchars = "diff: "
   vim.wo[right_win].fillchars = "diff: "
@@ -1732,7 +1766,7 @@ function _G.CodeForgeDiffOpen(path, base, head_rev)
     -- step; refreshed here and on save (#56). In a range it's the files that
     -- differ between the two commits, so stepping walks the same set the diff
     -- panel listed.
-    files = cf_diff_file_list(root, rev),
+    files = files,
   }
 
   -- Esc closes; Tab hops sides; Space-z zooms; ] / [ step files; Enter folds
@@ -1814,6 +1848,8 @@ function _G.CodeForgeDiffOpen(path, base, head_rev)
       vim.g.codeforge_diff_tab = nil
       if st then
         pcall(vim.api.nvim_del_augroup_by_id, st.aug)
+        -- Bring the buffer tabs back however the view died (#87).
+        vim.o.showtabline = st.prev_showtabline or 2
         if st.map_win and vim.api.nvim_win_is_valid(st.map_win) then
           pcall(vim.api.nvim_win_close, st.map_win, true)
         end
@@ -1828,6 +1864,28 @@ function _G.CodeForgeDiffOpen(path, base, head_rev)
       end
       pcall(vim.cmd, "diffoff!")
       vim.fn.delete(cf_diff_flag())
+    end,
+  })
+
+  -- No buffer tabs in the diff view (#87). bufferline runs in `buffers` mode, so
+  -- it paints the whole global buffer list in every tabpage — including this
+  -- one, where the editor's open files are noise and the winbar already names
+  -- the file. `showtabline` is global, so it has to follow the active tabpage
+  -- rather than being set once here.
+  cf_diff.prev_showtabline = vim.o.showtabline
+  vim.o.showtabline = 0
+  vim.api.nvim_create_autocmd("TabEnter", {
+    group = cf_diff.aug,
+    callback = function()
+      local st = cf_diff
+      if not st then
+        return
+      end
+      if vim.api.nvim_get_current_tabpage() == st.tab then
+        vim.o.showtabline = 0
+      else
+        vim.o.showtabline = st.prev_showtabline
+      end
     end,
   })
 
