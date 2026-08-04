@@ -81,7 +81,7 @@ const LOG_LIMIT: usize = 200;
 pub struct Entry {
     pub rel: String,
     pub abs: PathBuf,
-    /// 'M' modified, 'D' deleted, '?' untracked.
+    /// 'M' modified, 'D' deleted, 'A' added (untracked, or added in a range).
     pub status: char,
     pub added: Option<u64>,
     pub removed: Option<u64>,
@@ -611,7 +611,7 @@ impl DiffList {
                 if !selected {
                     let sc = match e.status {
                         'D' => Color::Red,
-                        '?' => Color::Green,
+                        'A' => Color::Green,
                         _ => Color::Yellow,
                     };
                     queue!(out, SetForegroundColor(sc))?;
@@ -903,7 +903,9 @@ fn load(dir: &Path) -> Result<Vec<Entry>, String> {
                 rel: p.to_string(),
                 added: count_lines(&abs),
                 abs,
-                status: '?',
+                // Untracked reads as "added" here (#90); git's own `??` code is
+                // an implementation detail of `status --porcelain`, not a label.
+                status: 'A',
                 removed: Some(0),
             });
         }
@@ -966,7 +968,7 @@ fn load_range(root: &Path, base: &str, head: &str) -> Result<Vec<Entry>, String>
         entries.push(Entry {
             rel: p.to_string(),
             abs: root.join(p),
-            status: if st == 'A' { '?' } else { st },
+            status: st,
             added: a.parse().ok(),
             removed: d.parse().ok(),
         });
