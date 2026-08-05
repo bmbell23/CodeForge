@@ -477,6 +477,8 @@ pub enum Msg {
     ToggleFavorite,
     /// Open the worktree manager (#83).
     OpenWorktrees,
+    /// Open the history of the file the editor is showing (#92).
+    OpenFileLog,
     /// A background classification finished: worktree path -> state (#83).
     WorktreeState(PathBuf, worktree::WtState),
     /// Toggle fullscreen of the focused pane, hiding the other two (#40).
@@ -2515,6 +2517,33 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                     needs_clear = true;
                 }
+                Msg::OpenFileLog => {
+                    // History of whatever the editor is showing (#92). Same
+                    // panel as the diff list, opened straight onto the file's
+                    // commits; picking one shows that commit's whole change.
+                    exit_copy(&mut copy, &mut windows);
+                    help = None;
+                    picker = None;
+                    let w = &windows[cur];
+                    let ed = w.active[role_index(PaneRole::Editor)];
+                    match nvim_current_file(&nvim_sock(ed)) {
+                        Some(file) => {
+                            diff = Some(DiffList::new_file_log(&w.dir, &file));
+                            let (c, r) = size;
+                            let w = &mut windows[cur];
+                            // The panel lives over the terminal pane; reveal it
+                            // and take focus, or the list can't be driven (#51).
+                            if !w.show_shell {
+                                w.show_shell = true;
+                                refresh_layout(w, cfg.editor_ratio, cfg.right_ratio);
+                                relayout(&mut w.panes, &w.layout, c, r.saturating_sub(1))?;
+                            }
+                            w.focus_id = w.active[1];
+                        }
+                        None => fav_note = Some("no file in the editor".to_string()),
+                    }
+                    dirty = true;
+                }
                 Msg::ToggleDiff => {
                     exit_copy(&mut copy, &mut windows);
                     help = None;
@@ -3471,6 +3500,8 @@ impl InputParser {
             Some(Msg::ToggleDiff)
         } else if c == k.worktrees {
             Some(Msg::OpenWorktrees)
+        } else if c == k.file_log {
+            Some(Msg::OpenFileLog)
         } else if c == k.favorites {
             Some(Msg::OpenFavorites)
         } else if c == k.favorite_toggle {

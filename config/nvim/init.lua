@@ -724,6 +724,7 @@ require("lazy").setup({
           {
             "Git",
             { CFKeys.pdisp("git_diff"), "git diff" },
+            { CFKeys.pdisp("file_log"), "this file's history" },
             { CFKeys.disp("file_history"), "file history" },
           },
           {
@@ -1479,6 +1480,33 @@ end
 -- Walks the same set the forge diff list shows (`git diff --name-only HEAD`),
 -- wrapping around, and reopens the diff on that file. `]`/`[` are bound to this;
 -- `]c`/`[c` stay the native within-file hunk motions (nvim disambiguates).
+-- The base-side path for `rel` (#94). A renamed file doesn't exist under its new
+-- name on the left: `git show HEAD:<new>` fails, the base reads empty, and the
+-- diff paints the whole file as added rather than showing what actually changed.
+-- Ask git what it was called before; falls back to `rel` when this isn't a
+-- rename. Defined above its callers — a later `local` would be a nil global.
+--
+-- Deliberately unfiltered by pathspec: `-- <new>` hides the source side, and
+-- rename detection needs to see both to pair them, so it degrades to `A <new>`
+-- and the rename is lost. Scan the whole list and match on the destination.
+local function cf_diff_src_rel(root, rev, rel)
+  local cmd = { "git", "-C", root, "diff", "--name-status", "-M" }
+  if rev then
+    table.insert(cmd, rev.base)
+    table.insert(cmd, rev.head)
+  else
+    table.insert(cmd, "HEAD")
+  end
+  for _, l in ipairs(vim.fn.systemlist(cmd) or {}) do
+    -- "R073\told\tnew" — the old name is what the left side must load.
+    local old, new = l:match("^R%d*\t([^\t]+)\t(.+)$")
+    if old and new == rel then
+      return old
+    end
+  end
+  return rel
+end
+
 -- The right side's winbar (#87, #89). With the buffer tabs hidden this is the
 -- only thing naming the file, so it carries the full path (or the revision, in
 -- a range view) plus this file's position in the changed set — `3/12` — so you
@@ -1572,7 +1600,9 @@ function _G.CodeForgeDiffSwap(path)
   end
   local rel = path:sub(#st.root + 2)
   local left_rev = st.rev and st.rev.base or "HEAD"
-  local head = vim.fn.systemlist({ "git", "-C", st.root, "show", left_rev .. ":" .. rel })
+  -- A rename's base lives under the old name (#94).
+  local src_rel = cf_diff_src_rel(st.root, st.rev, rel)
+  local head = vim.fn.systemlist({ "git", "-C", st.root, "show", left_rev .. ":" .. src_rel })
   local untracked = false
   if vim.v.shell_error ~= 0 then
     head = {}
@@ -1601,7 +1631,7 @@ function _G.CodeForgeDiffSwap(path)
 
   vim.bo[st.left_buf].modifiable = true
   vim.api.nvim_buf_set_lines(st.left_buf, 0, -1, false, head)
-  pcall(vim.api.nvim_buf_set_name, st.left_buf, left_rev .. ": " .. rel)
+  pcall(vim.api.nvim_buf_set_name, st.left_buf, left_rev .. ": " .. src_rel)
   vim.bo[st.left_buf].modifiable = false
   vim.bo[st.left_buf].filetype = ft
 
@@ -1689,7 +1719,9 @@ function _G.CodeForgeDiffOpen(path, base, head_rev)
   end
   local rel = path:sub(#root + 2)
   local left_rev = rev and rev.base or "HEAD"
-  local head, untracked = cf_diff_show(root, left_rev, rel)
+  -- A rename's base lives under the old name (#94).
+  local src_rel = cf_diff_src_rel(root, rev, rel)
+  local head, untracked = cf_diff_show(root, left_rev, src_rel)
   -- Needed before the winbar (for the X/N counter) and reused as the cached
   -- stepping list below, so it's only shelled once.
   local files = cf_diff_file_list(root, rev)
@@ -1716,7 +1748,7 @@ function _G.CodeForgeDiffOpen(path, base, head_rev)
   local left_win = vim.api.nvim_get_current_win()
   local left_buf = vim.api.nvim_get_current_buf()
   vim.api.nvim_buf_set_lines(left_buf, 0, -1, false, head)
-  pcall(vim.api.nvim_buf_set_name, left_buf, left_rev .. ": " .. rel)
+  pcall(vim.api.nvim_buf_set_name, left_buf, left_rev .. ": " .. src_rel)
   local bo = vim.bo[left_buf]
   bo.buftype = "nofile"
   bo.bufhidden = "wipe"

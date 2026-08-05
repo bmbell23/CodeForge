@@ -48,6 +48,10 @@ enum Mode {
     Log,
     /// Changed files between the two picked revisions.
     Range,
+    /// Commits that touched one file (#92) — the history of what the editor is
+    /// showing. Enter opens that commit's *full* changed-file set, so the diff
+    /// steps like any other range.
+    FileLog,
 }
 
 /// One row of the commit list.
@@ -56,6 +60,11 @@ pub struct Commit {
     subject: String,
     /// Relative author date (`2 days ago`).
     when: String,
+    /// Author name — shown in `Mode::FileLog`'s "who touched it" column (#92).
+    author: String,
+    /// What this commit did to the tracked file in `Mode::FileLog`: 'M', 'A',
+    /// 'D', 'R'. `' '` in the repo-wide log, which isn't about one file.
+    fstatus: char,
 }
 
 /// A picked endpoint of the diff: a marked commit, or a rev typed at the `/`
@@ -111,6 +120,43 @@ pub struct DiffList {
     log_sel: usize,
     /// Text typed at the `/` rev prompt, while it's open.
     input: Option<String>,
+    /// The file `Mode::FileLog` is tracking, repo-relative (#92).
+    file_rel: Option<String>,
+    /// Which list Range was entered from, so Esc returns there — the commit
+    /// list, or a file's history (#92).
+    range_from: Mode,
+    /// The single commit Range is showing, when it is one commit rather than a
+    /// span: its message is unambiguous, so the header can name it (#93).
+    range_commit: Option<Commit>,
+    /// The full commit message, while the overlay is open (#93).
+    message: Option<Vec<String>>,
+}
+
+/// Repo-wide `(+added, -removed)` for the footer (#91), counted over every
+/// entry rather than the visible window. `added`/`removed` are `None` for
+/// binaries and for untracked files too big to count; those set a trailing `?`
+/// instead of folding in as 0, which would quietly under-report the total.
+/// `None` when there is nothing to total.
+fn totals(entries: &[Entry]) -> Option<(String, String)> {
+    if entries.is_empty() {
+        return None;
+    }
+    let (mut add, mut rem) = (0u64, 0u64);
+    let (mut unk_a, mut unk_r) = (false, false);
+    for e in entries {
+        match e.added {
+            Some(n) => add += n,
+            None => unk_a = true,
+        }
+        match e.removed {
+            Some(n) => rem += n,
+            None => unk_r = true,
+        }
+    }
+    Some((
+        format!("+{add}{}", if unk_a { "?" } else { "" }),
+        format!("-{rem}{}", if unk_r { "?" } else { "" }),
+    ))
 }
 
 /// List rows that fit in the overlay: the rect minus the two border rows and
@@ -141,14 +187,48 @@ impl DiffList {
             range: None,
             log_sel: 0,
             input: None,
+            file_rel: None,
+            range_from: Mode::Log,
+            range_commit: None,
+            message: None,
         }
+    }
+
+    /// Open straight onto one file's history (#92): the commits that touched
+    /// `file`, newest first. Entered from the editor rather than by descending
+    /// through the panel, so Esc closes instead of walking back to a list the
+    /// user never saw.
+    pub fn new_file_log(dir: &Path, file: &Path) -> DiffList {
+        let mut d = DiffList::new(dir);
+        let Some(root) = d.root.clone() else {
+            d.err = Some("not a git repository".into());
+            return d;
+        };
+        let rel = match file.strip_prefix(&root) {
+            Ok(r) => r.to_string_lossy().to_string(),
+            Err(_) => {
+                d.err = Some("file is outside this repository".into());
+                return d;
+            }
+        };
+        match load_file_log(&root, &rel) {
+            Ok(c) if c.is_empty() => d.err = Some(format!("no commits touch {rel}")),
+            Ok(c) => {
+                d.commits = c;
+                d.mode = Mode::FileLog;
+                d.file_rel = Some(rel);
+                d.entries = Vec::new();
+            }
+            Err(e) => d.err = Some(e),
+        }
+        d
     }
 
     /// Rows in the current mode's list — what windowing, hit-testing and
     /// selection all measure against.
     fn len(&self) -> usize {
         match self.mode {
-            Mode::Log => self.commits.len(),
+            Mode::Log | Mode::FileLog => self.commits.len(),
             _ => self.entries.len(),
         }
     }
@@ -180,15 +260,26 @@ impl DiffList {
     /// Esc one level up: Range -> Log -> Worktree. Returns `Cancel` at the top,
     /// where Esc closes the panel as it always has.
     fn back(&mut self) -> DiffAction {
+        // The message overlay is the innermost level: Esc closes it first (#93).
+        if self.message.is_some() {
+            self.message = None;
+            return DiffAction::None;
+        }
         match self.mode {
             Mode::Range => {
-                self.mode = Mode::Log;
+                // Back to whichever list opened this range — the commit list, or
+                // a file's history (#92).
+                self.mode = self.range_from;
                 self.sel = self.log_sel.min(self.commits.len().saturating_sub(1));
                 self.range = None;
+                self.range_commit = None;
                 self.entries = Vec::new();
                 self.note = None;
                 DiffAction::None
             }
+            // Opened straight from the editor, so there's no list underneath to
+            // walk back to (#92).
+            Mode::FileLog => DiffAction::Cancel,
             Mode::Log => {
                 self.mode = Mode::Worktree;
                 self.marks.clear();
@@ -248,6 +339,35 @@ impl DiffList {
         }
     }
 
+    /// Make the selected commit the only mark (#92). A file's history has no
+    /// two-endpoint picking — Enter means "this commit", so any earlier mark is
+    /// replaced rather than accumulating into a span.
+    fn mark_only_selected(&mut self) {
+        let Some(c) = self.commits.get(self.sel) else {
+            return;
+        };
+        self.marks = vec![Mark {
+            sha: c.sha.clone(),
+            label: c.sha.clone(),
+        }];
+    }
+
+    /// Show or hide the full commit message (#93). Loaded on demand — the log
+    /// only carries subjects, and a body can be long.
+    fn toggle_message(&mut self) {
+        if self.message.is_some() {
+            self.message = None;
+            return;
+        }
+        let (Some(root), Some(c)) = (self.root.clone(), self.range_commit.as_ref()) else {
+            return;
+        };
+        match commit_message(&root, &c.sha) {
+            Ok(lines) => self.message = Some(lines),
+            Err(e) => self.note = Some(e),
+        }
+    }
+
     /// Diff the marked endpoints: two marks diff against each other, one marks
     /// that commit against its parent. Order comes from ancestry, not from the
     /// order they were picked, so the older side is always the base.
@@ -295,11 +415,36 @@ impl DiffList {
                 )
             }
         };
+        // One mark is one commit, so its message is unambiguous — remember it so
+        // the header can name it and `m` can show the body (#93). A span of two
+        // endpoints can cover many commits and gets no single message.
+        let single = (self.marks.len() == 1).then(|| {
+            let m = &self.marks[0];
+            self.commits
+                .iter()
+                .find(|c| c.sha == m.sha)
+                .map(|c| Commit {
+                    sha: c.sha.clone(),
+                    subject: c.subject.clone(),
+                    when: c.when.clone(),
+                    author: c.author.clone(),
+                    fstatus: c.fstatus,
+                })
+                .unwrap_or_else(|| Commit {
+                    sha: m.sha.clone(),
+                    subject: m.label.clone(),
+                    when: String::new(),
+                    author: String::new(),
+                    fstatus: ' ',
+                })
+        });
         match load_range(&root, &base.sha, &head.sha) {
             Ok(entries) => {
                 self.log_sel = self.sel;
                 self.entries = entries;
                 self.range = Some((base, head));
+                self.range_from = self.mode;
+                self.range_commit = single;
                 self.mode = Mode::Range;
                 self.sel = 0;
                 self.note = if self.entries.is_empty() {
@@ -455,6 +600,15 @@ impl DiffList {
                                 return a;
                             }
                         }
+                        // Enter on a file's history opens that commit's whole
+                        // changed-file set, not just this file's diff (#92).
+                        Mode::FileLog => {
+                            self.mark_only_selected();
+                            let a = self.diff_marks();
+                            if !matches!(a, DiffAction::None) {
+                                return a;
+                            }
+                        }
                         _ => {
                             let a = self.open(self.sel);
                             if !matches!(a, DiffAction::None) {
@@ -466,9 +620,13 @@ impl DiffList {
                     b'k' => self.scroll(-1),
                     // Descend into the commit list; Space marks endpoints there
                     // and `/` types a rev (#74).
-                    b'l' if self.mode != Mode::Log => self.enter_log(),
+                    b'l' if !matches!(self.mode, Mode::Log | Mode::FileLog) => self.enter_log(),
                     b' ' if self.mode == Mode::Log => self.toggle_mark(self.sel),
                     b'/' if self.mode == Mode::Log => self.input = Some(String::new()),
+                    // The commit message, while a single commit is on show (#93).
+                    b'm' if self.mode == Mode::Range && self.range_commit.is_some() => {
+                        self.toggle_message()
+                    }
                     _ => {}
                 },
                 1 => {
@@ -535,11 +693,20 @@ impl DiffList {
         // Top border with the summary as its title. A range says which two
         // commits it's between, so the list is never ambiguous (#74).
         let scope = match (&self.mode, &self.range) {
-            (Mode::Log, _) => return self.render_log(out, rect, border, inner_w),
+            (Mode::Log | Mode::FileLog, _) => return self.render_log(out, rect, border, inner_w),
+            // A single commit names itself in the header (#93) — `..` between a
+            // parent and its child says nothing a subject wouldn't say better.
+            (_, Some(_)) if self.range_commit.is_some() => {
+                let c = self.range_commit.as_ref().unwrap();
+                format!("{} · {}", c.sha, c.subject)
+            }
             (_, Some((b, h))) => format!("{}..{}", b.label, h.label),
             (_, None) => "git diff".to_string(),
         };
         let title = if self.entries.is_empty() {
+            format!(" {scope} ")
+        } else if self.range_commit.is_some() {
+            // The subject already fills the bar; the counts live in the footer.
             format!(" {scope} ")
         } else {
             format!(
@@ -589,6 +756,30 @@ impl DiffList {
                 Print("│"),
             )?;
             let idx = start + vis;
+            // The message overlay takes over the list rows while it's open
+            // (#93); Esc or `m` closes it and the files come back.
+            if let Some(msg) = &self.message {
+                let line = msg.get(vis).map(String::as_str).unwrap_or("");
+                let l: String = line.chars().take(inner_w.saturating_sub(1)).collect();
+                queue!(
+                    out,
+                    ResetColor,
+                    // The subject is the first line; the rest is body/meta.
+                    SetForegroundColor(if vis == 0 {
+                        Color::White
+                    } else {
+                        Color::DarkGrey
+                    }),
+                    Print(" "),
+                    Print(&l),
+                    Print(" ".repeat(inner_w.saturating_sub(1 + l.chars().count()))),
+                    ResetColor,
+                    SetForegroundColor(border),
+                    Print("│"),
+                )?;
+                y += 1;
+                continue;
+            }
             if vis < visible {
                 let e = &self.entries[idx];
                 let selected = idx == self.sel;
@@ -612,6 +803,7 @@ impl DiffList {
                     let sc = match e.status {
                         'D' => Color::Red,
                         'A' => Color::Green,
+                        'R' => Color::Blue,
                         _ => Color::Yellow,
                     };
                     queue!(out, SetForegroundColor(sc))?;
@@ -659,18 +851,30 @@ impl DiffList {
             y += 1;
         }
 
+        // Repo-wide totals, right-aligned in the footer so they land under the
+        // per-file +/- columns (#91).
+        let totals = totals(&self.entries);
+        // Width the footer hint must leave free: counts plus their spacing.
+        let tw = totals
+            .as_ref()
+            .map(|(p, m)| p.chars().count() + 1 + m.chars().count() + 1)
+            .unwrap_or(0);
+
         // Footer hint row + bottom border.
         let hint = match (&self.note, self.mode) {
             (Some(n), _) => format!(" {n}"),
             // Esc backs out of a range to the commit list, not straight to
-            // closed (#74).
+            // closed (#74). With one commit on show, `m` reads its message (#93).
+            (None, Mode::Range) if self.range_commit.is_some() => {
+                " ↑↓ move · Enter open · m message · Esc back".to_string()
+            }
             (None, Mode::Range) => " ↑↓ move · Enter open · Esc commits".to_string(),
             // Log browse works with a clean worktree too — advertise it there,
             // where it's the only thing the panel can still do (#74).
             (None, _) if self.entries.is_empty() => " l commits · Esc close".to_string(),
             (None, _) => " ↑↓ move · Enter open · l commits · Esc close".to_string(),
         };
-        let h: String = hint.chars().take(inner_w).collect();
+        let h: String = hint.chars().take(inner_w.saturating_sub(tw)).collect();
         queue!(
             out,
             cursor::MoveTo(rect.x, y),
@@ -678,7 +882,21 @@ impl DiffList {
             Print("│"),
             SetForegroundColor(Color::DarkGrey),
             Print(&h),
-            Print(" ".repeat(inner_w.saturating_sub(h.chars().count()))),
+            Print(" ".repeat(inner_w.saturating_sub(tw).saturating_sub(h.chars().count()))),
+        )?;
+        if let Some((plus, minus)) = &totals {
+            queue!(
+                out,
+                SetForegroundColor(Color::Green),
+                Print(plus),
+                Print(" "),
+                SetForegroundColor(Color::Red),
+                Print(minus),
+                Print(" "),
+            )?;
+        }
+        queue!(
+            out,
             SetForegroundColor(border),
             Print("│"),
             cursor::MoveTo(rect.x, y + 1),
@@ -703,15 +921,24 @@ impl DiffList {
         inner_w: usize,
     ) -> Result<()> {
         let picked = self.marks.len();
-        let title = format!(
-            " commits · {} picked{} ",
-            picked,
-            match &self.marks[..] {
-                [a] => format!(" ({})", a.label),
-                [a, b] => format!(" ({}, {})", a.label, b.label),
-                _ => String::new(),
-            }
-        );
+        // A file's history names the file and its depth; the repo-wide log says
+        // how many endpoints are picked, which is what drives its Space/Enter.
+        let title = match (self.mode, &self.file_rel) {
+            (Mode::FileLog, Some(rel)) => format!(
+                " {rel} · {} commit{} ",
+                self.commits.len(),
+                if self.commits.len() == 1 { "" } else { "s" },
+            ),
+            _ => format!(
+                " commits · {} picked{} ",
+                picked,
+                match &self.marks[..] {
+                    [a] => format!(" ({})", a.label),
+                    [a, b] => format!(" ({}, {})", a.label, b.label),
+                    _ => String::new(),
+                }
+            ),
+        };
         let t: String = title.chars().take(inner_w).collect();
         queue!(
             out,
@@ -738,6 +965,21 @@ impl DiffList {
             .map(|c| c.when.chars().count())
             .max()
             .unwrap_or(0);
+        // A file's history swaps the mark checkbox — which only the repo-wide
+        // log's two-endpoint picking needs — for who touched it and how (#92).
+        let file_log = self.mode == Mode::FileLog;
+        let aw = if file_log {
+            self.commits
+                .iter()
+                .skip(start)
+                .take(visible)
+                .map(|c| c.author.chars().count())
+                .max()
+                .unwrap_or(0)
+                .min(14) // a long name shouldn't crowd out the subject
+        } else {
+            0
+        };
         for vis in 0..view {
             queue!(
                 out,
@@ -753,8 +995,10 @@ impl DiffList {
                 let marked = self.marks.iter().any(|m| m.sha == c.sha);
                 let marker = if selected { '❯' } else { ' ' };
                 let box_ = if marked { "[x]" } else { "[ ]" };
-                // " ❯ [x] sha subject … when "
-                let fixed = 3 + 4 + c.sha.chars().count() + 1 + dw + 1;
+                // Log:     " ❯ [x] sha subject … when "
+                // FileLog: " ❯ M sha author subject … when "
+                let lead = if file_log { 2 + aw + 1 } else { 4 };
+                let fixed = 3 + lead + c.sha.chars().count() + 1 + dw + 1;
                 let sw = inner_w.saturating_sub(fixed);
                 let subject: String = clip_right(&c.subject, sw);
                 let pad = sw.saturating_sub(subject.chars().count());
@@ -768,21 +1012,46 @@ impl DiffList {
                     queue!(out, ResetColor)?;
                 }
                 queue!(out, Print(format!(" {marker} ")))?;
-                if !selected {
-                    queue!(
-                        out,
-                        SetForegroundColor(if marked {
-                            Color::Green
-                        } else {
-                            Color::DarkGrey
-                        })
-                    )?;
+                if file_log {
+                    // What this commit did to the file, coloured like the
+                    // changed-file list so the letters read the same way.
+                    if !selected {
+                        queue!(
+                            out,
+                            SetForegroundColor(match c.fstatus {
+                                'D' => Color::Red,
+                                'A' => Color::Green,
+                                'R' => Color::Blue,
+                                _ => Color::Yellow,
+                            })
+                        )?;
+                    }
+                    queue!(out, Print(c.fstatus), Print(" "))?;
+                } else {
+                    if !selected {
+                        queue!(
+                            out,
+                            SetForegroundColor(if marked {
+                                Color::Green
+                            } else {
+                                Color::DarkGrey
+                            })
+                        )?;
+                    }
+                    queue!(out, Print(box_), Print(" "))?;
                 }
-                queue!(out, Print(box_), Print(" "))?;
                 if !selected {
                     queue!(out, SetForegroundColor(Color::Yellow))?;
                 }
                 queue!(out, Print(&c.sha), Print(" "))?;
+                if file_log {
+                    if !selected {
+                        queue!(out, SetForegroundColor(Color::Blue))?;
+                    }
+                    let author = clip_right(&c.author, aw);
+                    let apad = aw.saturating_sub(author.chars().count());
+                    queue!(out, Print(&author), Print(" ".repeat(apad)), Print(" "))?;
+                }
                 if !selected {
                     queue!(out, SetForegroundColor(Color::White))?;
                 }
@@ -803,6 +1072,9 @@ impl DiffList {
             // The rev prompt replaces the hint with what's being typed.
             (Some(buf), _) => format!(" rev: {buf}▏"),
             (None, Some(n)) => format!(" {n}"),
+            // A file's history has no endpoint picking: Enter is "open this
+            // commit", and Esc closes because nothing opened it (#92).
+            (None, None) if file_log => " ↑↓ move · Enter open commit · Esc close".to_string(),
             (None, None) => " Space mark · Enter diff · / rev · Esc back".to_string(),
         };
         let h: String = hint.chars().take(inner_w).collect();
@@ -880,20 +1152,24 @@ fn load(dir: &Path) -> Result<Vec<Entry>, String> {
     );
     let mut entries = Vec::new();
     // A repo with no commits yet has no HEAD; fall back to the index diff.
-    let numstat = git(&root, &["diff", "HEAD", "--numstat"])
-        .or_else(|_| git(&root, &["diff", "--numstat"]))?;
-    for line in numstat.lines() {
-        let mut it = line.splitn(3, '\t');
-        let (Some(a), Some(d), Some(p)) = (it.next(), it.next(), it.next()) else {
-            continue;
-        };
-        let abs = root.join(p);
+    let numstat = git(&root, &["diff", "HEAD", "--numstat", "-z", "-M"])
+        .or_else(|_| git(&root, &["diff", "--numstat", "-z", "-M"]))?;
+    for ns in parse_numstat_z(&numstat) {
+        let abs = root.join(&ns.path);
         entries.push(Entry {
-            rel: p.to_string(),
-            status: if abs.exists() { 'M' } else { 'D' },
+            // A rename names both ends, so the move itself is visible (#94).
+            rel: match &ns.from {
+                Some(from) => format!("{from} → {}", ns.path),
+                None => ns.path.clone(),
+            },
+            status: match (&ns.from, abs.exists()) {
+                (Some(_), _) => 'R',
+                (None, true) => 'M',
+                (None, false) => 'D',
+            },
             abs,
-            added: a.parse().ok(),
-            removed: d.parse().ok(),
+            added: ns.added,
+            removed: ns.removed,
         });
     }
     if let Ok(unt) = git(&root, &["ls-files", "--others", "--exclude-standard"]) {
@@ -911,6 +1187,54 @@ fn load(dir: &Path) -> Result<Vec<Entry>, String> {
         }
     }
     Ok(entries)
+}
+
+/// One parsed `--numstat -z` record: counts, the path to act on, and — for a
+/// rename — the name it came from (#94).
+struct NumStat {
+    added: Option<u64>,
+    removed: Option<u64>,
+    path: String,
+    from: Option<String>,
+}
+
+/// Parse `git diff --numstat -z`. The tab-delimited form can't express a
+/// rename; with `-z` the pathname field is emitted NUL-terminated, and a rename
+/// leaves that field empty and follows with two more NUL-terminated names:
+/// `0\t0\t\0old\0new\0`. So renames are only visible in this encoding.
+fn parse_numstat_z(raw: &str) -> Vec<NumStat> {
+    let mut out = Vec::new();
+    let mut it = raw.split('\0');
+    while let Some(rec) = it.next() {
+        if rec.is_empty() {
+            continue;
+        }
+        let mut f = rec.splitn(3, '\t');
+        let (Some(a), Some(d), Some(p)) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let (added, removed) = (a.parse().ok(), d.parse().ok());
+        if p.is_empty() {
+            // Rename or copy: the two names follow as their own records.
+            let (Some(from), Some(to)) = (it.next(), it.next()) else {
+                continue;
+            };
+            out.push(NumStat {
+                added,
+                removed,
+                path: to.to_string(),
+                from: Some(from.to_string()),
+            });
+        } else {
+            out.push(NumStat {
+                added,
+                removed,
+                path: p.to_string(),
+                from: None,
+            });
+        }
+    }
+    out
 }
 
 /// Repo root for `dir`, or `None` when it isn't inside a git repo.
@@ -942,35 +1266,98 @@ fn load_log(root: &Path) -> Result<Vec<Commit>, String> {
                 sha: sha.to_string(),
                 subject: subject.to_string(),
                 when: when.to_string(),
+                author: String::new(),
+                fstatus: ' ',
             })
         })
         .collect())
+}
+
+/// Commits that touched `rel`, newest first (#92). `--follow` keeps the history
+/// going across renames; the per-commit `--name-status` letter says what that
+/// commit did to the file. Records are separated by RS and fields by US so a
+/// subject or an author name containing anything still splits cleanly.
+fn load_file_log(root: &Path, rel: &str) -> Result<Vec<Commit>, String> {
+    let out = git(
+        root,
+        &[
+            "log",
+            "--follow",
+            "--name-status",
+            "--pretty=format:\x1e%h\x1f%an\x1f%s\x1f%cr",
+            "-n",
+            &LOG_LIMIT.to_string(),
+            "--",
+            rel,
+        ],
+    )?;
+    Ok(out
+        .split('\x1e')
+        .filter(|r| !r.trim().is_empty())
+        .filter_map(|rec| {
+            let mut lines = rec.lines();
+            let mut it = lines.next()?.splitn(4, '\x1f');
+            let (sha, author, subject, when) = (it.next()?, it.next()?, it.next()?, it.next()?);
+            // The name-status lines follow the header; with --follow a rename
+            // reads `R100\told\tnew`, so take the letter only.
+            let fstatus = lines
+                .find(|l| !l.trim().is_empty())
+                .and_then(|l| l.chars().next())
+                .unwrap_or(' ');
+            Some(Commit {
+                sha: sha.to_string(),
+                subject: subject.to_string(),
+                when: when.to_string(),
+                author: author.to_string(),
+                fstatus,
+            })
+        })
+        .collect())
+}
+
+/// The full message of `sha` for the overlay (#93): subject, body, author and
+/// date, as display lines.
+fn commit_message(root: &Path, sha: &str) -> Result<Vec<String>, String> {
+    let out = git(
+        root,
+        &[
+            "show",
+            "-s",
+            "--format=%s%n%n%an · %ad%n%n%b",
+            "--date=short",
+            sha,
+        ],
+    )?;
+    Ok(out.lines().map(|l| l.to_string()).collect())
 }
 
 /// Changed files between two revisions (#74). Same shape as the working-tree
 /// list, so the panel renders and opens them identically; `abs` is the path in
 /// the working tree, which the diff view resolves against the two revs.
 fn load_range(root: &Path, base: &str, head: &str) -> Result<Vec<Entry>, String> {
-    let numstat = git(root, &["diff", "--numstat", base, head])?;
+    let numstat = git(root, &["diff", "--numstat", "-z", "-M", base, head])?;
     let status = git(root, &["diff", "--name-status", base, head]).unwrap_or_default();
     let mut entries = Vec::new();
-    for line in numstat.lines() {
-        let mut it = line.splitn(3, '\t');
-        let (Some(a), Some(d), Some(p)) = (it.next(), it.next(), it.next()) else {
-            continue;
+    for ns in parse_numstat_z(&numstat) {
+        // A rename is already known from the `-z` encoding (#94); for the rest,
+        // git's status letter says A added, D deleted, M modified.
+        let st = match &ns.from {
+            Some(_) => 'R',
+            None => status
+                .lines()
+                .find(|l| l.split('\t').nth(1) == Some(ns.path.as_str()))
+                .and_then(|l| l.chars().next())
+                .unwrap_or('M'),
         };
-        // git's status letter for this path: A added, D deleted, M modified.
-        let st = status
-            .lines()
-            .find(|l| l.split('\t').nth(1) == Some(p))
-            .and_then(|l| l.chars().next())
-            .unwrap_or('M');
         entries.push(Entry {
-            rel: p.to_string(),
-            abs: root.join(p),
+            rel: match &ns.from {
+                Some(from) => format!("{from} → {}", ns.path),
+                None => ns.path.clone(),
+            },
+            abs: root.join(&ns.path),
             status: st,
-            added: a.parse().ok(),
-            removed: d.parse().ok(),
+            added: ns.added,
+            removed: ns.removed,
         });
     }
     Ok(entries)
@@ -1015,6 +1402,10 @@ mod tests {
             range: None,
             log_sel: 0,
             input: None,
+            file_rel: None,
+            range_from: Mode::Log,
+            range_commit: None,
+            message: None,
         }
     }
 
@@ -1111,6 +1502,8 @@ mod tests {
                 sha: format!("sha{i}"),
                 subject: "s".into(),
                 when: "now".into(),
+                author: "someone".into(),
+                fstatus: 'M',
             })
             .collect();
         dl.mode = Mode::Log;
@@ -1129,6 +1522,8 @@ mod tests {
                 sha: format!("sha{i}"),
                 subject: format!("commit {i}"),
                 when: "2 days ago".into(),
+                author: "someone".into(),
+                fstatus: 'M',
             })
             .collect();
         dl.mode = Mode::Log;
@@ -1175,12 +1570,91 @@ mod tests {
                 sha: format!("sha{i}"),
                 subject: "s".into(),
                 when: "now".into(),
+                author: "someone".into(),
+                fstatus: 'M',
             })
             .collect();
         dl.mode = Mode::Log;
         dl.scroll(99);
         assert_eq!(dl.sel, 19, "scroll clamps to the last commit");
         assert_eq!(dl.window(5), (15, 5));
+    }
+}
+
+#[cfg(test)]
+mod totals_tests {
+    use super::*;
+
+    fn e(added: Option<u64>, removed: Option<u64>) -> Entry {
+        Entry {
+            rel: "f".into(),
+            abs: PathBuf::from("/f"),
+            status: 'M',
+            added,
+            removed,
+        }
+    }
+
+    #[test]
+    fn totals_sum_every_entry_not_just_the_visible_ones() {
+        let entries = vec![
+            e(Some(10), Some(3)),
+            e(Some(1), Some(0)),
+            e(Some(4), Some(7)),
+        ];
+        let (plus, minus) = totals(&entries).unwrap();
+        assert_eq!(plus, "+15");
+        assert_eq!(minus, "-10");
+    }
+
+    /// A binary or too-large-to-count file must not read as 0 — the total says
+    /// `?` so an under-report is visible rather than silent.
+    #[test]
+    fn uncounted_entries_mark_the_total_rather_than_counting_as_zero() {
+        let entries = vec![e(Some(5), Some(2)), e(None, None)];
+        let (plus, minus) = totals(&entries).unwrap();
+        assert_eq!(plus, "+5?");
+        assert_eq!(minus, "-2?");
+    }
+
+    /// The two sides are marked independently: a deleted-only unknown shouldn't
+    /// cast doubt on the added total.
+    #[test]
+    fn the_unknown_marker_is_per_side() {
+        let entries = vec![e(Some(9), None)];
+        let (plus, minus) = totals(&entries).unwrap();
+        assert_eq!(plus, "+9");
+        assert_eq!(minus, "-0?");
+    }
+
+    #[test]
+    fn no_totals_when_there_is_nothing_to_total() {
+        assert!(totals(&[]).is_none());
+    }
+
+    /// The `-z` encoding is the only one that can express a rename: the path
+    /// field is empty and the two names follow as their own records (#94).
+    #[test]
+    fn numstat_z_reads_renames_and_ordinary_paths() {
+        let raw = "1\t2\tsrc/a.rs\0".to_string()
+            + "0\t0\t\0old/name.rs\0new/name.rs\0"
+            + "5\t0\tsrc/b.rs\0";
+        let recs = parse_numstat_z(&raw);
+        assert_eq!(recs.len(), 3);
+        assert_eq!(recs[0].path, "src/a.rs");
+        assert!(recs[0].from.is_none());
+        assert_eq!(recs[1].path, "new/name.rs", "the rename's destination");
+        assert_eq!(recs[1].from.as_deref(), Some("old/name.rs"));
+        assert_eq!(recs[2].path, "src/b.rs", "parsing resyncs after a rename");
+        assert_eq!(recs[2].added, Some(5));
+    }
+
+    /// A binary file's counts are `-`, which must read as unknown, not 0.
+    #[test]
+    fn numstat_z_keeps_binary_counts_unknown() {
+        let recs = parse_numstat_z("-\t-\timg.png\0");
+        assert_eq!(recs[0].added, None);
+        assert_eq!(recs[0].removed, None);
     }
 }
 
@@ -1201,6 +1675,139 @@ mod range_tests {
             "git {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    /// A staged rename reads as R and names both ends (#94). An unstaged move
+    /// can't: git compares against the index, so it is a delete plus an
+    /// untracked file until staged — asserted here so the limit is deliberate.
+    #[test]
+    fn a_staged_rename_shows_as_r_an_unstaged_move_does_not() {
+        let dir = std::env::temp_dir().join(format!("cf-rename-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_in(&dir, &["init", "-q"]);
+        git_in(&dir, &["config", "user.email", "t@t"]);
+        git_in(&dir, &["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "first"]);
+
+        git_in(&dir, &["mv", "a.txt", "b.txt"]);
+        let e = load(&dir).unwrap();
+        assert_eq!(
+            e.len(),
+            1,
+            "a rename is one entry, not a delete plus an add"
+        );
+        assert_eq!(e[0].status, 'R');
+        assert_eq!(e[0].rel, "a.txt → b.txt", "both ends are named");
+        assert_eq!(e[0].abs, dir.join("b.txt"), "opening it uses the new path");
+
+        // Unstaged: git sees a delete and an unrelated untracked file.
+        git_in(&dir, &["commit", "-qm", "rename"]);
+        std::fs::rename(dir.join("b.txt"), dir.join("c.txt")).unwrap();
+        let e = load(&dir).unwrap();
+        let mut got: Vec<char> = e.iter().map(|x| x.status).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec!['A', 'D'], "unstaged move is D + untracked");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file's history (#92): only the commits touching that file, newest
+    /// first, each carrying who did it and what it did — then Enter opens that
+    /// commit's *whole* change, not just this file, and Esc closes outright
+    /// because nothing opened the list underneath.
+    #[test]
+    fn file_history_lists_only_that_files_commits_and_opens_the_whole_commit() {
+        let dir = std::env::temp_dir().join(format!("cf-flog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_in(&dir, &["init", "-q"]);
+        git_in(&dir, &["config", "user.email", "t@t"]);
+        git_in(&dir, &["config", "user.name", "Ada"]);
+        // a.txt is touched twice; b.txt once, in a commit that also touches a.
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "add a"]);
+        std::fs::write(dir.join("c.txt"), "c\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "add c only"]);
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "touch a and b"]);
+
+        let mut dl = DiffList::new_file_log(&dir, &dir.join("a.txt"));
+        assert!(matches!(dl.mode, Mode::FileLog), "opens on the file's log");
+        assert_eq!(dl.commits.len(), 2, "the c-only commit is not a's history");
+        assert_eq!(dl.commits[0].subject, "touch a and b", "newest first");
+        assert_eq!(dl.commits[0].author, "Ada", "who touched it");
+        assert_eq!(dl.commits[1].fstatus, 'A', "the commit that added it");
+
+        // Enter opens that commit vs its parent — every file it changed.
+        dl.feed_bytes(b"\r");
+        assert!(matches!(dl.mode, Mode::Range));
+        let mut rels: Vec<&str> = dl.entries.iter().map(|e| e.rel.as_str()).collect();
+        rels.sort();
+        assert_eq!(rels, vec!["a.txt", "b.txt"], "the whole commit, not just a");
+        assert!(dl.range_commit.is_some(), "one commit, so it has a message");
+
+        // Esc walks back to the file's history, then closes from there.
+        assert!(matches!(dl.feed_bytes(b"\x1b"), DiffAction::None));
+        assert!(matches!(dl.mode, Mode::FileLog), "back to the history");
+        assert!(matches!(dl.feed_bytes(b"\x1b"), DiffAction::Cancel));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `m` shows the message only when the range is a single commit (#93); a
+    /// two-endpoint span has no one message to show.
+    #[test]
+    fn the_message_overlay_needs_a_single_commit() {
+        let dir = std::env::temp_dir().join(format!("cf-msg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git_in(&dir, &["init", "-q"]);
+        git_in(&dir, &["config", "user.email", "t@t"]);
+        git_in(&dir, &["config", "user.name", "Ada"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-qm", "first"]);
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        git_in(&dir, &["commit", "-qam", "second subject\n\nthe body"]);
+
+        // One marked commit: the message is unambiguous.
+        let mut dl = DiffList::new(&dir);
+        dl.feed_bytes(b"l");
+        dl.feed_bytes(b" ");
+        dl.feed_bytes(b"\r");
+        assert!(matches!(dl.mode, Mode::Range));
+        dl.feed_bytes(b"m");
+        let msg = dl.message.as_ref().expect("m opens the message");
+        assert_eq!(msg[0], "second subject");
+        assert!(msg.iter().any(|l| l.contains("Ada")), "author is shown");
+        assert!(msg.iter().any(|l| l == "the body"), "body is shown");
+        // Esc closes the overlay first, leaving the range up.
+        dl.feed_bytes(b"\x1b");
+        assert!(dl.message.is_none());
+        assert!(
+            matches!(dl.mode, Mode::Range),
+            "esc closed only the overlay"
+        );
+
+        // A two-endpoint span spans commits, so there is no single message.
+        let mut dl = DiffList::new(&dir);
+        dl.feed_bytes(b"l");
+        dl.feed_bytes(b" ");
+        dl.feed_bytes(b"j");
+        dl.feed_bytes(b" ");
+        dl.feed_bytes(b"\r");
+        assert!(dl.range_commit.is_none(), "a span names no single commit");
+        dl.feed_bytes(b"m");
+        assert!(dl.message.is_none(), "m does nothing for a span");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Driving the panel the way a user does: `l` to the commit list, mark two
