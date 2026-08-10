@@ -348,6 +348,110 @@ if not uv.fs_stat(lazymain) then
 end
 vim.opt.rtp:prepend(lazypath)
 
+-- Go-to-definition that doesn't depend on a language server (#81). LSP is the
+-- best answer when it has one, but it often doesn't: bashls only indexes files
+-- matching its glob (extensionless scripts are invisible to it) and can never
+-- resolve a dynamically sourced file, and for a buffer with no server attached
+-- `gd` is just Vim's local-file jump. So every language gets a ripgrep search
+-- for how a definition is *written* in that language, used when LSP yields
+-- nothing. Kept deliberately conservative — a definition pattern that matches
+-- call sites too would bury the real hit.
+local function cf_def_patterns(ft, w)
+  local W = vim.fn.escape(w, "\\.*$^[]")
+  -- `\s` rather than a POSIX class: `[[:space:]]` contains `]]`, which would
+  -- close a Lua long-bracket string mid-pattern.
+  local shell = { "^\\s*(function\\s+)?" .. W .. "\\s*\\(\\)" }
+  local by_ft = {
+    sh = shell,
+    bash = shell,
+    zsh = shell,
+    python = { "^\\s*(def|class)\\s+" .. W .. "\\b" },
+    perl = { "^\\s*sub\\s+" .. W .. "\\b" },
+    c = {
+      "^[A-Za-z_].*\\b" .. W .. "\\s*\\(",
+      "^\\s*#\\s*define\\s+" .. W .. "\\b",
+      "\\b(struct|enum|union|typedef)\\s+" .. W .. "\\b",
+    },
+    lua = {
+      "function\\s+[A-Za-z0-9_.:]*" .. W .. "\\s*\\(",
+      "local\\s+" .. W .. "\\s*=",
+    },
+    rust = { "\\b(fn|struct|enum|trait|type|const|static|mod)\\s+" .. W .. "\\b" },
+  }
+  by_ft.cpp = by_ft.c
+  -- Last resort for a language with no rule: a line that assigns or declares it.
+  return by_ft[ft] or { "\\b" .. W .. "\\b\\s*[=:(]" }
+end
+
+--- Where a symbol search should run (#81). Not nvim's cwd: CodeForge opens a
+--- window per *project directory*, which is often a subdirectory of the repo
+--- (`auto/jenkins/jobs/rc_build`), so a cwd search never sees a helper that
+--- lives a level up (`auto/jenkins/jobs/utility/stage_utilities.sh`). Search
+--- the current file's repo instead, falling back to its directory, then cwd.
+local function cf_search_root()
+  local file = vim.api.nvim_buf_get_name(0)
+  local from = file ~= "" and vim.fs.dirname(file) or vim.fn.getcwd()
+  local git = vim.fs.find(".git", { path = from, upward = true })[1]
+  if git then
+    return vim.fs.dirname(git)
+  end
+  return from
+end
+
+--- Jump to `items[1]`, or list them all when the search found several.
+local function cf_open_defs(word, items)
+  if #items == 0 then
+    vim.notify("No definition found for " .. word, vim.log.levels.INFO)
+    return
+  end
+  if #items == 1 then
+    local it = items[1]
+    vim.cmd("edit " .. vim.fn.fnameescape(it.filename))
+    pcall(vim.api.nvim_win_set_cursor, 0, { it.lnum, math.max((it.col or 1) - 1, 0) })
+    vim.cmd("normal! zz")
+    return
+  end
+  vim.fn.setqflist({}, " ", { title = "Definitions: " .. word, items = items })
+  require("trouble").open("quickfix")
+end
+
+function _G.CF_rg_definition(word, ft)
+  word = word ~= "" and word or vim.fn.expand("<cword>")
+  if word == "" then
+    return
+  end
+  if vim.fn.executable("rg") == 0 then
+    vim.notify("ripgrep (rg) not found; cannot search definitions", vim.log.levels.WARN)
+    return
+  end
+  local cmd = { "rg", "--vimgrep", "--no-heading" }
+  for _, p in ipairs(cf_def_patterns(ft or vim.bo.filetype, word)) do
+    table.insert(cmd, "-e")
+    table.insert(cmd, p)
+  end
+  -- Search the repo, not the cwd — the definition usually lives outside the
+  -- project directory this window was opened on.
+  local root = cf_search_root()
+  table.insert(cmd, "--")
+  table.insert(cmd, root)
+  local items = {}
+  for _, line in ipairs(vim.fn.systemlist(cmd) or {}) do
+    local file, lnum, col, text = line:match("^(.-):(%d+):(%d+):(.*)$")
+    if file then
+      items[#items + 1] =
+        { filename = file, lnum = tonumber(lnum), col = tonumber(col), text = text }
+    end
+  end
+  cf_open_defs(word, items)
+end
+
+-- `gd` for buffers with no language server at all. LspAttach installs a
+-- buffer-local `gd` that tries LSP first and falls back to this, and a
+-- buffer-local map wins over this global one.
+vim.keymap.set("n", "gd", function()
+  _G.CF_rg_definition("", vim.bo.filetype)
+end, { desc = "Go to definition (search)" })
+
 require("lazy").setup({
   -- Colorscheme.
   {
@@ -1218,7 +1322,16 @@ require("lazy").setup({
               vim.notify("ripgrep (rg) not found; cannot search callers", vim.log.levels.WARN)
               return
             end
-            local out = vim.fn.systemlist({ "rg", "--vimgrep", "--word-regexp", "--", word })
+            -- Repo-wide, not cwd-wide (#81): callers of a shared helper live all
+            -- over the repo, usually outside this window's project directory.
+            local out = vim.fn.systemlist({
+              "rg",
+              "--vimgrep",
+              "--word-regexp",
+              "--",
+              word,
+              cf_search_root(),
+            })
             local items = {}
             for _, line in ipairs(out) do
               local file, lnum, col, text = line:match("^(.-):(%d+):(%d+):(.*)$")
@@ -1238,17 +1351,48 @@ require("lazy").setup({
                 break
               end
             end
+            local word = vim.fn.expand("<cword>")
             if has_refs then
               vim.lsp.buf.references({ includeDeclaration = false }, {
                 on_list = function(o)
+                  -- An attached server that never indexed the defining file
+                  -- answers "no references" rather than failing, so an empty
+                  -- result has to fall back too, not just a missing server.
+                  if not o.items or #o.items == 0 then
+                    rg_callers(word)
+                    return
+                  end
                   open_callers_qf(o.title, o.items)
                 end,
               })
             else
-              rg_callers(vim.fn.expand("<cword>"))
+              rg_callers(word)
             end
           end
-          map("gd", peek("definitions", tb.lsp_definitions), "Peek / go to definition")
+          -- LSP first, ripgrep when it comes back empty (#81). bashls doesn't
+          -- index extensionless scripts and can't follow a dynamic `source`, so
+          -- a server being attached is no guarantee it knows the symbol — the
+          -- fallback has to key off the *result*, not off whether a server
+          -- exists.
+          local lsp_peek = peek("definitions", tb.lsp_definitions)
+          local function goto_definition()
+            local buf = vim.api.nvim_get_current_buf()
+            local word, ft = vim.fn.expand("<cword>"), vim.bo.filetype
+            -- Neovim 0.11+ warns on every call without an explicit encoding.
+            local enc = (vim.lsp.get_clients({ bufnr = buf })[1] or {}).offset_encoding
+            local params = vim.lsp.util.make_position_params(0, enc or "utf-16")
+            vim.lsp.buf_request_all(buf, "textDocument/definition", params, function(results)
+              for _, r in pairs(results or {}) do
+                local v = r.result
+                if v and (v.uri or v.targetUri or (type(v) == "table" and #v > 0)) then
+                  lsp_peek()
+                  return
+                end
+              end
+              _G.CF_rg_definition(word, ft)
+            end)
+          end
+          map("gd", goto_definition, "Go to definition (LSP, then search)")
           map("gr", find_callers, "Find callers (references, no declaration)")
           map("gi", peek("implementations", tb.lsp_implementations), "Peek implementations")
           map("gt", peek("type_definitions", tb.lsp_type_definitions), "Peek type definition")
@@ -1287,6 +1431,21 @@ require("lazy").setup({
         local lspconfig = require("lspconfig")
         for _, server in ipairs(mlsp.get_installed_servers()) do
           local opts = {}
+          if server == "bashls" then
+            -- bashls only cross-indexes files its glob matches, and the default
+            -- (`**/*@(.sh|.inc|.bash|.command)`) skips extensionless scripts —
+            -- exactly where shared shell functions tend to live, so `gd` across
+            -- files found nothing (#81). Widen it, and anchor the workspace on
+            -- the git root so background analysis covers the whole repo rather
+            -- than the file's own directory.
+            opts.settings = {
+              bashIde = { globPattern = "**/*@(.sh|.inc|.bash|.command|.bashrc|.zsh|)" },
+            }
+            opts.root_dir = function(fname)
+              return vim.fs.dirname(vim.fs.find(".git", { path = fname, upward = true })[1])
+                or vim.fn.getcwd()
+            end
+          end
           if server == "lua_ls" then
             -- Editing this Neovim config is Lua: recognise the `vim` global so it
             -- isn't flagged undefined, and don't prompt about third-party libs.
@@ -1978,6 +2137,31 @@ vim.api.nvim_create_autocmd("FileType", {
     -- Enter while typing = "submit": leave insert (results already update live),
     -- so you can step to hits without reaching for Esc first (#53).
     vim.keymap.set("i", "<CR>", "<Esc>", { buffer = buf, desc = "grug-far: submit search" })
+    -- Enter / double-click on a hit opens it and dismisses the search (#96).
+    -- grug-far's own Enter resolves a target window from `context.prevWin` — a
+    -- window in the *other* tabpage, since we open with `tab split`. CodeForge
+    -- closes and relayouts editor windows underneath it, so that handle goes
+    -- stale and the jump lands somewhere invisible or nowhere. Do it explicitly:
+    -- jump, then hide the search, which drops us on the file either way.
+    local function open_hit()
+      local inst = require("grug-far").get_instance(buf)
+      if not inst then
+        return
+      end
+      local before = vim.api.nvim_buf_get_name(0)
+      local ok = pcall(function()
+        inst:goto_location()
+      end)
+      -- Only dismiss when the cursor really was on a hit; on a file header or a
+      -- blank line goto_location is a no-op and the search should stay up.
+      if ok and vim.api.nvim_buf_get_name(0) ~= before then
+        pcall(function()
+          require("grug-far").hide_instance(buf)
+        end)
+      end
+    end
+    vim.keymap.set("n", "<CR>", open_hit, { buffer = buf, desc = "grug-far: open hit" })
+    vim.keymap.set("n", "<2-LeftMouse>", open_hit, { buffer = buf, desc = "grug-far: open hit" })
     -- Esc in normal mode hides the window but keeps the instance, so reopening
     -- restores the search + hits (kill would lose them) (#53).
     vim.keymap.set("n", "<Esc>", function()
