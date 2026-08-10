@@ -356,13 +356,53 @@ pub fn classify(dir: &Path) -> WtState {
         None => return WtState::Error("status failed"),
         _ => {}
     }
-    // Commits the upstream doesn't have. No upstream at all means the work
+    // Already merged into the mainline? Counting commits the upstream lacks
+    // (below) compares SHAs, so work that landed in master rebased, squashed or
+    // cherry-picked still reads as unpushed — the common case for a finished
+    // ticket, which then can't be deleted (#97). `git cherry` matches by
+    // patch-id instead and lists only what mainline genuinely doesn't have.
+    //
+    // Note a tree comparison against mainline's tip would be wrong here: these
+    // worktrees are usually *behind* master, so the diff is dominated by master's
+    // own newer commits and says nothing about this branch's unique work.
+    let merged = mainline(dir).and_then(|m| {
+        git_out(dir, &["cherry", &m, "HEAD"]).map(|out| !out.lines().any(|l| l.starts_with('+')))
+    });
+    if merged == Some(true) {
+        return WtState::Clean;
+    }
+
+    // Otherwise the work still has to exist somewhere other than this worktree:
+    // pushed to its own upstream. No upstream at all and nothing merged means it
     // exists nowhere else, which is the same risk as unpushed commits.
     match git_out(dir, &["rev-list", "--count", "@{u}..HEAD"]) {
         Some(n) if n.trim() == "0" => WtState::Clean,
         Some(_) => WtState::Pending,
+        // Unmerged commits on a branch that was never pushed: real work, not an
+        // error — only report Error when mainline couldn't be resolved either.
+        None if merged == Some(false) => WtState::Pending,
         None => WtState::Error("no upstream"),
     }
+}
+
+/// The mainline branch to judge "already merged" against: whatever
+/// `origin/HEAD` points at, falling back to origin/main then origin/master.
+/// `None` when the remote has none of them, which leaves classification to the
+/// upstream check alone.
+fn mainline(dir: &Path) -> Option<String> {
+    if let Some(s) = git_out(
+        dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
+        let s = s.trim().to_string();
+        if !s.is_empty() {
+            return Some(s);
+        }
+    }
+    ["origin/main", "origin/master"]
+        .into_iter()
+        .find(|r| git_out(dir, &["rev-parse", "--verify", "--quiet", r]).is_some())
+        .map(String::from)
 }
 
 /// Delete a worktree: its registration, its directory, and its branch — the
@@ -438,6 +478,99 @@ mod manager_tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// Work that already landed in mainline under a *different* SHA (rebased,
+    /// squashed, cherry-picked) is finished, so its worktree is deletable — the
+    /// SHA-counting check called it Pending forever (#97). Work mainline really
+    /// doesn't have must still never be Clean: the delete is irreversible.
+    #[test]
+    fn merged_under_another_sha_is_clean_but_unique_work_is_not() {
+        let tmp = std::env::temp_dir().join(format!("cf-wt-merged-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (origin, clone) = (tmp.join("origin"), tmp.join("clone"));
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init", "-q", "-b", "master"]);
+        git_in(&origin, &["config", "user.email", "t@t"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        std::fs::write(origin.join("a.txt"), "one\n").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-qm", "first"]);
+
+        git_in(&tmp, &["clone", "-q", origin.to_str().unwrap(), "clone"]);
+        git_in(&clone, &["config", "user.email", "t@t"]);
+        git_in(&clone, &["config", "user.name", "t"]);
+
+        // A worktree whose commit is applied to origin/master as a new commit —
+        // same patch, different SHA, exactly what a merged ticket looks like.
+        let done = tmp.join("clone-DONE");
+        git_in(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                done.to_str().unwrap(),
+                "-b",
+                "done",
+            ],
+        );
+        std::fs::write(done.join("b.txt"), "shared\n").unwrap();
+        git_in(&done, &["add", "."]);
+        git_in(&done, &["commit", "-qm", "the feature"]);
+        let patch = Command::new("git")
+            .arg("-C")
+            .arg(&done)
+            .args(["format-patch", "-1", "--stdout"])
+            .output()
+            .unwrap();
+        std::fs::write(tmp.join("p.patch"), &patch.stdout).unwrap();
+        git_in(
+            &origin,
+            &["am", "-q", tmp.join("p.patch").to_str().unwrap()],
+        );
+
+        // And one with work that exists nowhere else.
+        let wip = tmp.join("clone-WIP");
+        git_in(
+            &clone,
+            &["worktree", "add", "-q", wip.to_str().unwrap(), "-b", "wip"],
+        );
+        std::fs::write(wip.join("c.txt"), "unique\n").unwrap();
+        git_in(&wip, &["add", "."]);
+        git_in(&wip, &["commit", "-qm", "not upstream anywhere"]);
+
+        assert_eq!(
+            classify(&done),
+            WtState::Clean,
+            "patch already in mainline: deletable"
+        );
+        assert_eq!(
+            classify(&wip),
+            WtState::Pending,
+            "work that exists nowhere else must never be Clean"
+        );
+
+        // The safety property the whole feature rests on.
+        let (mut d, mut w) = (
+            WtEntry {
+                name: "done".into(),
+                path: done.clone(),
+                state: classify(&done),
+            },
+            WtEntry {
+                name: "wip".into(),
+                path: wip.clone(),
+                state: classify(&wip),
+            },
+        );
+        assert!(d.deletable(), "merged work can be cleaned up");
+        assert!(!w.deletable(), "unique work is protected");
+        d.state = WtState::Dirty;
+        w.state = WtState::Unknown;
+        assert!(!d.deletable() && !w.deletable());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A clone is never a linked worktree, so it can't reach the delete path —
