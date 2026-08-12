@@ -2217,6 +2217,21 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 && py < rect.y + rect.h;
                             if taken {
                                 let is_wheel = cb & 64 != 0;
+                                // A click on the panel focuses the pane it covers
+                                // (#95). The panel only owns the keyboard while
+                                // that pane is focused (#51), so without this the
+                                // list could be clicked but never driven — the
+                                // focus-on-click below is in the `!taken` branch
+                                // and never sees these events. Wheel and drag
+                                // don't steal focus, matching the panes.
+                                if press && !is_wheel && cb & 32 == 0 {
+                                    let w = &mut windows[cur];
+                                    let term = w.active[1];
+                                    if w.focus_id != term {
+                                        w.focus_id = term;
+                                        dirty = true;
+                                    }
+                                }
                                 if is_wheel {
                                     if press {
                                         dl.scroll(if cb & 1 == 0 { -3 } else { 3 });
