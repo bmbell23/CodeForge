@@ -310,6 +310,31 @@ local function cf_goto_line()
   end
 end
 vim.keymap.set("n", CFKeys.lhs("goto_line"), cf_goto_line, { desc = "Jump to line (type digits, live)" })
+
+-- Where the text starts, for a screen cell (1-based), as a 0-based column in
+-- the pane (#99). forge does its own mouse drag-selection over the raw screen,
+-- so a multi-line drag would otherwise copy the line-number gutter along with
+-- the code; it calls this over RPC to learn what to clip off the left.
+-- `textoff` is the exact gutter width (number + sign + fold columns), so this
+-- never has to guess at what looks like a line number. Windows are matched in
+-- the current tabpage only, and 0 ("don't clip") covers a cell over no window
+-- at all — a statusline, or the bufferline row.
+function _G.CF_gutter_cols(row, col)
+  local ok, wins = pcall(vim.fn.getwininfo)
+  if not ok then
+    return 0
+  end
+  local tab = vim.fn.tabpagenr()
+  for _, w in ipairs(wins) do
+    if w.tabnr == tab
+      and row >= w.winrow and row < w.winrow + w.height
+      and col >= w.wincol and col < w.wincol + w.width then
+      return w.wincol - 1 + (w.textoff or 0)
+    end
+  end
+  return 0
+end
+
 opt.clipboard = "unnamedplus"
 opt.ignorecase = true
 opt.smartcase = true

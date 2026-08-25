@@ -318,6 +318,36 @@ fn nvim_current_file(sock: &Path) -> Option<PathBuf> {
     (out.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
 }
 
+/// Where the editor's text starts under a screen cell: nvim's gutter width (line
+/// numbers, signs, folds) as a 0-based pane column (#99). `row`/`col` are 0-based
+/// cells in the pane's content rect; nvim screen coords are 1-based, hence the +1.
+///
+/// 0 means "don't clip" and covers every way this can come up short — nvim not
+/// reachable, an older nvim without `textoff`, or a cell that's over no window at
+/// all (a statusline or the bufferline). A wrong guess here would silently eat
+/// real code off the left of a copy, so every failure falls back to today's
+/// behavior instead.
+fn nvim_gutter(sock: &Path, row: u16, col: u16) -> u16 {
+    if !sock.exists() {
+        return 0;
+    }
+    let out = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-expr")
+        .arg(format!("v:lua.CF_gutter_cols({}, {})", row + 1, col + 1))
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .parse::<u16>()
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// Ask the editor to open CodeForge's side-by-side diff (#18) on `file`.
 /// True only when nvim confirms — the caller zooms the layout on success.
 fn nvim_diff_open(sock: &Path, file: &Path) -> bool {
@@ -2349,6 +2379,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                         anchor: c,
                                         cur: c,
                                         moved: false,
+                                        gutter: None,
                                     });
                                 }
                             } else if is_motion && button == 0 {
@@ -2358,6 +2389,29 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                         ms.cur = c;
                                         ms.moved = true;
                                         dirty = true;
+                                        // Rows after the first are copied whole,
+                                        // from column 0 — in the editor that drags
+                                        // the line-number gutter along (#99). Once
+                                        // the drag spans rows, ask nvim where its
+                                        // text starts and clip to it. Resolved once
+                                        // per drag (the width only changes on a
+                                        // layout change, which ends the drag), so a
+                                        // click never pays for the round-trip.
+                                        if ms.gutter.is_none() && ms.anchor.0 != c.0 {
+                                            let editor = w
+                                                .panes
+                                                .iter()
+                                                .any(|p| p.id == id && p.role == PaneRole::Editor);
+                                            ms.gutter = Some(if editor {
+                                                nvim_gutter(
+                                                    &nvim_sock(id),
+                                                    ms.anchor.0,
+                                                    ms.anchor.1,
+                                                )
+                                            } else {
+                                                0
+                                            });
+                                        }
                                     }
                                 }
                             } else if !press {
@@ -2370,7 +2424,14 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                             .panes
                                             .iter()
                                             .find(|p| p.id == ms.pane_id)
-                                            .map(|p| extract_range(p.screen(), s, e))
+                                            .map(|p| {
+                                                extract_range(
+                                                    p.screen(),
+                                                    s,
+                                                    e,
+                                                    ms.gutter.unwrap_or(0),
+                                                )
+                                            })
                                             .unwrap_or_default();
                                         if !text.is_empty() {
                                             if let Some(cl) = client.as_mut() {
@@ -3150,7 +3211,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     &eksnap,
                     msel.as_ref().map(|m| {
                         let (s, e) = m.range();
-                        (m.pane_id, s, e)
+                        (m.pane_id, s, e, m.gutter.unwrap_or(0))
                     }),
                 )?;
                 let payload = differ.frame(&framebuf, size.0, size.1, needs_clear);
@@ -3836,9 +3897,9 @@ fn render(
                     draw_copy_overlay(out, p.screen(), inner, cm)?;
                 }
                 // Live mouse drag-selection highlight on this pane (#21).
-                if let Some((mid, s, e)) = msel {
+                if let Some((mid, s, e, g)) = msel {
                     if mid == *id {
-                        draw_selection(out, p.screen(), inner, s, e)?;
+                        draw_selection(out, p.screen(), inner, s, e, g)?;
                     }
                 }
             }
@@ -4957,11 +5018,16 @@ struct MouseSel {
     /// True once the pointer moved off the anchor cell — distinguishes a
     /// select-drag from a plain click (which we still forward to the app).
     moved: bool,
+    /// Left bound to clip every row to, so a multi-line drag in the editor
+    /// doesn't drag the line-number gutter along (#99). `None` until the drag
+    /// spans rows and we've asked nvim where its text starts — resolved once
+    /// per drag so a plain click never pays for the RPC round-trip.
+    gutter: Option<u16>,
 }
 
-/// A resolved selection to highlight: (pane id, start cell, end cell), in
-/// reading order. Passed to `render` for the mouse drag-selection overlay.
-type Sel = (usize, (u16, u16), (u16, u16));
+/// A resolved selection to highlight: (pane id, start cell, end cell, gutter),
+/// in reading order. Passed to `render` for the mouse drag-selection overlay.
+type Sel = (usize, (u16, u16), (u16, u16), u16);
 
 impl MouseSel {
     /// Normalized (start, end) in reading order.
@@ -5144,19 +5210,28 @@ fn extract_selection(screen: &vt100::Screen, cm: &CopyMode) -> String {
     let (_, cols) = screen.size();
     let last = cols.saturating_sub(1);
     let (start, end) = cm.selection().unwrap_or(((cm.row, 0), (cm.row, last)));
-    extract_range(screen, start, end)
+    extract_range(screen, start, end, 0)
 }
 
 /// Extract text between two (row, col) cell coordinates (inclusive, reading
 /// order) from the visible screen, trimming trailing spaces per line. Shared by
 /// keyboard copy mode and mouse drag-selection.
-fn extract_range(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> String {
+///
+/// `gutter` is a left bound every row is clipped to — nvim's line-number column
+/// for a drag in the editor (#99), 0 everywhere else. Without it the rows after
+/// the first start at column 0 and the copy carries the line numbers.
+fn extract_range(
+    screen: &vt100::Screen,
+    start: (u16, u16),
+    end: (u16, u16),
+    gutter: u16,
+) -> String {
     let (_, cols) = screen.size();
     let last = cols.saturating_sub(1);
     let ((sr, sc), (er, ec)) = (start, end);
     let mut out = String::new();
     for r in sr..=er {
-        let cstart = if r == sr { sc } else { 0 };
+        let cstart = (if r == sr { sc } else { 0 }).max(gutter);
         let cend = (if r == er { ec } else { last }).min(last);
         let mut line = String::new();
         for c in cstart..=cend {
@@ -5178,13 +5253,16 @@ fn extract_range(screen: &vt100::Screen, start: (u16, u16), end: (u16, u16)) -> 
 
 /// Reverse-highlight a plain (start, end) cell range on an already-blitted pane
 /// — the live feedback for a mouse drag-selection (#21). `inner` is the pane's
-/// content rect; `s`/`e` are (row, col) in reading order.
+/// content rect; `s`/`e` are (row, col) in reading order. `gutter` is the same
+/// left bound `extract_range` clips to (#99), so the highlight shows exactly
+/// what the release will copy.
 fn draw_selection(
     out: &mut Vec<u8>,
     screen: &vt100::Screen,
     inner: Rect,
     s: (u16, u16),
     e: (u16, u16),
+    gutter: u16,
 ) -> Result<()> {
     let (rows, cols) = screen.size();
     let (sr, sc) = s;
@@ -5193,7 +5271,7 @@ fn draw_selection(
         if r < sr || r > er {
             continue;
         }
-        let cstart = if r == sr { sc } else { 0 };
+        let cstart = (if r == sr { sc } else { 0 }).max(gutter);
         let cend = if r == er { ec } else { cols.saturating_sub(1) };
         for c in cstart..=cend.min(cols.min(inner.w).saturating_sub(1)) {
             let ch = screen
@@ -6249,6 +6327,33 @@ mod tests {
             anchor: None,
         };
         assert_eq!(extract_selection(screen, &line), "second line");
+    }
+
+    /// A multi-line drag in the editor clips every row to nvim's gutter (#99),
+    /// so the copy is code alone — the rows after the first would otherwise be
+    /// taken whole, from column 0, line numbers included.
+    #[test]
+    fn extract_range_clips_the_gutter() {
+        let mut parser = vt100::Parser::new(4, 24, 100);
+        parser.process(b"  1   let x = 1;\r\n  2   foo(x);\r\n  3 }");
+        let screen = parser.screen();
+        // "  1   " is the gutter: text starts at column 6 on every row. Drag
+        // from the first row's text to the end of row 1.
+        let start = (0, 6);
+        let end = (1, 13);
+        assert_eq!(extract_range(screen, start, end, 6), "let x = 1;\nfoo(x);");
+        // Same drag with no gutter (a shell pane) keeps today's behavior: row 1
+        // is taken whole, line number and all.
+        assert_eq!(
+            extract_range(screen, start, end, 0),
+            "let x = 1;\n  2   foo(x);"
+        );
+        // Starting the drag inside the gutter still clips — the anchor column
+        // is a lower bound, not an override.
+        assert_eq!(extract_range(screen, (0, 0), end, 6), "let x = 1;\nfoo(x);");
+        // A row that ends before the gutter contributes an empty line rather
+        // than panicking on an inverted range.
+        assert_eq!(extract_range(screen, (0, 6), (1, 2), 6), "let x = 1;\n");
     }
 
     #[test]
