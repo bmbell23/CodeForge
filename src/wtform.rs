@@ -2,9 +2,11 @@
 //! picker's "＋ New worktree" entry. Fields, in tab order:
 //!   clone (fuzzy-select a git repo under the projects root) ->
 //!   [also make the auto worktree] (only for sfaos) ->
-//!   ticket (prefilled "SFAP-", editable) ->
+//!   ticket (prefilled "SFAP-" on the SFA clones only, editable, optional) ->
 //!   short name (spaces become underscores as you type) ->
-//!   upstream (shown as `origin/<branch>`, default master, optional).
+//!   upstream (shown as `origin/<branch>`, prefilled with the chosen clone's
+//!   own default branch — `main` on the GHE/GitLab repos, `master` on the
+//!   Gerrit ones, #102).
 //! Driven by `feed_bytes` like the picker, since the main loop owns stdin.
 
 use std::path::{Path, PathBuf};
@@ -15,7 +17,7 @@ use crossterm::style::{
 };
 use crossterm::{cursor, queue};
 
-use crate::worktree::WorktreeSpec;
+use crate::worktree::{default_branch, is_sfa_clone, WorktreeSpec};
 
 /// Max clone rows shown while selecting.
 const MAX_ROWS: usize = 8;
@@ -38,6 +40,8 @@ enum Field {
 }
 
 pub struct WorktreeForm {
+    /// Projects root, kept so the chosen clone can be probed for its defaults.
+    root: PathBuf,
     clones: Vec<String>,
     // Clone selector state.
     filter: String,
@@ -49,6 +53,13 @@ pub struct WorktreeForm {
     ticket: String,
     name: String,
     upstream: String,
+    /// The clone's own default branch, cached when the clone is confirmed so
+    /// the blank-field hint doesn't shell out to git on every frame.
+    default_upstream: String,
+    /// True while `ticket`/`upstream` still hold what we prefilled — picking a
+    /// different clone re-prefills them, but never overwrites your typing.
+    ticket_auto: bool,
+    upstream_auto: bool,
     focus: Field,
     error: Option<String>,
     /// A create worker is running; the form stays up showing progress until
@@ -67,6 +78,7 @@ impl WorktreeForm {
         let mut clones = list_clones(&root);
         clones.sort_by_key(|s| s.to_lowercase());
         let mut f = WorktreeForm {
+            root,
             clones,
             filter: String::new(),
             matches: Vec::new(),
@@ -76,6 +88,9 @@ impl WorktreeForm {
             ticket: String::new(),
             name: String::new(),
             upstream: String::new(),
+            default_upstream: "master".to_string(),
+            ticket_auto: true,
+            upstream_auto: true,
             focus: Field::Clone,
             error: None,
             creating: false,
@@ -135,13 +150,25 @@ impl WorktreeForm {
         v
     }
 
-    /// Confirm the highlighted clone and move on. Prefills the ticket prefix.
+    /// Confirm the highlighted clone and move on, prefilling from that clone:
+    /// its default branch as the upstream, and the `SFAP-` ticket prefix only
+    /// where that convention applies (#102). Anything you already typed into
+    /// those fields survives a change of clone.
     fn confirm_clone(&mut self) {
         if let Some(c) = self.selected_clone() {
-            self.clone = Some(c);
-            if self.ticket.is_empty() {
-                self.ticket = "SFAP-".to_string();
+            let dir = self.root.join(&c);
+            self.default_upstream = default_branch(&dir);
+            if self.upstream_auto {
+                self.upstream = self.default_upstream.clone();
             }
+            if self.ticket_auto {
+                self.ticket = if is_sfa_clone(&dir) {
+                    "SFAP-".to_string()
+                } else {
+                    String::new()
+                };
+            }
+            self.clone = Some(c);
             self.focus = if self.clone.as_deref() == Some("sfaos") {
                 Field::AlsoAuto
             } else {
@@ -192,6 +219,16 @@ impl WorktreeForm {
         })
     }
 
+    /// Editing a prefilled field hands it over to you — a later clone change
+    /// won't clobber it.
+    fn mark_typed(&mut self) {
+        match self.focus {
+            Field::Ticket => self.ticket_auto = false,
+            Field::Upstream => self.upstream_auto = false,
+            _ => {}
+        }
+    }
+
     fn edit_field(&mut self) -> &mut String {
         match self.focus {
             Field::Ticket => &mut self.ticket,
@@ -202,6 +239,7 @@ impl WorktreeForm {
 
     fn type_char(&mut self, c: char) {
         self.error = None;
+        self.mark_typed();
         match self.focus {
             Field::Clone => {
                 self.filter.push(c);
@@ -222,6 +260,7 @@ impl WorktreeForm {
 
     fn backspace(&mut self) {
         self.error = None;
+        self.mark_typed();
         match self.focus {
             Field::Clone => {
                 self.filter.pop();
@@ -424,7 +463,7 @@ impl WorktreeForm {
         field_line(out, r, "name    ", &self.name, self.focus == Field::Name)?;
         r += 1;
         let up = if self.upstream.trim().is_empty() {
-            "origin/master".to_string()
+            format!("origin/{}", self.default_upstream)
         } else {
             format!("origin/{}", self.upstream)
         };

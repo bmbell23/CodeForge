@@ -49,9 +49,10 @@ pub fn sanitize_desc(s: &str) -> String {
 }
 
 /// Normalize the ticket: `prefix-number` upcases the prefix (SFAP-… / DDNDO-…);
-/// a bare number becomes `SFAP-<number>` (worktree.sh's default). Anything else
-/// is passed through trimmed.
-pub fn normalize_ticket(input: &str) -> String {
+/// on an SFA clone a bare number becomes `SFAP-<number>` (worktree.sh's
+/// default). Anything else is passed through trimmed — including a bare number
+/// on a non-SFA clone (#102), where `SFAP` would be simply wrong.
+pub fn normalize_ticket(input: &str, sfa: bool) -> String {
     let t = input.trim();
     if let Some((prefix, num)) = t.split_once('-') {
         if !prefix.is_empty()
@@ -62,26 +63,74 @@ pub fn normalize_ticket(input: &str) -> String {
             return format!("{}-{}", prefix.to_ascii_uppercase(), num);
         }
     }
-    if !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
+    if sfa && !t.is_empty() && t.chars().all(|c| c.is_ascii_digit()) {
         return format!("SFAP-{t}");
     }
     t.to_string()
 }
 
 /// The worktree directory name, which is also the branch name:
-/// `<clone>-<TICKET>-<desc>`.
+/// `<clone>-<TICKET>-<desc>`, or `<clone>-<desc>` when there's no ticket —
+/// repos outside the SFA Jira projects don't have one, and keeping the segment
+/// would leave a double dash (#102).
 pub fn worktree_name(clone: &str, ticket: &str, desc: &str) -> String {
-    format!("{clone}-{ticket}-{desc}")
+    if ticket.is_empty() {
+        format!("{clone}-{desc}")
+    } else {
+        format!("{clone}-{ticket}-{desc}")
+    }
 }
 
-/// `origin/<upstream>`, defaulting to `master` when the field is blank.
-fn upstream_or_default(upstream: &str) -> String {
+/// `origin/<upstream>`, falling back to the clone's own default branch when the
+/// field is blank. Hardcoding `master` broke every clone that uses `main` —
+/// the GHE and GitLab repos (#102).
+fn upstream_or_default(upstream: &str, clone_dir: &Path) -> String {
     let u = upstream.trim();
     if u.is_empty() {
-        "master".to_string()
+        default_branch(clone_dir)
     } else {
         u.to_string()
     }
+}
+
+/// The clone's default branch, without the `origin/` prefix. Reads local refs
+/// only — this runs while the form is open, so it must not touch the network:
+/// `origin/HEAD` when the clone has it set, else whichever of `main`/`master`
+/// exists as a remote-tracking ref (mlai has no `origin/HEAD`), else `master`.
+pub fn default_branch(clone_dir: &Path) -> String {
+    if let Some(head) = git_out(
+        clone_dir,
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+    ) {
+        if let Some(b) = head.trim().strip_prefix("origin/") {
+            if !b.is_empty() {
+                return b.to_string();
+            }
+        }
+    }
+    for cand in ["main", "master"] {
+        let r = format!("refs/remotes/origin/{cand}");
+        if git_out(clone_dir, &["rev-parse", "--verify", "--quiet", &r]).is_some() {
+            return cand.to_string();
+        }
+    }
+    "master".to_string()
+}
+
+/// Whether `clone_dir` is one of the SFA repos, i.e. its origin lives under the
+/// `sfa/` namespace — true for the Gerrit clones (sfaos, auto, eng, infra, qa)
+/// and for `sfa/k8s` on GHE, false for `ddn/reservations`, `ddn/mlai` and the
+/// GitLab repos. Drives the `SFAP-` ticket conventions and nothing else, so a
+/// wrong answer only costs a prefill (#102).
+pub fn is_sfa_clone(clone_dir: &Path) -> bool {
+    let Some(url) = git_out(clone_dir, &["remote", "get-url", "origin"]) else {
+        return false;
+    };
+    url.trim()
+        .trim_end_matches(".git")
+        .rsplit_once('/')
+        .and_then(|(head, _)| head.rsplit_once(['/', ':']).map(|(_, ns)| ns))
+        .is_some_and(|ns| ns == "sfa")
 }
 
 /// Create one worktree from `clone` off `origin/<upstream>` at
@@ -146,7 +195,7 @@ fn create_one(
     // Logs symlink: <wt>/logs -> /home/logs/<ticket>, only if the source dir
     // exists (worktree.sh convention).
     let logs_src = PathBuf::from("/home/logs").join(ticket);
-    if logs_src.is_dir() {
+    if !ticket.is_empty() && logs_src.is_dir() {
         progress("linking logs…");
         let _ = std::os::unix::fs::symlink(&logs_src, dest.join("logs"));
     }
@@ -181,12 +230,13 @@ pub fn create(
     spec: &WorktreeSpec,
     progress: &dyn Fn(&str),
 ) -> Result<PathBuf> {
-    let ticket = normalize_ticket(&spec.ticket);
+    let clone_dir = projects_root.join(&spec.clone);
+    let ticket = normalize_ticket(&spec.ticket, is_sfa_clone(&clone_dir));
     let desc = sanitize_desc(&spec.description);
     if desc.is_empty() {
         bail!("a short description is required");
     }
-    let upstream = upstream_or_default(&spec.upstream);
+    let upstream = upstream_or_default(&spec.upstream, &clone_dir);
 
     let primary = create_one(
         projects_root,
@@ -229,22 +279,27 @@ mod tests {
 
     #[test]
     fn normalizes_ticket() {
-        assert_eq!(normalize_ticket("123456"), "SFAP-123456"); // bare number
-        assert_eq!(normalize_ticket("sfap-123"), "SFAP-123"); // upcases prefix
-        assert_eq!(normalize_ticket("DDNDO-123"), "DDNDO-123"); // kept
-        assert_eq!(normalize_ticket("  SFAP-9 "), "SFAP-9"); // trimmed
-        assert_eq!(normalize_ticket("weird"), "weird"); // pass-through
+        assert_eq!(normalize_ticket("123456", true), "SFAP-123456"); // bare number
+        assert_eq!(normalize_ticket("sfap-123", true), "SFAP-123"); // upcases prefix
+        assert_eq!(normalize_ticket("DDNDO-123", true), "DDNDO-123"); // kept
+        assert_eq!(normalize_ticket("  SFAP-9 ", true), "SFAP-9"); // trimmed
+        assert_eq!(normalize_ticket("weird", true), "weird"); // pass-through
+                                                              // Off an SFA clone a bare number is not an SFAP ticket (#102).
+        assert_eq!(normalize_ticket("225", false), "225");
+        assert_eq!(normalize_ticket("mlai-225", false), "MLAI-225");
     }
 
     #[test]
-    fn builds_names_and_upstream() {
+    fn builds_names() {
         assert_eq!(
             worktree_name("sfaos", "SFAP-123456", "my_fix"),
             "sfaos-SFAP-123456-my_fix"
         );
-        assert_eq!(upstream_or_default(""), "master");
-        assert_eq!(upstream_or_default("  "), "master");
-        assert_eq!(upstream_or_default("12.9"), "12.9");
+        // No ticket: the segment goes away rather than leaving a double dash.
+        assert_eq!(
+            worktree_name("reservations", "", "my_fix"),
+            "reservations-my_fix"
+        );
     }
 }
 
@@ -478,6 +533,49 @@ mod manager_tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// A clone on `main` must not be told its base branch is `master` (#102),
+    /// including when it has no `origin/HEAD` — the local-refs fallback covers
+    /// mlai, which doesn't. The clone's namespace, not its host, decides
+    /// whether the SFA ticket conventions apply.
+    #[test]
+    fn default_branch_and_sfa_namespace() {
+        let tmp = std::env::temp_dir().join(format!("cf-wt-default-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (origin, clone) = (tmp.join("origin"), tmp.join("clone"));
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["config", "user.email", "t@t"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        std::fs::write(origin.join("a.txt"), "one\n").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-qm", "first"]);
+        git_in(&tmp, &["clone", "-q", origin.to_str().unwrap(), "clone"]);
+
+        assert_eq!(default_branch(&clone), "main"); // from origin/HEAD
+        git_in(&clone, &["remote", "set-head", "origin", "-d"]);
+        assert_eq!(default_branch(&clone), "main"); // from the tracking refs
+                                                    // An unknown directory can't be probed at all; master stays the floor.
+        assert_eq!(default_branch(&tmp.join("nope")), "master");
+
+        for (url, sfa) in [
+            ("git@github.red.datadirectnet.com:sfa/k8s.git", true),
+            (
+                "ssh://bbell@cos-scm-00.colorado.datadirectnet.com:29418/sfa/qa",
+                true,
+            ),
+            ("git@github.red.datadirectnet.com:ddn/mlai.git", false),
+            (
+                "ssh://git@gitlab.co-es.datadirectnet.com:31031/ddn-tools/stonehenge.git",
+                false,
+            ),
+        ] {
+            git_in(&clone, &["remote", "set-url", "origin", url]);
+            assert_eq!(is_sfa_clone(&clone), sfa, "{url}");
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Work that already landed in mainline under a *different* SHA (rebased,
