@@ -2056,10 +2056,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             PickerAction::Chosen(dir) => {
                                 picker = None;
                                 needs_clear = true;
-                                // Belt and braces: the picker already hides open
-                                // projects, but a typed/stale path could still
-                                // name one. Focus that window rather than open a
-                                // second editor over the same tree (#82).
+                                // The picker lists open projects too (#104), so
+                                // this is the normal path for choosing one, not
+                                // just a stale-path guard: focus that window
+                                // rather than open a second editor over the same
+                                // working tree (#82).
                                 if let Some(i) = window_for_dir(&windows, &dir) {
                                     switch_window(&mut windows, &mut cur, i, &mut use_tick);
                                     dirty = true;
@@ -2747,7 +2748,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         None
                     } else {
                         picker_new_window = false;
-                        Some(Picker::new_excluding(proot.clone(), &open_dirs(&windows)))
+                        Some(Picker::new_with_open(proot.clone(), &open_dirs(&windows)))
                     };
                     dirty = true;
                     needs_clear = true;
@@ -2756,7 +2757,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     exit_copy(&mut copy, &mut windows);
                     help = None;
                     diff = None;
-                    picker = Some(Picker::new_excluding(proot.clone(), &open_dirs(&windows)));
+                    picker = Some(Picker::new_with_open(proot.clone(), &open_dirs(&windows)));
                     picker_new_window = true;
                     dirty = true;
                     needs_clear = true;

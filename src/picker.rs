@@ -32,6 +32,9 @@ pub enum PickerAction {
 pub struct Picker {
     root: PathBuf,
     all: Vec<String>,
+    /// Parallel to `all`: this project already has a window, so choosing it
+    /// jumps there instead of starting a fresh one (#104).
+    open: Vec<bool>,
     filter: String,
     matches: Vec<usize>,
     sel: usize,
@@ -40,18 +43,22 @@ pub struct Picker {
 }
 
 impl Picker {
-    /// List `root`'s projects. `open` are directories already showing in a
-    /// window — they're left out, since a second window on the same directory
-    /// gives two editors over one working tree (#82).
-    pub fn new_excluding(root: PathBuf, open: &[PathBuf]) -> Picker {
-        let mut all: Vec<String> = list_dirs(&root)
-            .into_iter()
-            .filter(|name| !open.iter().any(|d| d == &root.join(name)))
-            .collect();
+    /// List *every* project under `root`. `open` are directories already showing
+    /// in a window; they stay in the list and are marked, because choosing one
+    /// focuses that window rather than opening a second editor over the same
+    /// working tree (#104). Hiding them (#82's first fix) made the list a
+    /// different set every time and left no single "go to project" gesture.
+    pub fn new_with_open(root: PathBuf, open: &[PathBuf]) -> Picker {
+        let mut all: Vec<String> = list_dirs(&root);
         all.sort_by_key(|s| s.to_lowercase());
+        let is_open = all
+            .iter()
+            .map(|name| open.iter().any(|d| d == &root.join(name)))
+            .collect();
         let mut p = Picker {
             root,
             all,
+            open: is_open,
             filter: String::new(),
             matches: Vec::new(),
             sel: 0,
@@ -63,7 +70,7 @@ impl Picker {
 
     /// Every project under `root` — the startup picker, where nothing is open.
     pub fn new(root: PathBuf) -> Picker {
-        Picker::new_excluding(root, &[])
+        Picker::new_with_open(root, &[])
     }
 
     fn refilter(&mut self) {
@@ -289,16 +296,22 @@ impl Picker {
                 ' '
             };
             let marker = if i == self.sel { "❯" } else { " " };
+            let open = self.open[mi];
             if i == self.sel {
                 queue!(
                     out,
                     SetBackgroundColor(Color::Cyan),
                     SetForegroundColor(Color::Black)
                 )?;
+            } else if open {
+                // Dimmed and suffixed: picking this row switches to the window
+                // that already has it, rather than opening another (#104).
+                queue!(out, ResetColor, SetForegroundColor(Color::Grey))?;
             } else {
                 queue!(out, ResetColor, SetForegroundColor(Color::White))?;
             }
-            line(out, row, format!(" {num} {marker} {name}"))?;
+            let tag = if open { " · open" } else { "" };
+            line(out, row, format!(" {num} {marker} {name}{tag}"))?;
             row += 1;
         }
         if visible == 0 {
@@ -341,29 +354,36 @@ fn list_dirs(root: &Path) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod open_filter_tests {
+mod tests {
     use super::*;
 
-    /// Projects that already have a window are left out of the picker, so a
-    /// second window can't be opened over the same working tree (#82).
+    /// Every project stays in the list, open or not — the picker is the one
+    /// "go to project" gesture, and an open one is marked rather than hidden
+    /// (#104). Choosing a marked row focuses its window (`src/main.rs`).
     #[test]
-    fn picker_hides_already_open_projects() {
-        let root = std::env::temp_dir().join(format!("cf-pick-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        for name in ["alpha", "beta", "gamma"] {
-            std::fs::create_dir_all(root.join(name)).unwrap();
+    fn open_projects_are_listed_and_marked() {
+        let tmp = std::env::temp_dir().join(format!("cf-picker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for d in ["alpha", "beta", "gamma"] {
+            std::fs::create_dir_all(tmp.join(d)).unwrap();
         }
+        // A hidden dir and a plain file are never projects.
+        std::fs::create_dir_all(tmp.join(".hidden")).unwrap();
+        std::fs::write(tmp.join("a-file"), "x").unwrap();
 
-        let all = Picker::new(root.clone());
-        assert_eq!(all.all.len(), 3, "startup lists every project");
+        // The startup picker has nothing open and marks nothing.
+        let fresh = Picker::new(tmp.clone());
+        assert_eq!(fresh.all, ["alpha", "beta", "gamma"]);
+        assert_eq!(fresh.open, [false, false, false]);
 
-        let p = Picker::new_excluding(root.clone(), &[root.join("beta")]);
-        assert_eq!(p.all, vec!["alpha".to_string(), "gamma".to_string()]);
-        assert!(
-            !p.all.contains(&"beta".to_string()),
-            "open project is hidden"
-        );
+        let p = Picker::new_with_open(tmp.clone(), &[tmp.join("beta")]);
+        assert_eq!(p.all, ["alpha", "beta", "gamma"]);
+        assert_eq!(p.open, [false, true, false]);
+        // The open one is still selectable, and still filterable by name.
+        let mut p = p;
+        p.input_char('b');
+        assert_eq!(p.selected(), Some(tmp.join("beta")));
 
-        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
