@@ -38,6 +38,12 @@ pub struct Config {
     pub start_editor: bool,
     pub start_terminal: bool,
     pub start_ai: bool,
+    /// How many *recent* window tabs the status bar draws alongside the one
+    /// you're on (#107) — the current window and the pinned Notes tab are
+    /// always drawn and don't count against this. The full list lives in the
+    /// `mod-Tab` switcher, so the bar only has to cover what you're moving
+    /// between. 0 means no cap.
+    pub status_tabs: usize,
     /// Status-bar right side toggles (#16), left-to-right order when shown:
     /// metrics (cpu/ram/disk), weather, date, clock.
     pub status_metrics: bool,
@@ -272,6 +278,7 @@ impl Default for Config {
             start_editor: true,
             start_terminal: true,
             start_ai: true,
+            status_tabs: 5,
             status_metrics: true,
             status_weather: true,
             status_date: true,
@@ -799,6 +806,11 @@ right_ratio  = 0.5   # terminal height fraction of the right column
 
 # Status-bar temperature location (empty "" disables it).
 weather = "Colorado Springs"
+
+# How many recent windows the bottom bar shows *besides* the one you're on (the
+# current window and Notes are always shown). The rest are a "+N" count and live
+# in the mod-Tab switcher. 0 shows every window (#107).
+status_tabs = 5
 
 # Status-bar right side (#16). Shown left-to-right: metrics, weather, date, clock.
 status_metrics = true   # cpu / ram / disk usage

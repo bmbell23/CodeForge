@@ -1028,6 +1028,24 @@ fn tab_order(windows: &[Window], cur: usize) -> Vec<usize> {
     order
 }
 
+/// Trim the tab strip to `max` *recent* windows, returning it with the count
+/// left off (#107). The first `exempt` entries — the pinned Notes tab and the
+/// window you're on — are always drawn and don't count against `max`, so the
+/// bar shows the current window plus `max` others rather than `max` in total.
+/// `tab_order` puts those exempt entries first and the rest most-recent-first,
+/// so taking the front drops the oldest. `max` of 0 means no cap.
+fn capped_tabs(order: Vec<usize>, max: usize, exempt: usize) -> (Vec<usize>, usize) {
+    if max == 0 {
+        return (order, 0);
+    }
+    let keep = exempt.saturating_add(max);
+    if order.len() <= keep {
+        return (order, 0);
+    }
+    let hidden = order.len() - keep;
+    (order.into_iter().take(keep).collect(), hidden)
+}
+
 /// The `mod-N` number shown on each window's tab: `0` for Notes, its recency
 /// position for the rest, and `None` for the current window — pressing a number
 /// to get where you already are is wasted (#77).
@@ -3208,6 +3226,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     wtman.as_ref(),
                     dl,
                     &right_info,
+                    cfg.status_tabs,
                     ksnap,
                     &eksnap,
                     msel.as_ref().map(|m| {
@@ -3846,6 +3865,8 @@ fn render(
     wtman: Option<&WtManager>,
     diff: Option<&DiffList>,
     right_info: &str,
+    // How many window tabs the status bar may draw (#107); 0 = no cap.
+    status_tabs: usize,
     keys: Keys,
     editor_keys: &config::EditorKeys,
     msel: Option<Sel>,
@@ -3907,7 +3928,7 @@ fn render(
         }
     }
 
-    draw_status(out, cols, rows, windows, cur, right_info)?;
+    draw_status(out, cols, rows, windows, cur, right_info, status_tabs)?;
 
     // Position the real cursor inside the focused pane.
     if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == w.focus_id) {
@@ -4667,6 +4688,7 @@ fn draw_status(
     windows: &[Window],
     cur: usize,
     right_info: &str,
+    max_tabs: usize,
 ) -> Result<()> {
     let y = rows.saturating_sub(1);
     // Fill the row so old content is covered.
@@ -4689,7 +4711,13 @@ fn draw_status(
     // The strip itself is ordered by recency (#77): the project you're on sits
     // first with no number, then mod-1, mod-2, … behind it, with Notes (mod-0)
     // pinned to the end. So the tab you'd reach for is always in the same place.
+    // Only the front of the recency order is drawn (#107) — the rest are a
+    // "+N" count, and the full list is a mod-Tab away. The pinned Notes tab and
+    // the current window are always drawn and don't spend the budget, so the
+    // bar is "where you are, plus the last `status_tabs` you were in".
     let order = tab_order(windows, cur);
+    let exempt = order.len() - mru_order(windows, cur).len();
+    let (order, hidden) = capped_tabs(order, max_tabs, exempt);
     let labels: Vec<String> = order
         .iter()
         .map(|&i| match numbers[i] {
@@ -4703,8 +4731,15 @@ fn draw_status(
     } else {
         right_info.chars().count() + 2
     };
+    // The "+N" count is reserved out of the tab budget up front, so it can't be
+    // squeezed off the row by the labels it's counting.
+    let more = if hidden > 0 {
+        format!(" +{hidden} ")
+    } else {
+        String::new()
+    };
     // Leave the final column untouched so nothing triggers an auto-wrap/scroll.
-    let avail = (cols as usize).saturating_sub(rwidth + 1);
+    let avail = (cols as usize).saturating_sub(rwidth + more.chars().count() + 1);
     // Scrolling anchors on wherever the current window landed in the strip
     // (position 1 when Notes is pinned ahead of it).
     let anchor = order.iter().position(|&i| i == cur).unwrap_or(0);
@@ -4754,6 +4789,15 @@ fn draw_status(
             SetBackgroundColor(Color::DarkGrey),
             SetForegroundColor(Color::White),
             Print("›")
+        )?;
+    }
+    // Windows the cap left off, as a count rather than a truncated label.
+    if !more.is_empty() {
+        queue!(
+            out,
+            SetBackgroundColor(Color::DarkGrey),
+            SetForegroundColor(Color::Grey),
+            Print(&more)
         )?;
     }
 
@@ -5808,6 +5852,32 @@ mod tests {
         assert_eq!(fresh_ai_cmd(&mk("claude --continue")), "claude");
         assert_eq!(fresh_ai_cmd(&mk("claude")), "claude");
         assert_eq!(fresh_ai_cmd(&mk("augment")), "augment"); // non-claude as-is
+    }
+
+    /// The bar draws only the front of the recency order (#107). `tab_order`
+    /// puts Notes and the current window there first, so the cap can never hide
+    /// the tab you're on or the one you'd reach for — it drops the oldest.
+    #[test]
+    fn capped_tabs_keeps_the_front_and_counts_the_rest() {
+        let order: Vec<usize> = (0..10).collect();
+        // Current window exempt, 5 recents alongside it: 6 drawn, not 5.
+        assert_eq!(
+            capped_tabs(order.clone(), 5, 1),
+            (vec![0, 1, 2, 3, 4, 5], 4)
+        );
+        // Notes pinned as well: both exempt, still 5 recents behind them.
+        assert_eq!(
+            capped_tabs(order.clone(), 5, 2),
+            (vec![0, 1, 2, 3, 4, 5, 6], 3)
+        );
+        // Under the cap: untouched, nothing hidden.
+        assert_eq!(capped_tabs(vec![0, 1, 2], 5, 1), (vec![0, 1, 2], 0));
+        // Exactly at it is still not truncated.
+        assert_eq!(capped_tabs(vec![0, 1, 2], 2, 1), (vec![0, 1, 2], 0));
+        // 0 disables the cap.
+        assert_eq!(capped_tabs(order.clone(), 0, 1), (order.clone(), 0));
+        // A cap of 0 recents still keeps the exempt front.
+        assert_eq!(capped_tabs(order, 1, 1), (vec![0, 1], 8));
     }
 
     #[test]
