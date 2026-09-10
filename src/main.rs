@@ -5341,8 +5341,13 @@ fn draw_selection(
         let cstart = (if r == sr { sc } else { 0 }).max(gutter);
         let cend = if r == er { ec } else { cols.saturating_sub(1) };
         for c in cstart..=cend.min(cols.min(inner.w).saturating_sub(1)) {
-            let ch = screen
-                .cell(r, c)
+            let cell = screen.cell(r, c);
+            // The glyph's own cell already drew the highlight across both of its
+            // columns; painting a space over the continuation halves it (#106).
+            if cell.as_ref().is_some_and(|c| c.is_wide_continuation()) {
+                continue;
+            }
+            let ch = cell
                 .map(|cell| cell.contents())
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| " ".to_string());
@@ -5448,8 +5453,14 @@ fn draw_copy_overlay(
             if !selected && !on_cur_row {
                 continue;
             }
-            let ch = screen
-                .cell(r, c)
+            let cell = screen.cell(r, c);
+            // Leave the second half of a wide glyph alone: the highlight for it
+            // was already drawn with the glyph, and painting a space here would
+            // chop it in half (#106).
+            if cell.as_ref().is_some_and(|c| c.is_wide_continuation()) {
+                continue;
+            }
+            let ch = cell
                 .map(|cell| cell.contents())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| " ".to_string());
@@ -5672,7 +5683,24 @@ fn blit_pane(out: &mut Vec<u8>, screen: &vt100::Screen, inner: Rect) -> Result<(
         queue!(out, cursor::MoveTo(inner.x, inner.y + row))?;
         for col in 0..inner.w {
             let cell = screen.cell(row, col);
+            // The second half of a wide glyph. The terminal already advanced two
+            // columns when it drew the glyph itself, so anything printed here
+            // pushes the rest of the row one column right — and the tail of the
+            // row lands past the pane's border, on top of the neighbouring pane
+            // (#106). vt100 stores the pair as (glyph, empty continuation);
+            // skipping the continuation is what keeps our columns and the
+            // terminal's in step.
+            if cell.as_ref().is_some_and(|c| c.is_wide_continuation()) {
+                continue;
+            }
             queue!(out, SetAttribute(Attribute::Reset))?;
+            // A wide glyph in the last column has nowhere to put its second
+            // half: drawing it would spill over the border. A space keeps the
+            // row inside the pane — the glyph is clipped, not misplaced.
+            if cell.as_ref().is_some_and(|c| c.is_wide()) && col + 1 >= inner.w {
+                queue!(out, ResetColor, Print(' '))?;
+                continue;
+            }
             if let Some(cell) = cell {
                 if let Some(c) = conv_color(cell.fgcolor()) {
                     queue!(out, SetForegroundColor(c))?;
@@ -5905,6 +5933,76 @@ mod tests {
     /// Closing lands on the `mod-1` project, not on whatever index slid into
     /// the removed slot (#111). `mru_order` indexes the list *before* the
     /// removal, so anything above the closed window shifts down one.
+    /// A wide glyph occupies two columns but vt100 stores it as (glyph, empty
+    /// continuation). Printing something for that continuation pushes the rest
+    /// of the row one column right per glyph, so the tail overruns the pane's
+    /// border and lands on the neighbour — the stale fragments of #106. Replay
+    /// the blit into a wider mirror and check the columns still line up.
+    #[test]
+    fn blit_keeps_columns_aligned_across_wide_glyphs() {
+        let mut pane = vt100::Parser::new(1, 10, 0);
+        pane.process("a\u{1F600}bc".as_bytes());
+        let mut out = Vec::new();
+        blit_pane(
+            &mut out,
+            pane.screen(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 1,
+            },
+        )
+        .unwrap();
+        let mut mirror = vt100::Parser::new(1, 20, 0);
+        mirror.process(&out);
+        let at = |c: u16| {
+            mirror
+                .screen()
+                .cell(0, c)
+                .map(|x| x.contents())
+                .unwrap_or_default()
+        };
+        assert_eq!(at(0), "a");
+        assert_eq!(at(1), "\u{1F600}");
+        // b and c keep their source columns; they used to slide to 4 and 5.
+        assert_eq!(at(3), "b");
+        assert_eq!(at(4), "c");
+        // Nothing is drawn past the rect.
+        assert_eq!(at(10), "");
+
+        // A wide glyph landing in the rect's final column is clipped to a space
+        // rather than spilling its second half over the border. (The pane screen
+        // is wider than the rect here: writing a wide glyph into vt100's own
+        // last column panics inside vt100 0.15.2, so it can't be set up that
+        // way.)
+        let mut edge = vt100::Parser::new(1, 6, 0);
+        edge.process("abc\u{1F600}".as_bytes());
+        let mut out = Vec::new();
+        blit_pane(
+            &mut out,
+            edge.screen(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 4,
+                h: 1,
+            },
+        )
+        .unwrap();
+        let mut mirror = vt100::Parser::new(1, 20, 0);
+        mirror.process(&out);
+        let at = |c: u16| {
+            mirror
+                .screen()
+                .cell(0, c)
+                .map(|x| x.contents())
+                .unwrap_or_default()
+        };
+        assert_eq!(at(3), " ");
+        assert_eq!(at(4), "");
+    }
+
     #[test]
     fn window_after_close_follows_recency() {
         // mod-1 sits above the closed window: its index shifts down one.
