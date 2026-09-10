@@ -990,6 +990,21 @@ fn switch_window(windows: &mut [Window], cur: &mut usize, to: usize, tick: &mut 
     *cur = to;
 }
 
+/// Which window to focus after closing the one at `cur`. `next` is the `mod-1`
+/// window — `mru_order`'s first entry — as a *pre-removal* index, so anything
+/// above the removed slot shifts down one (#111). `None` means recency had no
+/// candidate (only the pinned Notes window survives), which falls back to the
+/// old index clamp. Closing used to always clamp, so you landed on whatever
+/// window slid into the removed slot rather than on the one you were last in.
+fn window_after_close(cur: usize, next: Option<usize>, len_after: usize) -> usize {
+    match next {
+        // `mru_order` never yields `cur`, so `n == cur` is impossible here.
+        Some(n) if n > cur => n - 1,
+        Some(n) => n,
+        None => cur.min(len_after.saturating_sub(1)),
+    }
+}
+
 /// Directories that already have a window, so the picker can leave them out and
 /// callers can focus the existing window instead of opening a duplicate (#82).
 fn open_dirs(windows: &[Window]) -> Vec<PathBuf> {
@@ -2817,6 +2832,13 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     needs_clear = true;
                 }
                 Msg::CloseWindow => {
+                    // Land on the project the status bar numbers `mod-1` — the
+                    // most recently used survivor — rather than whatever window
+                    // slid into the removed slot (#111). Resolved before the
+                    // removal, which shifts every index above `cur` down one.
+                    // No recency stamp here: `switch_window` stamps the window
+                    // being *left*, and this one is being destroyed.
+                    let next = mru_order(&windows, cur).first().copied();
                     for p in &mut windows[cur].panes {
                         p.kill();
                     }
@@ -2827,9 +2849,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         quit = true;
                         break;
                     }
-                    if cur >= windows.len() {
-                        cur = windows.len() - 1;
-                    }
+                    cur = window_after_close(cur, next, windows.len());
                     let (c, r) = size;
                     let area = r.saturating_sub(1);
                     let w = &mut windows[cur];
@@ -5880,6 +5900,24 @@ mod tests {
         assert_eq!(capped_tabs(order.clone(), 0, 1), (order.clone(), 0));
         // A cap of 0 recents still keeps the exempt front.
         assert_eq!(capped_tabs(order, 1, 1), (vec![0, 1], 8));
+    }
+
+    /// Closing lands on the `mod-1` project, not on whatever index slid into
+    /// the removed slot (#111). `mru_order` indexes the list *before* the
+    /// removal, so anything above the closed window shifts down one.
+    #[test]
+    fn window_after_close_follows_recency() {
+        // mod-1 sits above the closed window: its index shifts down one.
+        assert_eq!(window_after_close(1, Some(4), 5), 3);
+        // mod-1 sits below it: unaffected by the removal.
+        assert_eq!(window_after_close(3, Some(1), 5), 1);
+        // Closing the last window, most-recent is the first one.
+        assert_eq!(window_after_close(5, Some(0), 5), 0);
+        // Adjacent above, the common case: 2 closes onto the old 3.
+        assert_eq!(window_after_close(2, Some(3), 4), 2);
+        // No recency candidate (only Notes left): the old index clamp.
+        assert_eq!(window_after_close(2, None, 1), 0);
+        assert_eq!(window_after_close(0, None, 2), 0);
     }
 
     #[test]
