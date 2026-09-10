@@ -275,6 +275,27 @@ end
 -- Close the current Notes note (mod-x); if it's the last buffer, open the fresh
 -- timestamped note CodeForge passes in first, so the Notes window is never left
 -- empty (#70). Called over RPC from forge's tab_close handler.
+-- Close the current buffer, keeping nvim alive (#110). `bprevious | bdelete #`
+-- alone silently no-ops on the last buffer: with nothing else listed, `bprevious`
+-- stays put and `#` is unset or the buffer you're already on, so the delete has
+-- no valid target. Opening an empty buffer first gives it one, so the last tab
+-- closes to a blank editor instead of refusing. Same shape as CF_notes_close
+-- below, which opens a fresh note rather than a blank.
+function _G.CF_close_buffer()
+  local listed = 0
+  for _, b in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.bo[b].buflisted then
+      listed = listed + 1
+    end
+  end
+  if listed > 1 then
+    vim.cmd("silent! bprevious | bdelete #")
+  else
+    vim.cmd("enew")
+    vim.cmd("silent! bdelete #")
+  end
+end
+
 function _G.CF_notes_close(newpath)
   local listed = 0
   for _, b in ipairs(vim.api.nvim_list_bufs()) do

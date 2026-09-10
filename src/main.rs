@@ -224,8 +224,10 @@ fn query_nvim_files(sock: &Path) -> Vec<PathBuf> {
 }
 
 /// Close nvim's current buffer (an editor "tab") over its RPC socket, keeping
-/// the window/nvim alive. `bp|bd#` switches to the previous buffer then deletes
-/// the one we left; `silent!` swallows the last-buffer case. Best-effort.
+/// the window/nvim alive. The buffer juggling lives in `CF_close_buffer`, which
+/// handles the last-buffer case by opening a blank first — inline `bp|bd#`
+/// silently did nothing there, so the final tab couldn't be closed (#110).
+/// Best-effort: a missing socket or an nvim without the helper is a no-op.
 fn nvim_close_buffer(sock: &Path) {
     if !sock.exists() {
         return;
@@ -236,7 +238,7 @@ fn nvim_close_buffer(sock: &Path) {
         .arg("--server")
         .arg(sock)
         .arg("--remote-expr")
-        .arg("execute('silent! bp|bd#')")
+        .arg("v:lua.CF_close_buffer()")
         .output();
 }
 
