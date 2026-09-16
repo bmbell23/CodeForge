@@ -1863,15 +1863,46 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         relayout(&mut w.panes, &w.layout, size.0, size.1.saturating_sub(1))?;
     }
 
-    while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
+    // A frame that's due but deliberately not drawn yet (#115), and when the
+    // last one went out. `carry_dirty` guarantees a coalesced burst still ends
+    // in a repaint: the wait below wakes us even if no further message arrives.
+    let mut carry_dirty = false;
+    // A deferred frame must not lose its clear: the respawn path sets
+    // `needs_clear` on any pass, including one we're about to hold back, and a
+    // repaint without it would leave the stale cells the clear was for.
+    let mut carry_clear = false;
+    let mut last_render = Instant::now();
+    loop {
+        let first = if carry_dirty {
+            match frame_delay(last_render, Instant::now(), FRAME_BUDGET) {
+                // Still inside the budget: wait out the remainder, but take a
+                // message if one shows up first so it joins this frame.
+                Some(wait) => match rx.recv_timeout(wait) {
+                    Ok(m) => Some(m),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                },
+                // Budget elapsed: draw the pending frame on this pass.
+                None => None,
+            }
+        } else {
+            // Nothing pending: block, so an idle session costs nothing.
+            match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => break,
+            }
+        };
+        let mut batch: Vec<Msg> = first.into_iter().collect();
         while let Ok(m) = rx.try_recv() {
             batch.push(m);
         }
+        // Anything that isn't pane output is a reaction to the user, and those
+        // must not wait on the frame budget.
+        let interactive = batch.iter().any(|m| !matches!(m, Msg::Output(..)));
 
-        let mut dirty = false;
+        let mut dirty = carry_dirty;
         let mut quit = false;
-        let mut needs_clear = false;
+        let mut needs_clear = carry_clear;
         for msg in batch {
             match msg {
                 Msg::Output(id, bytes) => {
@@ -1884,9 +1915,15 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         }
                     }
                     for (wi, w) in windows.iter_mut().enumerate() {
+                        // A background tab still gets fed — its parser has to
+                        // stay current — but it can't be seen, so it has no
+                        // business forcing a repaint (#115). `leaf_exists` is
+                        // exactly "in the current layout": the active child of a
+                        // visible slot.
+                        let visible = wi == cur && leaf_exists(&w.layout, id);
                         if let Some(p) = w.panes.iter_mut().find(|p| p.id == id) {
                             p.feed(&bytes);
-                            if wi == cur {
+                            if visible {
                                 dirty = true;
                             }
                             break;
@@ -3176,7 +3213,19 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
             }
         }
 
+        // Output-only frames are paced; anything the user did draws immediately.
+        // Holding one back sets `carry_dirty`, and the wait at the top of the
+        // loop brings us back to draw it even if the pane goes quiet.
+        if dirty && !interactive && frame_delay(last_render, Instant::now(), FRAME_BUDGET).is_some()
+        {
+            carry_dirty = true;
+            carry_clear = needs_clear;
+            continue;
+        }
+        carry_dirty = false;
+        carry_clear = false;
         if dirty {
+            last_render = Instant::now();
             if let Some(cl) = client.as_mut() {
                 let now = chrono::Local::now();
                 // Right side, left-to-right: metrics, weather, date, clock — each
@@ -5691,6 +5740,21 @@ fn draw_help(
     Ok(())
 }
 
+/// How long output-driven frames are coalesced for (#115). A chatty pane can
+/// emit hundreds of messages a second and each one used to force a full
+/// repaint; 60fps is well past what reading output needs. Interactive frames
+/// (keystrokes, resize, overlays) ignore this entirely — echo has to feel
+/// instant — so it only ever throttles a pane talking to itself.
+const FRAME_BUDGET: Duration = Duration::from_millis(16);
+
+/// How long to wait before drawing a frame that's already pending, given when
+/// the last one went out. `None` means the budget has elapsed: draw now.
+/// Separated from the event loop so the pacing can be tested without a TTY.
+fn frame_delay(last_render: Instant, now: Instant, budget: Duration) -> Option<Duration> {
+    let since = now.saturating_duration_since(last_render);
+    (since < budget).then(|| budget - since)
+}
+
 /// The SGR state a cell wants, so consecutive cells that agree can be printed
 /// without re-sending it (#114). `fg`/`bg` of `None` mean the terminal default.
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -6133,6 +6197,40 @@ mod tests {
                 assert_eq!(got.inverse(), want.inverse(), "{at} inverse");
             }
         }
+    }
+
+    /// Output-driven frames are coalesced to the budget, but a burst must still
+    /// end in a repaint and an idle session must still block (#115).
+    #[test]
+    fn frame_delay_paces_without_dropping_the_last_frame() {
+        let budget = Duration::from_millis(16);
+        let t0 = Instant::now();
+        // Just rendered: a frame arriving now waits out the remainder.
+        assert_eq!(
+            frame_delay(t0, t0, budget),
+            Some(budget),
+            "immediately after a render, wait the whole budget"
+        );
+        let mid = t0 + Duration::from_millis(6);
+        assert_eq!(
+            frame_delay(t0, mid, budget),
+            Some(Duration::from_millis(10)),
+            "part way through, wait only the remainder"
+        );
+        // Budget elapsed (and beyond): draw now, never a negative wait.
+        assert_eq!(frame_delay(t0, t0 + budget, budget), None, "exactly due");
+        assert_eq!(
+            frame_delay(t0, t0 + Duration::from_millis(500), budget),
+            None,
+            "long overdue"
+        );
+        // A clock that appears to go backwards must not underflow into a
+        // enormous wait; saturating_duration_since keeps it at "draw now".
+        assert_eq!(
+            frame_delay(t0 + Duration::from_millis(50), t0, budget),
+            Some(budget),
+            "last render in the future still waits at most the budget"
+        );
     }
 
     #[test]
