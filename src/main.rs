@@ -5691,8 +5691,92 @@ fn draw_help(
     Ok(())
 }
 
+/// The SGR state a cell wants, so consecutive cells that agree can be printed
+/// without re-sending it (#114). `fg`/`bg` of `None` mean the terminal default.
+#[derive(Clone, Copy, PartialEq, Default)]
+struct CellStyle {
+    fg: Option<Color>,
+    bg: Option<Color>,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+impl CellStyle {
+    fn of(cell: &vt100::Cell) -> CellStyle {
+        CellStyle {
+            fg: conv_color(cell.fgcolor()),
+            bg: conv_color(cell.bgcolor()),
+            bold: cell.bold(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        }
+    }
+
+    /// Whether going from `self` to `next` has to clear something. SGR can turn
+    /// attributes on individually but there's no cheap per-attribute "off", so
+    /// any attribute or colour being dropped costs a full reset.
+    fn needs_reset(self, next: CellStyle) -> bool {
+        (self.bold && !next.bold)
+            || (self.italic && !next.italic)
+            || (self.underline && !next.underline)
+            || (self.inverse && !next.inverse)
+            || (self.fg.is_some() && next.fg != self.fg)
+            || (self.bg.is_some() && next.bg != self.bg)
+    }
+}
+
+/// Emit the SGR needed to move the output stream from `cur` to `want`, updating
+/// `cur`. Writing every cell's full attribute set cost ~5 bytes per cell of
+/// plain text and the mirror re-parsed all of it, so a frame of ordinary text
+/// was ~38KB (#114).
+fn apply_style(out: &mut Vec<u8>, cur: &mut CellStyle, want: CellStyle) -> Result<()> {
+    if *cur == want {
+        return Ok(());
+    }
+    if cur.needs_reset(want) {
+        queue!(out, SetAttribute(Attribute::Reset))?;
+        *cur = CellStyle::default();
+        if *cur == want {
+            return Ok(());
+        }
+    }
+    if want.fg != cur.fg {
+        if let Some(c) = want.fg {
+            queue!(out, SetForegroundColor(c))?;
+        }
+    }
+    if want.bg != cur.bg {
+        if let Some(c) = want.bg {
+            queue!(out, SetBackgroundColor(c))?;
+        }
+    }
+    if want.bold && !cur.bold {
+        queue!(out, SetAttribute(Attribute::Bold))?;
+    }
+    if want.italic && !cur.italic {
+        queue!(out, SetAttribute(Attribute::Italic))?;
+    }
+    if want.underline && !cur.underline {
+        queue!(out, SetAttribute(Attribute::Underlined))?;
+    }
+    if want.inverse && !cur.inverse {
+        queue!(out, SetAttribute(Attribute::Reverse))?;
+    }
+    *cur = want;
+    Ok(())
+}
+
 /// Blit one emulator screen into `inner`, cell by cell, preserving attributes.
+/// Attributes are sent only where they change from the previous cell (#114);
+/// the stream's current state is tracked across rows, since a `MoveTo` doesn't
+/// disturb SGR.
 fn blit_pane(out: &mut Vec<u8>, screen: &vt100::Screen, inner: Rect) -> Result<()> {
+    // Callers reset before blitting, so the stream starts at the default.
+    queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+    let mut cur = CellStyle::default();
     for row in 0..inner.h {
         queue!(out, cursor::MoveTo(inner.x, inner.y + row))?;
         for col in 0..inner.w {
@@ -5707,41 +5791,29 @@ fn blit_pane(out: &mut Vec<u8>, screen: &vt100::Screen, inner: Rect) -> Result<(
             if cell.as_ref().is_some_and(|c| c.is_wide_continuation()) {
                 continue;
             }
-            queue!(out, SetAttribute(Attribute::Reset))?;
             // A wide glyph in the last column has nowhere to put its second
             // half: drawing it would spill over the border. A space keeps the
             // row inside the pane — the glyph is clipped, not misplaced.
             if cell.as_ref().is_some_and(|c| c.is_wide()) && col + 1 >= inner.w {
-                queue!(out, ResetColor, Print(' '))?;
+                apply_style(out, &mut cur, CellStyle::default())?;
+                queue!(out, Print(' '))?;
                 continue;
             }
-            if let Some(cell) = cell {
-                if let Some(c) = conv_color(cell.fgcolor()) {
-                    queue!(out, SetForegroundColor(c))?;
+            match cell {
+                Some(cell) => {
+                    apply_style(out, &mut cur, CellStyle::of(cell))?;
+                    let contents = cell.contents();
+                    if contents.is_empty() {
+                        queue!(out, Print(' '))?;
+                    } else {
+                        queue!(out, Print(contents))?;
+                    }
                 }
-                if let Some(c) = conv_color(cell.bgcolor()) {
-                    queue!(out, SetBackgroundColor(c))?;
-                }
-                if cell.bold() {
-                    queue!(out, SetAttribute(Attribute::Bold))?;
-                }
-                if cell.italic() {
-                    queue!(out, SetAttribute(Attribute::Italic))?;
-                }
-                if cell.underline() {
-                    queue!(out, SetAttribute(Attribute::Underlined))?;
-                }
-                if cell.inverse() {
-                    queue!(out, SetAttribute(Attribute::Reverse))?;
-                }
-                let contents = cell.contents();
-                if contents.is_empty() {
+                // Past the end of the pane's own screen: blank, unstyled.
+                None => {
+                    apply_style(out, &mut cur, CellStyle::default())?;
                     queue!(out, Print(' '))?;
-                } else {
-                    queue!(out, Print(contents))?;
                 }
-            } else {
-                queue!(out, Print(' '))?;
             }
         }
     }
@@ -6015,6 +6087,52 @@ mod tests {
         };
         assert_eq!(at(3), " ");
         assert_eq!(at(4), "");
+    }
+
+    /// Attributes are now sent only where they change (#114), so the blit has
+    /// to be checked for fidelity, not just for characters: replay it through a
+    /// mirror and compare every cell's colours and attributes against the
+    /// source. A missed reset would bleed styling into the cells that follow.
+    #[test]
+    fn blit_reproduces_every_cell_style() {
+        let (rows, cols) = (4u16, 24u16);
+        let mut pane = vt100::Parser::new(rows, cols, 0);
+        // Colour on, bold on top of it, back to plain, then inverse and
+        // underline — each transition is a different branch of apply_style.
+        pane.process(b"\x1b[31mred\x1b[1mboldred\x1b[0mplain\r\n");
+        pane.process(b"\x1b[7minverse\x1b[0m \x1b[4munder\x1b[0m\r\n");
+        pane.process(b"\x1b[44mbg\x1b[0m \x1b[32;1mgb\x1b[0m plain\r\n");
+        let mut out = Vec::new();
+        blit_pane(
+            &mut out,
+            pane.screen(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: cols,
+                h: rows,
+            },
+        )
+        .unwrap();
+        let mut mirror = vt100::Parser::new(rows, cols, 0);
+        mirror.process(&out);
+        for r in 0..rows {
+            for c in 0..cols {
+                let want = pane.screen().cell(r, c).unwrap();
+                let got = mirror.screen().cell(r, c).unwrap();
+                let at = format!("cell ({r},{c})");
+                // An untouched cell reads as "" from vt100 but is blitted as a
+                // space; that's long-standing behaviour, not a style question.
+                let norm = |t: String| if t.is_empty() { " ".to_string() } else { t };
+                assert_eq!(norm(got.contents()), norm(want.contents()), "{at} contents");
+                assert_eq!(got.fgcolor(), want.fgcolor(), "{at} fg");
+                assert_eq!(got.bgcolor(), want.bgcolor(), "{at} bg");
+                assert_eq!(got.bold(), want.bold(), "{at} bold");
+                assert_eq!(got.italic(), want.italic(), "{at} italic");
+                assert_eq!(got.underline(), want.underline(), "{at} underline");
+                assert_eq!(got.inverse(), want.inverse(), "{at} inverse");
+            }
+        }
     }
 
     #[test]
