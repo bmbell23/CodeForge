@@ -3428,9 +3428,10 @@ fn relayout(panes: &mut [Pane], layout: &Layout, cols: u16, rows: u16) -> Result
 }
 
 /// Parse a kitty key event's parameters (`code[:shifted:base][;mods[:type]]`,
-/// #67) into `(code, ctrl, alt)`. Shift is ignored: the terminal already sends
-/// the shifted code point, so the modifier adds nothing we act on.
-fn parse_key_event(params: &[u8]) -> Option<(u32, bool, bool)> {
+/// #67) into `(code, ctrl, alt, shift)`. Shift matters only where it changes the
+/// legacy encoding — for a printable key the terminal already sends the shifted
+/// code point, but Shift-Tab is its own sequence (#100).
+fn parse_key_event(params: &[u8]) -> Option<(u32, bool, bool, bool)> {
     let s = std::str::from_utf8(params).ok()?;
     let mut fields = s.split(';');
     // Sub-parameters after `:` describe alternate keys we don't use.
@@ -3443,7 +3444,12 @@ fn parse_key_event(params: &[u8]) -> Option<(u32, bool, bool)> {
         .and_then(|m| m.parse::<u32>().ok())
         .unwrap_or(1)
         .saturating_sub(1);
-    Some((code, mods & 0b100 != 0, mods & 0b010 != 0))
+    Some((
+        code,
+        mods & 0b100 != 0,
+        mods & 0b010 != 0,
+        mods & 0b001 != 0,
+    ))
 }
 
 /// Whether a modified-arrow parameter (`1;<mods>`) carries modifiers beyond the
@@ -3470,11 +3476,19 @@ fn exotic_modifier(params: &[u8]) -> bool {
 /// would have sent, so panes see exactly what they always have (#67). Empty when
 /// there's no legacy encoding (Ctrl-Space is NUL, which is why it can be a
 /// prefix in the first place).
-fn legacy_bytes(code: u32, ctrl: bool, alt: bool) -> Vec<u8> {
+fn legacy_bytes(code: u32, ctrl: bool, alt: bool, shift: bool) -> Vec<u8> {
     let mut out = Vec::new();
     // Alt is the classic ESC prefix.
     if alt {
         out.push(0x1b);
+    }
+    // Shift-Tab is the one key where shift picks a different sequence rather
+    // than a different code point: its legacy form is CSI Z (back-tab), not a
+    // tab byte. Dropping the shift here sent panes a plain Tab, which is why
+    // Shift-Tab couldn't cycle the Claude CLI's permission mode (#100).
+    if shift && code == 9 && !ctrl {
+        out.extend_from_slice(b"\x1b[Z");
+        return out;
     }
     match (ctrl, char::from_u32(code)) {
         // Ctrl masks bits 6/7, and only over the ASCII range that maps onto a
@@ -3657,13 +3671,13 @@ impl InputParser {
             self.prefix_pending = false;
             return;
         };
-        let (mut code, ctrl, alt) = ev;
+        let (mut code, ctrl, alt, shift) = ev;
         // Some terminals report Ctrl-Space as NUL rather than Space+ctrl; they
         // mean the same keypress.
         if ctrl && code == 0 {
             code = 32;
         }
-        let bytes = legacy_bytes(code, ctrl, alt);
+        let bytes = legacy_bytes(code, ctrl, alt, shift);
         // The fallback prefix must work in *every* encoding, not just as a raw
         // byte: with the protocol on, this terminal reports Ctrl-a as a key
         // event too, and passing it to the pane left no way to drive the
@@ -3677,7 +3691,7 @@ impl InputParser {
             // matching the byte path).
             if matches!(self.state, InState::Prefix) && !self.prefix_pending {
                 self.passthrough
-                    .extend_from_slice(&legacy_bytes(code, ctrl, alt));
+                    .extend_from_slice(&legacy_bytes(code, ctrl, alt, shift));
                 self.state = InState::Normal;
             } else {
                 self.prefix_pending = false;
@@ -6161,12 +6175,27 @@ mod tests {
     fn key_events_reach_panes_as_legacy_bytes() {
         // Panes don't speak the protocol, so every non-prefix event is
         // re-encoded to what a plain terminal would have sent (#67).
-        assert_eq!(legacy_bytes(27, false, false), vec![0x1b], "Esc");
-        assert_eq!(legacy_bytes(97, false, false), b"a".to_vec());
-        assert_eq!(legacy_bytes(97, true, false), vec![0x01], "Ctrl-a");
-        assert_eq!(legacy_bytes(97, false, true), vec![0x1b, b'a'], "Alt-a");
+        assert_eq!(legacy_bytes(27, false, false, false), vec![0x1b], "Esc");
+        assert_eq!(legacy_bytes(97, false, false, false), b"a".to_vec());
+        assert_eq!(legacy_bytes(97, true, false, false), vec![0x01], "Ctrl-a");
+        assert_eq!(
+            legacy_bytes(97, false, true, false),
+            vec![0x1b, b'a'],
+            "Alt-a"
+        );
+        // Shift-Tab is back-tab (CSI Z), not a tab byte — the Claude CLI reads
+        // it to cycle permission mode (#100). Plain Tab is untouched, and a
+        // shifted printable key still rides its own code point.
+        assert_eq!(legacy_bytes(9, false, false, false), vec![b'\t'], "Tab");
+        assert_eq!(legacy_bytes(9, false, false, true), b"\x1b[Z".to_vec());
+        assert_eq!(
+            legacy_bytes(9, false, true, true),
+            b"\x1b\x1b[Z".to_vec(),
+            "Alt-Shift-Tab keeps the Alt escape prefix"
+        );
+        assert_eq!(legacy_bytes(65, false, false, true), b"A".to_vec());
         assert!(
-            legacy_bytes(32, true, false).is_empty(),
+            legacy_bytes(32, true, false, false).is_empty(),
             "Ctrl-Space is NUL"
         );
 
@@ -6184,10 +6213,19 @@ mod tests {
 
     #[test]
     fn parses_key_event_params() {
-        assert_eq!(parse_key_event(b"32;5"), Some((32, true, false)));
-        assert_eq!(parse_key_event(b"27"), Some((27, false, false)), "no mods");
+        assert_eq!(parse_key_event(b"32;5"), Some((32, true, false, false)));
+        assert_eq!(
+            parse_key_event(b"27"),
+            Some((27, false, false, false)),
+            "no mods"
+        );
+        // mods is a bitmask + 1, so 2 is shift alone: Shift-Tab (#100).
+        assert_eq!(parse_key_event(b"9;2"), Some((9, false, false, true)));
         // Sub-parameters (alternate keys, event type) are ignored.
-        assert_eq!(parse_key_event(b"97:65;3:1"), Some((97, false, true)));
+        assert_eq!(
+            parse_key_event(b"97:65;3:1"),
+            Some((97, false, true, false))
+        );
         assert_eq!(parse_key_event(b"junk"), None);
     }
 
