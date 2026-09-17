@@ -3456,7 +3456,32 @@ fn leaf_exists(layout: &Layout, id: usize) -> bool {
     ls.contains(&id)
 }
 
-/// Resize every pane's PTY to match its current rectangle.
+/// Every pane that should be resized, and to what. The layout only names the
+/// *active* child of each slot, but a slot's background tabs have to track the
+/// same geometry: left at a stale size they keep drawing at the old width, and
+/// vt100 doesn't reflow, so switching to one showed rows wrapped for a window
+/// size that no longer exists (#119).
+///
+/// `roles` is every pane as `(id, role)`; `rects` is what the layout produced.
+/// A role the layout doesn't mention is a hidden slot, and its panes are left
+/// alone. Split out of `relayout` so the fan-out is testable without a PTY.
+fn resize_targets(roles: &[(usize, PaneRole)], rects: &[(usize, Rect)]) -> Vec<(usize, Rect)> {
+    let mut out = Vec::new();
+    for (id, rect) in rects {
+        let Some((_, role)) = roles.iter().find(|(pid, _)| pid == id) else {
+            continue;
+        };
+        for (pid, prole) in roles {
+            if prole == role {
+                out.push((*pid, *rect));
+            }
+        }
+    }
+    out
+}
+
+/// Resize every pane's PTY to match its slot's current rectangle — background
+/// tabs included (#119).
 fn relayout(panes: &mut [Pane], layout: &Layout, cols: u16, rows: u16) -> Result<()> {
     let mut rects = Vec::new();
     layout.rects(
@@ -3468,7 +3493,8 @@ fn relayout(panes: &mut [Pane], layout: &Layout, cols: u16, rows: u16) -> Result
         },
         &mut rects,
     );
-    for (id, rect) in rects {
+    let roles: Vec<(usize, PaneRole)> = panes.iter().map(|p| (p.id, p.role)).collect();
+    for (id, rect) in resize_targets(&roles, &rects) {
         if let (Some(inner), Some(p)) = (rect.inner(), panes.iter_mut().find(|p| p.id == id)) {
             p.resize(inner.h, inner.w)?;
         }
@@ -6231,6 +6257,43 @@ mod tests {
             Some(budget),
             "last render in the future still waits at most the budget"
         );
+    }
+
+    /// A slot's background tabs get the same rect as its active child (#119).
+    /// The layout only names the active one, and leaving the rest at a stale
+    /// size is what made a switched-to tab come back mangled.
+    #[test]
+    fn resize_targets_covers_background_tabs() {
+        let r = |w: u16| Rect {
+            x: 0,
+            y: 0,
+            w,
+            h: 10,
+        };
+        // Three shell tabs (1,2,3) with 2 active, one editor (10), one AI (20).
+        let roles = [
+            (1, PaneRole::Shell),
+            (2, PaneRole::Shell),
+            (3, PaneRole::Shell),
+            (10, PaneRole::Editor),
+            (20, PaneRole::Ai),
+        ];
+        let rects = [(2, r(40)), (10, r(80))];
+        let got = resize_targets(&roles, &rects);
+        let ids: Vec<usize> = got.iter().map(|(id, _)| *id).collect();
+        // Every shell tab picks up the active shell's rect...
+        assert_eq!(ids, vec![1, 2, 3, 10]);
+        for (id, rect) in &got {
+            let want = if *id == 10 { 80 } else { 40 };
+            assert_eq!(rect.w, want, "pane {id}");
+        }
+        // ...and the hidden AI slot, which the layout doesn't mention, is left
+        // alone rather than resized to something arbitrary.
+        assert!(!ids.contains(&20));
+
+        // A layout naming a pane that no longer exists is skipped, not panicked
+        // on — panes are removed while messages for them may still be in flight.
+        assert!(resize_targets(&roles, &[(99, r(10))]).is_empty());
     }
 
     #[test]
