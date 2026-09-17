@@ -1972,10 +1972,19 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 // render, so leave rather than show an empty shell.
                                 quit = true;
                             }
+                            // Drop the deleted rows in place. Rebuilding the
+                            // manager here re-ran a `git fetch` classification
+                            // for every surviving worktree, which a delete can't
+                            // have invalidated (#118).
+                            let gone: Vec<PathBuf> = doomed
+                                .iter()
+                                .filter(|e| !failures.iter().any(|f| f.starts_with(&e.name)))
+                                .map(|e| e.path.clone())
+                                .collect();
                             let m = wtman.get_or_insert_with(|| WtManager::new(&proot, &tx));
-                            *m = WtManager::new(&proot, &tx);
+                            m.remove_paths(&gone);
                             m.note = Some(if failures.is_empty() {
-                                format!("deleted {}", doomed.len())
+                                format!("deleted {}", gone.len())
                             } else {
                                 failures.join("; ")
                             });
@@ -4276,6 +4285,9 @@ struct WtManager {
     sel: usize,
     /// How many classifications are still running, for the "updating…" line.
     pending: usize,
+    /// Rows picked out for a batch delete, by path — indices shift as entries
+    /// are removed, paths don't (#118).
+    marked: Vec<PathBuf>,
     /// Confirmation in progress: what would be deleted, and what's typed so far.
     confirm: Option<(WtTarget, String)>,
     /// Result of the last delete, shown in the footer.
@@ -4286,6 +4298,7 @@ struct WtManager {
 #[derive(Clone)]
 enum WtTarget {
     One(usize),
+    Marked,
     AllClean,
 }
 
@@ -4306,9 +4319,55 @@ impl WtManager {
             pending: entries.len(),
             entries,
             sel: 0,
+            marked: Vec::new(),
             confirm: None,
             note: None,
         }
+    }
+
+    /// Drop the deleted rows and keep everything else — including the
+    /// classifications already paid for. Rebuilding the manager after each
+    /// delete re-ran a `git fetch` per surviving worktree, for a delete that
+    /// can't have changed any of their states (#118).
+    fn remove_paths(&mut self, gone: &[PathBuf]) {
+        self.entries.retain(|e| !gone.contains(&e.path));
+        self.marked.retain(|p| !gone.contains(p));
+        self.sel = self.sel.min(self.entries.len().saturating_sub(1));
+    }
+
+    /// Toggle the mark on a row. Only a deletable row can be marked, so a batch
+    /// can never be a way to sweep a dirty worktree in alongside clean ones.
+    fn toggle_mark(&mut self, i: usize) {
+        let Some(e) = self.entries.get(i) else { return };
+        if !e.deletable() {
+            self.note = Some("only clean worktrees can be deleted".into());
+            return;
+        }
+        let path = e.path.clone();
+        if let Some(pos) = self.marked.iter().position(|p| *p == path) {
+            self.marked.remove(pos);
+        } else {
+            self.marked.push(path);
+        }
+    }
+
+    /// The entries a confirmed target resolves to. `deletable()` is re-checked
+    /// here rather than trusted from mark time: a classification can land in
+    /// between, and this is the last gate before an irreversible delete.
+    fn doomed(&self, target: &WtTarget) -> Vec<worktree::WtEntry> {
+        let pick: Vec<&worktree::WtEntry> = match target {
+            WtTarget::One(i) => self.entries.get(*i).into_iter().collect(),
+            WtTarget::Marked => self
+                .entries
+                .iter()
+                .filter(|e| self.marked.contains(&e.path))
+                .collect(),
+            WtTarget::AllClean => self.entries.iter().filter(|e| e.deletable()).collect(),
+        };
+        pick.into_iter()
+            .filter(|e| e.deletable())
+            .cloned()
+            .collect()
     }
 
     /// Record a finished classification.
@@ -4340,19 +4399,14 @@ impl WtManager {
             match b {
                 0x1b | 0x03 => self.confirm = None,
                 b'\r' | b'\n' => {
-                    if typed == "DELETE" {
+                    // Case-insensitive: the point of typing the word is
+                    // deliberateness, not spelling (#118).
+                    if typed.trim().eq_ignore_ascii_case("delete") {
                         let target = target.clone();
                         self.confirm = None;
-                        return match target {
-                            WtTarget::One(i) => self.entries.get(i).cloned().into_iter().collect(),
-                            WtTarget::AllClean => self
-                                .clean_indices()
-                                .into_iter()
-                                .filter_map(|i| self.entries.get(i).cloned())
-                                .collect(),
-                        };
+                        return self.doomed(&target);
                     }
-                    self.note = Some("type DELETE exactly to confirm".into());
+                    self.note = Some("type \"delete\" to confirm".into());
                 }
                 0x7f | 0x08 => {
                     typed.pop();
@@ -4366,6 +4420,12 @@ impl WtManager {
             0x1b | 0x03 | b'q' => *done = true,
             b'j' => self.step(1),
             b'k' => self.step(-1),
+            // Space marks rows for a batch; `d` then takes the marked set if
+            // there is one, and the row under the cursor otherwise (#118).
+            b' ' => self.toggle_mark(self.sel),
+            b'd' if !self.marked.is_empty() => {
+                self.confirm = Some((WtTarget::Marked, String::new()))
+            }
             b'd' => match self.entries.get(self.sel) {
                 Some(e) if e.deletable() => {
                     self.confirm = Some((WtTarget::One(self.sel), String::new()))
@@ -4402,7 +4462,13 @@ impl WtManager {
         };
         let hint = match &self.note {
             Some(n) => format!(" {n} "),
-            None => " j/k move · d delete · a delete all clean · Esc close ".to_string(),
+            None if !self.marked.is_empty() => {
+                format!(
+                    " {} marked · d delete them · space unmark · Esc ",
+                    self.marked.len()
+                )
+            }
+            None => " j/k move · space mark · d delete · a all clean · Esc ".to_string(),
         };
         let widest = self
             .entries
@@ -4476,7 +4542,15 @@ impl WtManager {
                 worktree::WtState::Error(why) => format!("  ({why})"),
                 _ => String::new(),
             };
-            queue!(out, Print(pad(&format!(" {label} {}{reason}", e.name))))?;
+            let mark = if self.marked.contains(&e.path) {
+                "✓"
+            } else {
+                " "
+            };
+            queue!(
+                out,
+                Print(pad(&format!("{mark}{label} {}{reason}", e.name)))
+            )?;
             queue!(out, ResetColor, SetForegroundColor(Color::Cyan), Print("│"))?;
             row = i as u16 + 1;
         }
@@ -4509,19 +4583,9 @@ impl WtManager {
         target: &WtTarget,
         typed: &str,
     ) -> Result<()> {
-        let names: Vec<String> = match target {
-            WtTarget::One(i) => self
-                .entries
-                .get(*i)
-                .map(|e| e.name.clone())
-                .into_iter()
-                .collect(),
-            WtTarget::AllClean => self
-                .clean_indices()
-                .into_iter()
-                .map(|i| self.entries[i].name.clone())
-                .collect(),
-        };
+        // Exactly what the confirmation will act on — `doomed` is the same
+        // function the delete uses, so the list can't disagree with the deed.
+        let names: Vec<String> = self.doomed(target).iter().map(|e| e.name.clone()).collect();
         let mut lines: Vec<String> = vec![
             format!(" DELETE {} worktree(s):", names.len()),
             String::new(),
@@ -4531,7 +4595,7 @@ impl WtManager {
         lines.push(" removes the worktree, its branch, and its".to_string());
         lines.push(" directory. This cannot be undone.".to_string());
         lines.push(String::new());
-        lines.push(format!(" type DELETE to confirm: {typed}▏"));
+        lines.push(format!(" type \"delete\" to confirm: {typed}▏"));
         let iw = lines
             .iter()
             .map(|l| l.chars().count())
@@ -6294,6 +6358,87 @@ mod tests {
         // A layout naming a pane that no longer exists is skipped, not panicked
         // on — panes are removed while messages for them may still be in flight.
         assert!(resize_targets(&roles, &[(99, r(10))]).is_empty());
+    }
+
+    /// The worktree manager's batch rules (#118). Deletion is irreversible, so
+    /// the interesting assertions are the refusals: a dirty row can't be marked,
+    /// and a row that goes dirty after being marked is dropped from the batch
+    /// rather than deleted anyway.
+    #[test]
+    fn worktree_manager_marks_confirms_and_prunes() {
+        use worktree::{WtEntry, WtState};
+        let entry = |n: &str, state| WtEntry {
+            name: n.to_string(),
+            path: PathBuf::from("/p").join(n),
+            state,
+        };
+        let mut m = WtManager {
+            entries: vec![
+                entry("a", WtState::Clean),
+                entry("b", WtState::Dirty),
+                entry("c", WtState::Clean),
+            ],
+            sel: 0,
+            pending: 0,
+            marked: Vec::new(),
+            confirm: None,
+            note: None,
+        };
+
+        // Only deletable rows mark; the dirty one is refused and says why.
+        m.toggle_mark(0);
+        m.toggle_mark(1);
+        assert_eq!(m.marked, vec![PathBuf::from("/p/a")]);
+        assert!(m.note.as_deref().unwrap().contains("only clean"));
+        m.toggle_mark(2);
+        assert_eq!(m.marked.len(), 2);
+        m.toggle_mark(2); // toggles back off
+        assert_eq!(m.marked, vec![PathBuf::from("/p/a")]);
+
+        // `d` with marks targets the marked set, not the cursor row.
+        let mut done = false;
+        m.sel = 2;
+        assert!(m.feed(b'd', &mut done).is_empty(), "opens a confirmation");
+        assert!(matches!(m.confirm, Some((WtTarget::Marked, _))));
+
+        // The confirmation is case-insensitive, but still has to be the word.
+        for b in b"nope" {
+            m.feed(*b, &mut done);
+        }
+        assert!(m.feed(b'\r', &mut done).is_empty(), "wrong word refused");
+        assert!(m.confirm.is_some(), "confirmation stays up");
+        for _ in 0..4 {
+            m.feed(0x7f, &mut done);
+        }
+        for b in b"delete" {
+            m.feed(*b, &mut done);
+        }
+        let doomed = m.feed(b'\r', &mut done);
+        assert_eq!(doomed.len(), 1);
+        assert_eq!(doomed[0].name, "a");
+        assert!(m.confirm.is_none());
+
+        // A row marked while clean that turns dirty before the delete lands is
+        // dropped from the batch — `deletable()` is re-checked at execution.
+        m.marked = vec![PathBuf::from("/p/a"), PathBuf::from("/p/c")];
+        m.entries[2].state = WtState::Dirty;
+        let doomed = m.doomed(&WtTarget::Marked);
+        assert_eq!(doomed.len(), 1);
+        assert_eq!(doomed[0].name, "a");
+
+        // Removing deleted rows keeps the survivors' states and the selection in
+        // range, instead of rebuilding and re-fetching the whole list.
+        m.sel = 2;
+        m.remove_paths(&[PathBuf::from("/p/a")]);
+        assert_eq!(m.entries.len(), 2);
+        assert_eq!(m.entries[0].name, "b");
+        assert_eq!(m.entries[1].state, WtState::Dirty, "state survives");
+        assert_eq!(m.sel, 1, "selection clamped into range");
+        assert_eq!(
+            m.marked,
+            vec![PathBuf::from("/p/c")],
+            "the deleted row's mark goes; a surviving row keeps its own"
+        );
     }
 
     #[test]
