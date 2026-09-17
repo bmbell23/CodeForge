@@ -1954,12 +1954,24 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             // directory under a live nvim/shell would leave broken
                             // panes writing to a path that no longer exists.
                             if let Some(i) = window_for_dir(&windows, &e.path) {
+                                // Deleting the worktree you're standing in is now
+                                // the common case (#120), so landing has to follow
+                                // the same rule as a normal close: the `mod-1`
+                                // project, not whatever index shifts into the gap
+                                // (#111). Resolve it before the remove.
+                                let next = mru_order(&windows, i).first().copied();
                                 for p in &mut windows[i].panes {
                                     p.kill();
                                 }
                                 windows.remove(i);
-                                if cur >= windows.len() {
-                                    cur = windows.len().saturating_sub(1);
+                                if !windows.is_empty() {
+                                    cur = if i == cur {
+                                        window_after_close(i, next, windows.len())
+                                    } else {
+                                        // Some other window went: just keep the
+                                        // one we're on, adjusting for the shift.
+                                        cur - usize::from(i < cur)
+                                    };
                                 }
                             }
                             if let Err(err) = worktree::delete(e) {
@@ -1981,7 +1993,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 .filter(|e| !failures.iter().any(|f| f.starts_with(&e.name)))
                                 .map(|e| e.path.clone())
                                 .collect();
-                            let m = wtman.get_or_insert_with(|| WtManager::new(&proot, &tx));
+                            let m =
+                                wtman.get_or_insert_with(|| WtManager::new(&proot, &proot, &tx));
                             m.remove_paths(&gone);
                             m.note = Some(if failures.is_empty() {
                                 format!("deleted {}", gone.len())
@@ -2597,7 +2610,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     needs_clear = true;
                 }
                 Msg::OpenWorktrees => {
-                    wtman = Some(WtManager::new(&proot, &tx));
+                    wtman = Some(WtManager::new(&proot, &windows[cur].dir, &tx));
                     dirty = true;
                     needs_clear = true;
                 }
@@ -4294,6 +4307,13 @@ struct WtManager {
     note: Option<String>,
 }
 
+/// Where the manager's cursor starts: on the worktree `here` names when it's one
+/// of them, otherwise the top. Opening the manager from inside a worktree should
+/// land on it rather than making you find it (#120).
+fn preselect(entries: &[worktree::WtEntry], here: &Path) -> usize {
+    entries.iter().position(|e| e.path == here).unwrap_or(0)
+}
+
 /// What a confirmation is about to destroy.
 #[derive(Clone)]
 enum WtTarget {
@@ -4306,8 +4326,12 @@ impl WtManager {
     /// Build the list and kick off one classification per worktree. Each runs on
     /// its own thread and reports back as a message, so a slow `git fetch` on one
     /// worktree never blocks the list or the event loop.
-    fn new(root: &Path, tx: &Sender<Msg>) -> WtManager {
+    /// `here` is the directory of the window the manager was opened from: when
+    /// it *is* one of the worktrees, start the cursor on it, so deleting the one
+    /// you're standing in doesn't mean hunting for it in the list (#120).
+    fn new(root: &Path, here: &Path, tx: &Sender<Msg>) -> WtManager {
         let entries = worktree::list_worktrees(root);
+        let sel = preselect(&entries, here);
         for e in &entries {
             let (path, tx) = (e.path.clone(), tx.clone());
             thread::spawn(move || {
@@ -4318,7 +4342,7 @@ impl WtManager {
         WtManager {
             pending: entries.len(),
             entries,
-            sel: 0,
+            sel,
             marked: Vec::new(),
             confirm: None,
             note: None,
@@ -6364,6 +6388,24 @@ mod tests {
     /// the interesting assertions are the refusals: a dirty row can't be marked,
     /// and a row that goes dirty after being marked is dropped from the batch
     /// rather than deleted anyway.
+    /// Opening the manager from inside a worktree starts on it (#120); from
+    /// anywhere else — a clone, the projects root — it starts at the top.
+    #[test]
+    fn manager_preselects_the_worktree_youre_in() {
+        use worktree::{WtEntry, WtState};
+        let entry = |n: &str| WtEntry {
+            name: n.to_string(),
+            path: PathBuf::from("/p").join(n),
+            state: WtState::Clean,
+        };
+        let entries = [entry("a"), entry("b"), entry("c")];
+        assert_eq!(preselect(&entries, &PathBuf::from("/p/b")), 1);
+        assert_eq!(preselect(&entries, &PathBuf::from("/p/a")), 0);
+        // Not a worktree (a clone, or the root itself): top of the list.
+        assert_eq!(preselect(&entries, &PathBuf::from("/p/sfaos")), 0);
+        assert_eq!(preselect(&[], &PathBuf::from("/p/b")), 0);
+    }
+
     #[test]
     fn worktree_manager_marks_confirms_and_prunes() {
         use worktree::{WtEntry, WtState};
