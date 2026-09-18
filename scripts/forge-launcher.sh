@@ -38,7 +38,40 @@ if ! pgrep -u "$(id -u)" -f 'forge --server' >/dev/null 2>&1; then
       # every launch made a cold start look hung. Local dev builds with cargo
       # directly, so this never masks your own edits.
       if command -v cargo >/dev/null 2>&1 && { [ "$before" != "$after" ] || [ ! -x "$BIN" ]; }; then
-        ( cd "$REPO" && cargo build --release -q ) 2>/dev/null || true
+        # Say what's happening (#117). The build is still synchronous — the
+        # whole point of it is that nobody rides a stale binary — but a silent
+        # twenty seconds is indistinguishable from a hang, which is what made
+        # this read as "CodeForge is slow to start" rather than "it's building".
+        log="$(mktemp)"
+        ( cd "$REPO" && cargo build --release -q ) >"$log" 2>&1 &
+        build=$!
+        start=$SECONDS
+        if [ -t 2 ]; then
+          # A real terminal gets a live counter on one rewritten line.
+          spin='-\|/'
+          i=0
+          while kill -0 "$build" 2>/dev/null; do
+            i=$(( (i + 1) % 4 ))
+            printf '\r\033[2Kcodeforge: building update %s %ds' \
+              "${spin:$i:1}" "$(( SECONDS - start ))" >&2
+            sleep 0.2
+          done
+          printf '\r\033[2K' >&2
+        else
+          # Piped or scripted: one line, no animation.
+          echo "codeforge: building update..." >&2
+        fi
+        if wait "$build"; then
+          echo "codeforge: updated in $(( SECONDS - start ))s" >&2
+        else
+          # Never fail silently into the old binary: that is exactly how users
+          # end up running something main doesn't say (constitution principle 6).
+          echo "codeforge: update build FAILED - launching the previous binary" >&2
+          sed -n '1,20p' "$log" >&2
+          echo "codeforge: full log at $log" >&2
+          keep_log=1
+        fi
+        [ -n "${keep_log:-}" ] || rm -f "$log"
       fi
     ) 9>"${XDG_RUNTIME_DIR:-/tmp}/codeforge-update.lock"
   fi
