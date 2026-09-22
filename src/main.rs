@@ -90,6 +90,11 @@ struct WindowSpec {
     dir: PathBuf,
     shell_cwd: Option<PathBuf>,
     files: Vec<PathBuf>,
+    /// A Claude session id this window's AI pane was resumed from (#127), so a
+    /// reload or respawn comes back *in that conversation* rather than dropping
+    /// to the resume picker. One per window, because a restore rebuilds a single
+    /// AI pane regardless of how many tabs were open.
+    ai_resume: Option<String>,
 }
 
 impl WindowSpec {
@@ -98,6 +103,7 @@ impl WindowSpec {
             dir,
             shell_cwd: None,
             files: Vec::new(),
+            ai_resume: None,
         }
     }
 }
@@ -468,6 +474,7 @@ fn capture_specs(windows: &[Window]) -> Vec<WindowSpec> {
                 dir: w.dir.clone(),
                 shell_cwd,
                 files,
+                ai_resume: w.ai_resume.clone(),
             }
         })
         .collect()
@@ -594,6 +601,10 @@ struct Window {
     /// `mod-N` numbers projects by this rather than by creation order, so the
     /// last project you were in is always `mod-1` (#77).
     used: u64,
+    /// The Claude session id this window's AI pane was resumed from (#127).
+    /// Kept on the window so a respawn or a reload comes back in that
+    /// conversation instead of the resume picker.
+    ai_resume: Option<String>,
 }
 
 /// Slot index for a role: editor 0, shell 1, ai 2. Used to index `Window.active`.
@@ -977,6 +988,7 @@ fn new_window(
         // Ordered behind every window already in use, so a newly opened project
         // slots in as the least-recent until you switch to it (#77).
         used: 0,
+        ai_resume: spec.ai_resume.clone(),
     })
 }
 
@@ -1101,7 +1113,7 @@ fn spawn_ide(
     let shell_cwd = spec.shell_cwd.as_deref().unwrap_or(dir);
     // Resume the prior conversation for this project if it has one, else start
     // fresh — so a brand-new project isn't stranded on the resume picker (#54).
-    let (ai, ai_title) = command_line(&ai_cmd_for_dir(cfg, dir), dir);
+    let (ai, ai_title) = command_line(&ai_cmd_for_spec(cfg, spec), dir);
 
     // Watch for grug-far opening in this editor (#53): nvim writes the .grug
     // flag while the search is up; forge fullscreens the editor for it and
@@ -1227,6 +1239,7 @@ fn build_editor(
 /// Respawn a pane's child after it exits (Ctrl-D / `exit` / `:q`), keeping the
 /// pane and its id in place. The editor reopens the dir, the shell restarts, and
 /// the AI pane comes back on the resume picker (`claude --resume`).
+#[allow(clippy::too_many_arguments)]
 fn respawn_pane(
     role: PaneRole,
     dir: &Path,
@@ -1234,6 +1247,7 @@ fn respawn_pane(
     cfg: &Config,
     shell: &str,
     tx: &Sender<Msg>,
+    ai_resume: Option<&str>,
 ) -> Result<Pane> {
     match role {
         PaneRole::Editor => {
@@ -1250,9 +1264,13 @@ fn respawn_pane(
             tx.clone(),
         ),
         PaneRole::Ai => {
-            // Bring claude back on its session-resume picker.
+            // Back into the pinned conversation when this window has one (#127);
+            // otherwise claude's own session-resume picker.
             let line = if cfg.ai.trim_start().starts_with("claude") {
-                "claude --resume".to_string()
+                match ai_resume {
+                    Some(id) => format!("claude --resume {id}"),
+                    None => "claude --resume".to_string(),
+                }
             } else {
                 cfg.ai.clone()
             };
@@ -1284,6 +1302,33 @@ fn claude_project_key(dir: &Path) -> String {
         .collect()
 }
 
+/// The transcript file for a Claude session id, searched across *every* project
+/// (#127). Verified behaviour: `claude --resume <id>` resolves the id globally —
+/// a CodeForge session resumes fine from `/tmp` — so scoping the lookup to the
+/// current project would reject ids claude itself would accept. The returned
+/// path's parent names the project it belongs to, which is worth telling the
+/// user when it isn't this one.
+fn claude_session_path(id: &str) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    claude_session_in(&Path::new(&home).join(".claude/projects"), id)
+}
+
+/// The search itself, against an explicit projects root so it's testable without
+/// reaching for `$HOME` (tests share a process; mutating env races).
+fn claude_session_in(projects: &Path, id: &str) -> Option<PathBuf> {
+    // Ids name a file directly; anything with a separator in it is not an id and
+    // must never be turned into a path we go looking for.
+    if id.is_empty() || id.contains('/') || id.contains("..") {
+        return None;
+    }
+    let file = format!("{id}.jsonl");
+    std::fs::read_dir(projects)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().join(&file))
+        .find(|p| p.is_file())
+}
+
 /// Whether claude has a prior conversation stored for `dir` (under
 /// `~/.claude/projects/<key>`).
 fn claude_has_session(dir: &Path) -> bool {
@@ -1298,6 +1343,17 @@ fn claude_has_session(dir: &Path) -> bool {
 /// prior conversation only when the project actually has one — a brand-new
 /// project (e.g. a fresh worktree) has nothing to continue, so `claude
 /// --continue` would strand it on the resume picker; start it fresh instead.
+/// The AI command for a window being built from `spec`: resume the pinned
+/// session id when it has one (#127), otherwise the usual per-project rule.
+/// This is what makes a resumed conversation survive a reload — the id rides
+/// the snapshot, so the rebuilt pane lands back in it instead of on the picker.
+fn ai_cmd_for_spec(cfg: &Config, spec: &WindowSpec) -> String {
+    match (&spec.ai_resume, cfg.ai.trim_start().starts_with("claude")) {
+        (Some(id), true) => format!("{} --resume {id}", fresh_ai_cmd(cfg)),
+        _ => ai_cmd_for_dir(cfg, &spec.dir),
+    }
+}
+
 fn ai_cmd_for_dir(cfg: &Config, dir: &Path) -> String {
     let base = fresh_ai_cmd(cfg);
     if cfg.ai.trim_start().starts_with("claude") && claude_has_session(dir) {
@@ -1447,7 +1503,9 @@ fn snapshot_path() -> PathBuf {
 }
 
 /// Save window specs, best-effort. One window per line, tab-separated:
-/// `dir \t shell_cwd \t file1,file2,...`.
+/// `dir \t shell_cwd \t file1,file2,... \t ai_session_id`. The last field was
+/// added later (#127); a snapshot written without it loads with no resume id,
+/// which is exactly the old behaviour.
 fn save_snapshot(specs: &[WindowSpec]) {
     let path = snapshot_path();
     if let Some(parent) = path.parent() {
@@ -1468,7 +1526,8 @@ fn save_snapshot(specs: &[WindowSpec]) {
                 .map(|f| f.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join(",");
-            format!("{dir}\t{cwd}\t{files}")
+            let resume = s.ai_resume.clone().unwrap_or_default();
+            format!("{dir}\t{cwd}\t{files}\t{resume}")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1477,10 +1536,15 @@ fn save_snapshot(specs: &[WindowSpec]) {
 
 /// Load saved window specs whose project dir still exists.
 fn load_snapshot() -> Vec<WindowSpec> {
-    let text = match std::fs::read_to_string(snapshot_path()) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
-    };
+    match std::fs::read_to_string(snapshot_path()) {
+        Ok(s) => parse_snapshot(&s),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Parse a snapshot's text. Separate from the file read so the format — and in
+/// particular its backward compatibility — can be tested directly.
+fn parse_snapshot(text: &str) -> Vec<WindowSpec> {
     let mut specs = Vec::new();
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -1506,10 +1570,17 @@ fn load_snapshot() -> Vec<WindowSpec> {
             .filter(|f| !f.is_empty())
             .map(PathBuf::from)
             .collect();
+        // Absent in snapshots written before #127: no id, old behaviour.
+        let ai_resume = fields
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         specs.push(WindowSpec {
             dir,
             shell_cwd,
             files,
+            ai_resume,
         });
     }
     specs
@@ -1814,6 +1885,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
             dir,
             shell_cwd: None,
             files: vec![note],
+            ai_resume: None,
         };
         let w = new_window(&spec, &cfg, &shell, next_id, &tx)?;
         next_id += 3;
@@ -1833,6 +1905,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // A "new Claude tab: resume or fresh?" chooser is showing (#54); the next
     // key (r/n/Esc) resolves it.
     let mut ai_tab_prompt = false;
+    // Typing a Claude session id at the new-tab chooser (#127): `Some` while the
+    // field is open, holding what's been typed so far.
+    let mut ai_id_input: Option<String> = None;
     // The window switcher is up (#78); it owns input until Enter/Esc.
     let mut switcher: Option<WinSwitcher> = None;
     // The favorites list is up (#80); modal in the same way.
@@ -2095,10 +2170,81 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         }
                         dirty = true;
                         needs_clear = true;
+                    } else if let Some(buf) = ai_id_input.as_mut() {
+                        // Typing a session id (#127). Enter launches it, Esc
+                        // backs out, everything else edits the field.
+                        let mut launch: Option<String> = None;
+                        for &b in bytes.iter() {
+                            match b {
+                                0x1b | 0x03 => {
+                                    ai_id_input = None;
+                                    break;
+                                }
+                                b'\r' | b'\n' => {
+                                    launch = Some(buf.trim().to_string());
+                                    break;
+                                }
+                                0x7f | 0x08 => {
+                                    buf.pop();
+                                }
+                                // Ids are hex and dashes; anything printable is
+                                // accepted so a bad paste is visible rather than
+                                // silently eaten.
+                                0x20..=0x7e => buf.push(b as char),
+                                _ => {}
+                            }
+                        }
+                        if let Some(id) = launch {
+                            match claude_session_path(&id) {
+                                None => {
+                                    // A mistyped id would otherwise fail inside
+                                    // the pane, where the message is easy to miss.
+                                    fav_note = Some(format!("no Claude session {id}"));
+                                    ai_id_input = None;
+                                }
+                                Some(path) => {
+                                    // Resolvable ids can belong to another
+                                    // project — claude allows that, so we do
+                                    // too, but say so, because resuming someone
+                                    // else's conversation in this window's cwd
+                                    // is a thing to do knowingly.
+                                    let here = claude_project_key(&windows[cur].dir);
+                                    let owner = path
+                                        .parent()
+                                        .and_then(|p| p.file_name())
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    if owner != here {
+                                        fav_note = Some(format!("resuming a session from {owner}"));
+                                    }
+                                    ai_id_input = None;
+                                    ai_tab_prompt = false;
+                                    let base = fresh_ai_cmd(&cfg);
+                                    open_ai_tab(
+                                        &mut windows,
+                                        cur,
+                                        &format!("{base} --resume {id}"),
+                                        &mut next_id,
+                                        &cfg,
+                                        &tx,
+                                        size,
+                                    )?;
+                                    // Pin it so a reload or respawn comes back
+                                    // in this conversation, not on the picker.
+                                    windows[cur].ai_resume = Some(id);
+                                }
+                            }
+                        }
+                        dirty = true;
+                        needs_clear = true;
                     } else if ai_tab_prompt {
                         // Modal chooser for a new Claude tab (#54): r resume,
-                        // n new, Esc/Ctrl-c cancel; other keys ignored.
+                        // n new, i by id (#127), Esc/Ctrl-c cancel.
                         match bytes.first().copied().unwrap_or(0) {
+                            b'i' | b'I' => {
+                                ai_tab_prompt = false;
+                                ai_id_input = Some(String::new());
+                            }
                             b'r' | b'R' => {
                                 ai_tab_prompt = false;
                                 let base = fresh_ai_cmd(&cfg);
@@ -2934,6 +3080,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             dir,
                             shell_cwd: None,
                             files: vec![note],
+                            ai_resume: None,
                         };
                         let w = new_window(&spec, &cfg, &shell, base, &tx)?;
                         windows.insert(0, w);
@@ -3267,8 +3414,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 continue;
             }
             let dir = w.dir.clone();
+            let resume = w.ai_resume.clone();
             for (id, role, fails) in respawn {
-                let mut newp = respawn_pane(role, &dir, id, &cfg, &shell, &tx)?;
+                let mut newp = respawn_pane(role, &dir, id, &cfg, &shell, &tx, resume.as_deref())?;
                 newp.set_respawns(fails);
                 if let Some(slot) = w.panes.iter_mut().find(|p| p.id == id) {
                     *slot = newp;
@@ -3389,6 +3537,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     picker.as_ref(),
                     wtform.as_ref(),
                     ai_tab_prompt,
+                    ai_id_input.as_deref(),
                     switcher.as_ref(),
                     favs.as_ref(),
                     wtman.as_ref(),
@@ -4071,6 +4220,8 @@ fn render(
     picker: Option<&Picker>,
     wtform: Option<&WorktreeForm>,
     ai_prompt: bool,
+    // The session-id field, when it's open (#127).
+    ai_id: Option<&str>,
     switcher: Option<&WinSwitcher>,
     favs: Option<&FavList>,
     wtman: Option<&WtManager>,
@@ -4195,6 +4346,9 @@ fn render(
     }
     if ai_prompt {
         draw_ai_tab_prompt(out, cols, rows)?;
+    }
+    if let Some(buf) = ai_id {
+        draw_ai_id_input(out, cols, rows, buf)?;
     }
     // End the synchronized frame: present everything queued above at once.
     out.extend_from_slice(b"\x1b[?2026l");
@@ -5073,7 +5227,7 @@ impl FavList {
 
 /// Draw the "new Claude tab: resume or fresh?" chooser, centered (#54).
 fn draw_ai_tab_prompt(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
-    let text = " new Claude tab:  r resume · n new · Esc cancel ";
+    let text = " new Claude tab:  r resume · n new · i by id · Esc cancel ";
     let iw = text.chars().count();
     let bw = iw as u16 + 2;
     if bw > cols || rows < 3 {
@@ -5096,6 +5250,62 @@ fn draw_ai_tab_prompt(out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
         SetAttribute(Attribute::Bold),
         Print("│"),
         cursor::MoveTo(x, y + 1),
+        Print(format!("└{}┘", "─".repeat(iw))),
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        cursor::Hide,
+    )?;
+    Ok(())
+}
+
+/// The session-id field for resuming a specific Claude conversation (#127).
+/// Wide enough for a full uuid; the text scrolls if something longer is pasted.
+fn draw_ai_id_input(out: &mut Vec<u8>, cols: u16, rows: u16, buf: &str) -> Result<()> {
+    let label = " resume session id: ";
+    let iw = (label.chars().count() + 38).min(cols.saturating_sub(4) as usize);
+    let bw = iw as u16 + 2;
+    if bw > cols || rows < 4 {
+        return Ok(());
+    }
+    let x = (cols - bw) / 2;
+    let y = rows / 2;
+    // Keep the caret visible on a long paste by showing the tail.
+    let room = iw.saturating_sub(label.chars().count() + 1);
+    let shown: String = buf
+        .chars()
+        .rev()
+        .take(room)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let line = format!("{label}{shown}▏");
+    let pad = iw.saturating_sub(line.chars().count());
+    let hint = " Enter resume · Esc cancel ";
+    let hpad = iw.saturating_sub(hint.chars().count());
+    queue!(
+        out,
+        SetForegroundColor(Color::Cyan),
+        SetAttribute(Attribute::Bold),
+        cursor::MoveTo(x, y - 1),
+        Print(format!("┌{}┐", "─".repeat(iw))),
+        cursor::MoveTo(x, y),
+        Print("│"),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::White),
+        Print(format!("{line}{}", " ".repeat(pad))),
+        SetForegroundColor(Color::Cyan),
+        SetAttribute(Attribute::Bold),
+        Print("│"),
+        cursor::MoveTo(x, y + 1),
+        Print("│"),
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(Color::DarkGrey),
+        Print(format!("{hint}{}", " ".repeat(hpad))),
+        SetForegroundColor(Color::Cyan),
+        SetAttribute(Attribute::Bold),
+        Print("│"),
+        cursor::MoveTo(x, y + 2),
         Print(format!("└{}┘", "─".repeat(iw))),
         ResetColor,
         SetAttribute(Attribute::Reset),
@@ -6667,6 +6877,110 @@ mod tests {
     /// second, laxer rule than the manager's.
     /// Tab tint (#126): the manager's colours, and nothing that could be read
     /// as a state when there isn't one.
+    /// Resuming by id (#127). The lookup is global on purpose — verified that
+    /// `claude --resume <id>` resolves a session from any directory — so scoping
+    /// it to the current project would reject ids claude itself accepts.
+    /// A snapshot written before #127 has three fields, not four. It must load
+    /// exactly as it used to — a restore that silently lost windows, or grew a
+    /// bogus resume id, would be worse than the feature is worth.
+    #[test]
+    fn snapshots_without_a_session_id_still_load() {
+        let tmp = std::env::temp_dir().join(format!("cf-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (a, b) = (tmp.join("projA"), tmp.join("projB"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (ad, bd) = (a.display(), b.display());
+
+        // Old format: three tab-separated fields.
+        let old = format!("{ad}\t{ad}\tf1.rs,f2.rs\n{bd}\t\t");
+        let specs = parse_snapshot(&old);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].dir, a);
+        assert_eq!(specs[0].shell_cwd.as_deref(), Some(a.as_path()));
+        assert_eq!(specs[0].files.len(), 2);
+        assert!(specs[0].ai_resume.is_none(), "no id where none was written");
+        assert!(specs[1].ai_resume.is_none());
+
+        // New format round-trips the id, and an empty fourth field is still None
+        // rather than Some("").
+        let new = format!("{ad}\t\t\tabc-123\n{bd}\t\t\t");
+        let specs = parse_snapshot(&new);
+        assert_eq!(specs[0].ai_resume.as_deref(), Some("abc-123"));
+        assert!(specs[1].ai_resume.is_none());
+
+        // A window whose directory is gone is dropped, as before.
+        let missing = format!("{}\t\t\t", tmp.join("vanished").display());
+        assert!(parse_snapshot(&missing).is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The pinned id is what makes a resumed conversation survive a reload.
+    #[test]
+    fn a_pinned_session_id_becomes_the_resume_command() {
+        let mut cfg = Config {
+            ai: "claude".to_string(),
+            ..Config::default()
+        };
+        let dir = std::env::temp_dir();
+        let mut spec = WindowSpec::bare(dir.clone());
+        // No id: the existing per-project rule decides, untouched.
+        assert_eq!(ai_cmd_for_spec(&cfg, &spec), ai_cmd_for_dir(&cfg, &dir));
+        // With one: straight back into that conversation.
+        spec.ai_resume = Some("abc-123".into());
+        assert_eq!(ai_cmd_for_spec(&cfg, &spec), "claude --resume abc-123");
+        // A non-claude AI CLI has no such flag; leave its command alone.
+        cfg.ai = "auggie".to_string();
+        assert_eq!(ai_cmd_for_spec(&cfg, &spec), "auggie");
+    }
+
+    #[test]
+    fn claude_session_lookup_is_global_and_path_safe() {
+        let home = std::env::temp_dir().join(format!("cf-sess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let projects = home.join(".claude/projects");
+        std::fs::create_dir_all(projects.join("-home-u-projects-CodeForge")).unwrap();
+        std::fs::create_dir_all(projects.join("-home-u-projects-auto")).unwrap();
+        let here = "f3d64f78-d300-4ad3-8cfd-452917105923";
+        let elsewhere = "30da168b-faab-480e-885e-cde4865d06e1";
+        std::fs::write(
+            projects
+                .join("-home-u-projects-CodeForge")
+                .join(format!("{here}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+        std::fs::write(
+            projects
+                .join("-home-u-projects-auto")
+                .join(format!("{elsewhere}.jsonl")),
+            "{}",
+        )
+        .unwrap();
+
+        let found = claude_session_in(&projects, here).expect("session in this project");
+        assert_eq!(
+            found.parent().unwrap().file_name().unwrap(),
+            "-home-u-projects-CodeForge"
+        );
+        // A session belonging to another project still resolves; the caller
+        // tells the user whose it is rather than refusing.
+        let other = claude_session_in(&projects, elsewhere).expect("session in another project");
+        assert_eq!(
+            other.parent().unwrap().file_name().unwrap(),
+            "-home-u-projects-auto"
+        );
+        // Unknown ids are rejected, so a typo is caught before the pane starts.
+        assert!(claude_session_in(&projects, "00000000-0000-0000-0000-000000000000").is_none());
+        // Nothing that could escape the projects tree is ever turned into a path.
+        assert!(claude_session_in(&projects, "").is_none());
+        assert!(claude_session_in(&projects, "../../etc/passwd").is_none());
+        assert!(claude_session_in(&projects, "a/b").is_none());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn tab_colour_matches_the_manager_and_stays_quiet_when_unknown() {
         use worktree::WtState;
@@ -7206,6 +7520,7 @@ mod tests {
             zoom_prev: None,
             notes,
             used,
+            ai_resume: None,
         }
     }
 
