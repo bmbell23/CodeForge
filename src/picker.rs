@@ -230,7 +230,7 @@ impl Picker {
 
     /// Draw the picker box centered on the screen into `out`.
     pub fn render(&self, out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
-        let w: u16 = 44.min(cols.saturating_sub(2)).max(12);
+        let w = box_width(&self.all, cols);
         let inner_w = (w - 2) as usize;
         let visible = self.matches.len().min(MAX_ROWS);
         // Rows: title, filter, separator, list...  + 2 borders.
@@ -336,6 +336,33 @@ impl Picker {
     }
 }
 
+/// Columns a row spends on things that aren't the name: the leading space, the
+/// `mod-N` digit, the selection marker and their separators, plus the ` · open`
+/// suffix a window already showing the project gets (#104).
+const ROW_CHROME: usize = 5 + 7;
+
+/// The narrowest the picker gets. Nothing forces this — it's just that a root of
+/// short names shouldn't produce a cramped little box.
+const MIN_WIDTH: u16 = 44;
+
+/// How wide to draw the picker: enough for its longest entry, clamped to the
+/// terminal. Fixed at 44 columns until projects could be nested (#122), which
+/// made names long enough to truncate the part that distinguishes them — a
+/// worktree's tail (#128).
+///
+/// Measured over *every* entry rather than the filtered ones on purpose: sizing
+/// to matches would resize the box on each keystroke while filtering.
+fn box_width(all: &[String], cols: u16) -> u16 {
+    let widest = all
+        .iter()
+        .map(|n| n.chars().count() + ROW_CHROME)
+        .max()
+        .unwrap_or(0);
+    // +2 for the borders; never wider than the terminal can hold.
+    let want = (widest as u16).saturating_add(2).max(MIN_WIDTH);
+    want.min(cols.saturating_sub(2)).max(12)
+}
+
 /// Every project under `root`, named by its path relative to it (#122). A bare
 /// name stopped being unique once projects could be grouped: `SFA/eng/eng` and
 /// a top-level `eng` are different projects and can both be open.
@@ -349,6 +376,31 @@ fn list_dirs(root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The box grows to fit its longest entry and stops at the terminal edge
+    /// (#128). Nested paths are long and it's their *tail* that identifies them,
+    /// so truncation costs exactly the useful part.
+    #[test]
+    fn box_width_fits_the_longest_entry() {
+        let wide = 200u16;
+        // A short list stays at the floor rather than shrinking to nothing.
+        assert_eq!(box_width(&["auto".into()], wide), MIN_WIDTH);
+        assert_eq!(box_width(&[], wide), MIN_WIDTH);
+
+        // A long entry widens the box: name + row chrome + borders.
+        let long = "EXA/exascaler-management-framework/exascaler-management-framework";
+        let want = (long.chars().count() + ROW_CHROME + 2) as u16;
+        assert_eq!(box_width(&[long.to_string()], wide), want);
+        assert!(want > MIN_WIDTH);
+
+        // The longest entry wins, not the last one.
+        let mixed = vec!["a".to_string(), long.to_string(), "b".to_string()];
+        assert_eq!(box_width(&mixed, wide), want);
+
+        // A terminal too narrow clamps instead of overflowing it.
+        assert_eq!(box_width(&mixed, 50), 48);
+        assert_eq!(box_width(&mixed, 6), 12, "never collapses below the floor");
+    }
 
     /// Every project stays in the list, open or not — the picker is the one
     /// "go to project" gesture, and an open one is marked rather than hidden

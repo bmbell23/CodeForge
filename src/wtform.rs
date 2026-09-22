@@ -349,7 +349,7 @@ impl WorktreeForm {
 
     /// Draw the form centered on the screen.
     pub fn render(&self, out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
-        let w: u16 = 54.min(cols.saturating_sub(2)).max(20);
+        let w = box_width(&self.clones, cols);
         let inner_w = (w - 2) as usize;
         let is_sfaos = self.is_sfaos();
         let clone_rows = if self.focus == Field::Clone {
@@ -510,6 +510,27 @@ impl WorktreeForm {
     }
 }
 
+/// Columns a clone row spends on its marker, label and separators, so the box
+/// can be sized from the names themselves.
+const ROW_CHROME: usize = 12;
+
+/// The narrowest the form gets — its other fields need about this much anyway.
+const MIN_WIDTH: u16 = 54;
+
+/// How wide to draw the form: enough for the longest clone name, clamped to the
+/// terminal. Same regression as the picker's (#128) and from the same cause —
+/// once clones could be nested (#122) their names became paths, and a fixed
+/// width truncated the part that tells them apart.
+fn box_width(clones: &[String], cols: u16) -> u16 {
+    let widest = clones
+        .iter()
+        .map(|n| n.chars().count() + ROW_CHROME)
+        .max()
+        .unwrap_or(0);
+    let want = (widest as u16).saturating_add(2).max(MIN_WIDTH);
+    want.min(cols.saturating_sub(2)).max(20)
+}
+
 /// Every clone under `root`, named by its path relative to it (#122). Only
 /// clones: a linked worktree's `.git` is a file, and you can't branch a new
 /// worktree from one.
@@ -518,4 +539,22 @@ fn list_clones(root: &Path) -> Vec<String> {
         .into_iter()
         .map(|p| p.rel)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The form grows for a nested clone name instead of truncating it (#128).
+    #[test]
+    fn box_width_fits_the_longest_clone() {
+        let wide = 200u16;
+        assert_eq!(box_width(&["sfaos".into()], wide), MIN_WIDTH, "floor");
+        assert_eq!(box_width(&[], wide), MIN_WIDTH);
+        let long = "EXA/exascaler-management-framework/exascaler-management-framework";
+        let want = (long.chars().count() + ROW_CHROME + 2) as u16;
+        assert_eq!(box_width(&[long.to_string()], wide), want);
+        // Clamped to a narrow terminal rather than overflowing it.
+        assert_eq!(box_width(&[long.to_string()], 60), 58);
+    }
 }
