@@ -510,6 +510,8 @@ pub enum Msg {
     ToggleFavorite,
     /// Open the worktree manager (#83).
     OpenWorktrees,
+    /// Delete the current window's worktree (#124).
+    DeleteWorktree,
     /// Open the history of the file the editor is showing (#92).
     OpenFileLog,
     /// A background classification finished: worktree path -> state (#83).
@@ -2611,6 +2613,33 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                     needs_clear = true;
                 }
+                Msg::DeleteWorktree => {
+                    // Delete the worktree this window is on, without opening the
+                    // full manager — which would list and classify all of them
+                    // (#124). Only this one is looked at.
+                    let dir = windows[cur].dir.clone();
+                    if worktree::is_linked_worktree(&dir) {
+                        let name = dir
+                            .strip_prefix(&proot)
+                            .unwrap_or(&dir)
+                            .to_string_lossy()
+                            .into_owned();
+                        wtman = Some(WtManager::for_current(
+                            worktree::WtEntry {
+                                name,
+                                path: dir,
+                                state: worktree::WtState::Unknown,
+                            },
+                            &tx,
+                        ));
+                    } else {
+                        // A clone or a plain project: nothing to delete, and
+                        // silently doing nothing would read as a broken key.
+                        fav_note = Some("not a worktree — nothing to delete".to_string());
+                    }
+                    dirty = true;
+                    needs_clear = true;
+                }
                 Msg::OpenWorktrees => {
                     wtman = Some(WtManager::new(&proot, &windows[cur].dir, &tx));
                     dirty = true;
@@ -3731,6 +3760,8 @@ impl InputParser {
             Some(Msg::ToggleDiff)
         } else if c == k.worktrees {
             Some(Msg::OpenWorktrees)
+        } else if c == k.worktree_delete {
+            Some(Msg::DeleteWorktree)
         } else if c == k.file_log {
             Some(Msg::OpenFileLog)
         } else if c == k.favorites {
@@ -4326,6 +4357,11 @@ struct WtManager {
     sel: usize,
     /// How many classifications are still running, for the "updating…" line.
     pending: usize,
+    /// Opened straight from a window to delete that one worktree (#124): once
+    /// its classification lands, arm the confirmation if it's deletable, or say
+    /// why not. The manager is reused rather than given a second delete path so
+    /// there is one confirmation rule, not a laxer one for the current worktree.
+    auto_confirm: bool,
     /// Rows picked out for a batch delete, by path — indices shift as entries
     /// are removed, paths don't (#118).
     marked: Vec<PathBuf>,
@@ -4371,9 +4407,29 @@ impl WtManager {
             pending: entries.len(),
             entries,
             sel,
+            auto_confirm: false,
             marked: Vec::new(),
             confirm: None,
             note: None,
+        }
+    }
+
+    /// The manager over a single worktree — the one a window is sitting on
+    /// (#124). Classifying just this one avoids the fetch-and-check of all 63.
+    fn for_current(entry: worktree::WtEntry, tx: &Sender<Msg>) -> WtManager {
+        let (path, tx2) = (entry.path.clone(), tx.clone());
+        thread::spawn(move || {
+            let state = worktree::classify(&path);
+            let _ = tx2.send(Msg::WorktreeState(path, state));
+        });
+        WtManager {
+            pending: 1,
+            entries: vec![entry],
+            sel: 0,
+            auto_confirm: true,
+            marked: Vec::new(),
+            confirm: None,
+            note: Some("checking…".into()),
         }
     }
 
@@ -4422,11 +4478,28 @@ impl WtManager {
             .collect()
     }
 
-    /// Record a finished classification.
+    /// Record a finished classification. When the manager was opened to delete
+    /// one specific worktree (#124), that result decides immediately: confirm if
+    /// it's deletable, refuse with the reason if not.
     fn apply(&mut self, path: &Path, state: worktree::WtState) {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.path == path) {
-            e.state = state;
-            self.pending = self.pending.saturating_sub(1);
+        let Some(i) = self.entries.iter().position(|e| e.path == path) else {
+            return;
+        };
+        self.entries[i].state = state;
+        self.pending = self.pending.saturating_sub(1);
+        if self.auto_confirm {
+            self.auto_confirm = false;
+            self.note = None;
+            if self.entries[i].deletable() {
+                self.confirm = Some((WtTarget::One(i), String::new()));
+            } else {
+                self.note = Some(match state {
+                    worktree::WtState::Dirty => "uncommitted changes — not deleting".into(),
+                    worktree::WtState::Pending => "unpushed commits — not deleting".into(),
+                    worktree::WtState::Error(why) => format!("can't classify ({why})"),
+                    _ => "not clean — not deleting".to_string(),
+                });
+            }
         }
     }
 
@@ -6418,6 +6491,58 @@ mod tests {
     /// rather than deleted anyway.
     /// Opening the manager from inside a worktree starts on it (#120); from
     /// anywhere else — a clone, the projects root — it starts at the top.
+    /// The delete-this-worktree key (#124) is only as safe as what it does with
+    /// the classification: confirm when clean, and say *why* when not. A silent
+    /// no-op would read as a broken key; an unconditional confirm would be a
+    /// second, laxer rule than the manager's.
+    #[test]
+    fn delete_current_confirms_only_when_clean() {
+        use worktree::{WtEntry, WtState};
+        let entry = || WtEntry {
+            name: "eng-SFAP-1-x".into(),
+            path: PathBuf::from("/p/eng-SFAP-1-x"),
+            state: WtState::Unknown,
+        };
+        let armed = |state| {
+            let mut m = WtManager {
+                entries: vec![entry()],
+                sel: 0,
+                pending: 1,
+                auto_confirm: true,
+                marked: Vec::new(),
+                confirm: None,
+                note: Some("checking…".into()),
+            };
+            m.apply(&PathBuf::from("/p/eng-SFAP-1-x"), state);
+            m
+        };
+
+        let m = armed(WtState::Clean);
+        assert!(
+            matches!(m.confirm, Some((WtTarget::One(0), _))),
+            "clean confirms"
+        );
+        assert!(m.note.is_none());
+
+        for (state, want) in [
+            (WtState::Dirty, "uncommitted"),
+            (WtState::Pending, "unpushed"),
+            (WtState::Error("no upstream"), "no upstream"),
+        ] {
+            let m = armed(state);
+            assert!(m.confirm.is_none(), "{state:?} must not confirm");
+            let note = m.note.as_deref().unwrap_or("");
+            assert!(note.contains(want), "{state:?} said {note:?}");
+        }
+
+        // The flag is one-shot: a later classification landing in the ordinary
+        // manager must never arm a delete on its own.
+        let mut m = armed(WtState::Dirty);
+        m.entries[0].state = WtState::Unknown;
+        m.apply(&PathBuf::from("/p/eng-SFAP-1-x"), WtState::Clean);
+        assert!(m.confirm.is_none(), "auto-confirm must not re-arm");
+    }
+
     #[test]
     fn manager_preselects_the_worktree_youre_in() {
         use worktree::{WtEntry, WtState};
@@ -6450,6 +6575,7 @@ mod tests {
             ],
             sel: 0,
             pending: 0,
+            auto_confirm: false,
             marked: Vec::new(),
             confirm: None,
             note: None,

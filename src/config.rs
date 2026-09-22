@@ -254,6 +254,10 @@ pub struct Keys {
     pub favorite_toggle: char,
     /// Worktree manager (#83): status per worktree, delete the clean ones.
     pub worktrees: char,
+    /// Delete the current window's worktree without opening the manager (#124).
+    /// Uppercase on purpose: it's irreversible, so it shouldn't sit under a
+    /// stray keypress. The typed confirmation still applies.
+    pub worktree_delete: char,
     /// History of the file the editor is showing (#92): the commits that
     /// touched it, opening into that commit's full changed-file set.
     pub file_log: char,
@@ -323,6 +327,7 @@ impl Default for Keys {
             favorites: 'b',
             favorite_toggle: 'B',
             worktrees: 'D',
+            worktree_delete: 'W',
             // Not 'h': that's the default focus-left key.
             file_log: 'H',
             zoom: 'z',
@@ -333,7 +338,7 @@ impl Default for Keys {
 /// The rebindable actions, in the order shown in the `Ctrl-a ?` editor:
 /// `(config field, human label)`. Focus keys are listed individually so each
 /// can be rebound. `1..9` (window jump) and mouse aren't rebindable.
-pub const EDITABLE: [(&str, &str); 29] = [
+pub const EDITABLE: [(&str, &str); 30] = [
     ("toggle_editor", "show/hide editor"),
     ("toggle_shell", "show/hide terminal"),
     ("toggle_ai", "show/hide Claude"),
@@ -344,6 +349,7 @@ pub const EDITABLE: [(&str, &str); 29] = [
     ("favorites", "favorite files (this repo)"),
     ("favorite_toggle", "favorite / unfavorite this file"),
     ("worktrees", "worktrees: status / delete clean"),
+    ("worktree_delete", "delete THIS window's worktree"),
     ("file_log", "history of the editor's file"),
     ("tab_new", "new terminal/Claude tab"),
     ("tab_next", "next tab (focused slot)"),
@@ -396,6 +402,7 @@ impl Keys {
             "favorites" => self.favorites,
             "favorite_toggle" => self.favorite_toggle,
             "worktrees" => self.worktrees,
+            "worktree_delete" => self.worktree_delete,
             "file_log" => self.file_log,
             "zoom" => self.zoom,
             _ => return None,
@@ -443,6 +450,7 @@ impl Keys {
             "favorites" => self.favorites = ch,
             "favorite_toggle" => self.favorite_toggle = ch,
             "worktrees" => self.worktrees = ch,
+            "worktree_delete" => self.worktree_delete = ch,
             "file_log" => self.file_log = ch,
             "zoom" => self.zoom = ch,
             _ => return false,
@@ -852,6 +860,7 @@ win_list = "\t"  # window switcher: list open projects, pick by name or number
 favorites = "b"  # favorite files for this repo (shared across its worktrees/clones)
 favorite_toggle = "B"  # favorite / unfavorite the file open in the editor
 worktrees = "D"  # worktree manager: per-worktree status, delete clean worktrees
+worktree_delete = "W"  # delete the worktree this window is on (asks you to type "delete")
 file_log = "H"   # history of the file the editor is showing
 zoom = "z"       # fullscreen the focused pane (hide the other two); again restores
 # also: prefix + 1..9 jumps to a window, numbered by recency (1 = last used);
