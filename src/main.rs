@@ -3174,7 +3174,27 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dirty = true;
                 }
                 Msg::Tick => {
-                    // Just refresh the status-bar clock.
+                    // Refresh the status-bar clock, and keep the open windows'
+                    // worktree states current enough for the tab colours (#126).
+                    // Local checks only, off-thread, and only for worktrees whose
+                    // cached state has aged out — an idle session with nothing
+                    // stale does no work here at all.
+                    let dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
+                    for path in
+                        tabs_needing_refresh(&dirs, &wt_cache, Instant::now(), WT_TAB_REFRESH)
+                    {
+                        // Mark it fresh *now* so the next tick doesn't queue the
+                        // same worktree again while this one is still running.
+                        wt_cache
+                            .entry(path.clone())
+                            .or_insert((Instant::now(), worktree::WtState::Unknown))
+                            .0 = Instant::now();
+                        let tx = tx.clone();
+                        thread::spawn(move || {
+                            let state = worktree::classify_local(&path);
+                            let _ = tx.send(Msg::WorktreeState(path, state));
+                        });
+                    }
                     dirty = true;
                 }
                 Msg::Reload => {
@@ -3375,6 +3395,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     dl,
                     &right_info,
                     cfg.status_tabs,
+                    &wt_cache,
                     ksnap,
                     &eksnap,
                     msel.as_ref().map(|m| {
@@ -4057,6 +4078,8 @@ fn render(
     right_info: &str,
     // How many window tabs the status bar may draw (#107); 0 = no cap.
     status_tabs: usize,
+    // Worktree classifications, for colouring tab text by state (#126).
+    wt_states: &HashMap<PathBuf, (Instant, worktree::WtState)>,
     keys: Keys,
     editor_keys: &config::EditorKeys,
     msel: Option<Sel>,
@@ -4118,7 +4141,16 @@ fn render(
         }
     }
 
-    draw_status(out, cols, rows, windows, cur, right_info, status_tabs)?;
+    draw_status(
+        out,
+        cols,
+        rows,
+        windows,
+        cur,
+        right_info,
+        status_tabs,
+        wt_states,
+    )?;
 
     // Position the real cursor inside the focused pane.
     if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == w.focus_id) {
@@ -4401,6 +4433,58 @@ struct WtManager {
 /// governs *display* only: a delete always re-checks against git first, because
 /// a stale "clean" reaching a delete would destroy real work.
 const WT_CACHE_TTL: Duration = Duration::from_secs(120);
+
+/// How stale an *open* window's classification may get before the tick
+/// refreshes it (#126). Shorter than the manager's TTL because the tab strip is
+/// glanceable and always on screen: committing should turn a tab green soon
+/// after, not two minutes later. Only the local checks run on this path — no
+/// fetch, so nothing here touches the network on a timer.
+const WT_TAB_REFRESH: Duration = Duration::from_secs(30);
+
+/// The tab-text colour for a worktree's state (#126). Matches the worktree
+/// manager's own colours so the strip and the list can never disagree.
+/// `None` means "leave the tab alone": not a worktree, or not classified yet —
+/// unknown must not be mistakable for a state.
+fn state_colour(state: Option<worktree::WtState>) -> Option<Color> {
+    match state? {
+        worktree::WtState::Clean => Some(Color::Green),
+        worktree::WtState::Dirty => Some(Color::Red),
+        worktree::WtState::Pending => Some(Color::Yellow),
+        worktree::WtState::Error(_) => Some(Color::Red),
+        worktree::WtState::Unknown => None,
+    }
+}
+
+/// Whether `dir` is a linked worktree, by one stat rather than two git
+/// subprocesses: a linked worktree's `.git` is a *file* pointing back at the
+/// clone, a clone's is a directory. Good enough to decide whether it's worth
+/// classifying at all (#126); `is_linked_worktree` asks git and stays the
+/// authority wherever a wrong answer would matter.
+fn looks_like_worktree(dir: &Path) -> bool {
+    dir.join(".git").is_file()
+}
+
+/// Open windows whose worktree state should be refreshed on this tick: linked
+/// worktrees whose cached classification is missing or older than the refresh
+/// interval. Split out so the decision is testable without a clock or a repo.
+fn tabs_needing_refresh(
+    dirs: &[PathBuf],
+    cache: &HashMap<PathBuf, (Instant, worktree::WtState)>,
+    now: Instant,
+    max_age: Duration,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if !looks_like_worktree(d) || out.contains(d) {
+            continue;
+        }
+        match cache.get(d) {
+            Some((at, _)) if now.saturating_duration_since(*at) < max_age => {}
+            _ => out.push(d.clone()),
+        }
+    }
+    out
+}
 
 /// Where the manager's cursor starts: on the worktree `here` names when it's one
 /// of them, otherwise the top. Opening the manager from inside a worktree should
@@ -5059,6 +5143,7 @@ fn visible_tabs(widths: &[usize], cur: usize, avail: usize) -> (usize, usize) {
 /// Draw the bottom status bar: window tabs on the left (current highlighted,
 /// orange when a window wants attention), and the date/clock/temperature on the
 /// right. Keybinds live in the `Ctrl-a ?` overlay, not here.
+#[allow(clippy::too_many_arguments)]
 fn draw_status(
     out: &mut Vec<u8>,
     cols: u16,
@@ -5067,6 +5152,7 @@ fn draw_status(
     cur: usize,
     right_info: &str,
     max_tabs: usize,
+    wt_states: &HashMap<PathBuf, (Instant, worktree::WtState)>,
 ) -> Result<()> {
     let y = rows.saturating_sub(1);
     // Fill the row so old content is covered.
@@ -5154,7 +5240,13 @@ fn draw_status(
                 Color::Black,
             ) // orange: wants input
         } else {
-            (Color::DarkGrey, Color::White)
+            // Worktree state tints the text (#126): green clean, red dirty,
+            // yellow pending. Only here — the current and attention tabs carry
+            // black text on a light background, where a state colour would be
+            // unreadable, and attention is the more urgent thing to say anyway.
+            // Not a worktree, or not yet classified, keeps plain white.
+            let tint = state_colour(wt_states.get(&w.dir).map(|(_, s)| *s));
+            (Color::DarkGrey, tint.unwrap_or(Color::White))
         };
         queue!(out, SetBackgroundColor(bg), SetForegroundColor(fg))?;
         let label: String = labels[slot].chars().take(room).collect();
@@ -6573,6 +6665,68 @@ mod tests {
     /// the classification: confirm when clean, and say *why* when not. A silent
     /// no-op would read as a broken key; an unconditional confirm would be a
     /// second, laxer rule than the manager's.
+    /// Tab tint (#126): the manager's colours, and nothing that could be read
+    /// as a state when there isn't one.
+    #[test]
+    fn tab_colour_matches_the_manager_and_stays_quiet_when_unknown() {
+        use worktree::WtState;
+        assert_eq!(state_colour(Some(WtState::Clean)), Some(Color::Green));
+        assert_eq!(state_colour(Some(WtState::Dirty)), Some(Color::Red));
+        assert_eq!(state_colour(Some(WtState::Pending)), Some(Color::Yellow));
+        assert_eq!(
+            state_colour(Some(WtState::Error("no upstream"))),
+            Some(Color::Red)
+        );
+        // Not classified yet, and not a worktree at all, both stay plain: an
+        // unknown state must not look like a verdict.
+        assert_eq!(state_colour(Some(WtState::Unknown)), None);
+        assert_eq!(state_colour(None), None);
+    }
+
+    /// The tick only re-classifies open worktrees whose state has aged out, so
+    /// an idle session does no git work at all (#126).
+    #[test]
+    fn only_stale_open_worktrees_are_refreshed() {
+        use worktree::WtState;
+        let tmp = std::env::temp_dir().join(format!("cf-tabs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let wt = tmp.join("eng-SFAP-1-x");
+        let clone = tmp.join("eng");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(clone.join(".git")).unwrap();
+        // A linked worktree's .git is a file; a clone's is a directory.
+        std::fs::write(wt.join(".git"), "gitdir: /elsewhere").unwrap();
+
+        let now = Instant::now();
+        let max = Duration::from_secs(30);
+        let mut cache: HashMap<PathBuf, (Instant, WtState)> = HashMap::new();
+        let dirs = vec![wt.clone(), clone.clone(), tmp.join("gone")];
+
+        // Nothing cached: the worktree is queued, the clone and the missing
+        // directory never are.
+        assert_eq!(
+            tabs_needing_refresh(&dirs, &cache, now, max),
+            vec![wt.clone()]
+        );
+
+        // Freshly classified: left alone.
+        cache.insert(wt.clone(), (now, WtState::Clean));
+        assert!(tabs_needing_refresh(&dirs, &cache, now, max).is_empty());
+
+        // Aged out: queued again.
+        let later = now + Duration::from_secs(31);
+        assert_eq!(
+            tabs_needing_refresh(&dirs, &cache, later, max),
+            vec![wt.clone()]
+        );
+
+        // The same worktree open in two windows is only queued once.
+        let twice = vec![wt.clone(), wt.clone()];
+        assert_eq!(tabs_needing_refresh(&twice, &cache, later, max), vec![wt]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn delete_current_confirms_only_when_clean() {
         use worktree::{WtEntry, WtState};
