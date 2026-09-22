@@ -77,8 +77,24 @@ if ! pgrep -u "$(id -u)" -f 'forge --server' >/dev/null 2>&1; then
   fi
 fi
 
+# A moved or deleted clone is a different problem from an unbuilt one, and the
+# fix is different too — say which (#130). The launcher lives on $PATH outside
+# the clone, so it cannot find where the clone went; install.sh is the answer.
+if [ ! -d "$REPO" ]; then
+  echo "codeforge: the clone is no longer at $REPO" >&2
+  echo "  it was moved or removed. From its new location, run:" >&2
+  echo "      <new-path>/scripts/install.sh" >&2
+  echo "  that rewrites this launcher and re-links the Neovim config." >&2
+  exit 1
+fi
+
 if [ ! -x "$BIN" ]; then
-  echo "codeforge: binary missing at $BIN — ask the owner to run scripts/install.sh" >&2
+  echo "codeforge: binary missing at $BIN" >&2
+  if [ -w "$REPO/.git" ]; then
+    echo "  build it with: ( cd $REPO && cargo build --release )" >&2
+  else
+    echo "  ask the clone owner to run scripts/install.sh once to build it." >&2
+  fi
   exit 1
 fi
 exec "$BIN" "$@"

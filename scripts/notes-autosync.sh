@@ -9,7 +9,8 @@
 # *unchanged since the previous run* — so mid-typing bursts collapse into one
 # commit. Run every minute:
 #
-#   * * * * * /home/bbell/projects/CodeForge/scripts/notes-autosync.sh >/dev/null 2>&1
+#   * * * * * <clone>/scripts/notes-autosync.sh >/dev/null 2>&1
+# (use the clone's real path; it isn't fixed, and a crontab won't follow a move)
 #
 # Flags:
 #   --now / FORCE=1   sync immediately, skip the idle wait ("Save now")

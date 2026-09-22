@@ -3,7 +3,8 @@
 # link the `forge` launcher onto their PATH, and install the Neovim config under
 # ~/.config/codeforge (isolated via NVIM_APPNAME).
 #
-# One shared clone serves the whole team (e.g. /home/bbell/projects/CodeForge).
+# One shared clone serves the whole team. Re-run this after moving the clone: it
+# rewrites the launcher (which bakes in the clone path) and re-links init.lua.
 # The clone's OWNER (whoever can write it) builds the shared binary; everyone
 # else enrolls as a CONSUMER and just runs it. This script figures out which you
 # are from the clone's writability — a coworker runs the exact same command.

@@ -58,8 +58,10 @@ headless API client — **the IDE must not burn API tokens on its own.**
   runs from what `main` says. See `behavior.md` for the incident this comes from.
 
 ### 6. The shared clone is a shared resource
-- One clone at `/home/bbell/projects/CodeForge` on NFS serves the whole team; the
-  launcher runs the **installed release binary** from it.
+- One clone on NFS serves the whole team; the launcher runs the **installed
+  release binary** from it. The clone's path is not fixed — it has moved — so
+  never hardcode it; `scripts/install.sh` re-points the launcher and the Neovim
+  config symlink after a move.
 - **ALWAYS** treat a `cargo build --release` / `scripts/install.sh` as affecting
   every user — say so and get agreement before doing it.
 - **NEVER** relax the shared permission gates in a way other users inherit.

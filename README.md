@@ -55,12 +55,17 @@ for the roadmap.
 ## Install
 
 **One shared clone serves everyone** — you don't clone it yourself. It lives on
-the shared filesystem at `/home/bbell/projects/CodeForge`. To enroll (once per
-user), just run its installer:
+the shared filesystem; ask whoever owns it for the path (it has moved before, so
+this document deliberately doesn't hardcode one). To enroll (once per user), run
+that clone's installer:
 
 ```bash
-/home/bbell/projects/CodeForge/scripts/install.sh
+<clone>/scripts/install.sh
 ```
+
+Re-run the same command if the clone ever moves: it rewrites `~/.local/bin/forge`
+(which has the clone path baked in) and re-links the Neovim config (an absolute
+symlink into the clone). Nothing else needs touching.
 
 That one idempotent command:
 
@@ -90,7 +95,7 @@ write the shared clone:
 Both roles heal their *own* per-user deps on a fresh launch; attaching to a
 running session skips all of it. Every step is time-bounded and best-effort — no
 network, no problem, it launches what's there. The owner can force a refresh
-without relaunching: `git -C /home/bbell/projects/CodeForge pull` then `Ctrl-a r`.
+without relaunching: `git -C <clone> pull` then `Ctrl-a r`.
 
 > Because there's one clone and one binary, a coworker on another VM
 > (`cforry@co-sf-pe-050`) does nothing but run the installer once and `forge` —

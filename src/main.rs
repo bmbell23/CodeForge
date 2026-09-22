@@ -946,6 +946,24 @@ fn notes_sync_script() -> Option<PathBuf> {
     s.exists().then_some(s)
 }
 
+/// The installed Neovim config, if it is absent or dangling (#130).
+/// `~/.config/codeforge/init.lua` is an absolute symlink into the clone, so
+/// moving the clone leaves it pointing at nothing and nvim starts bare.
+/// `Some(path)` is the path that should exist and doesn't.
+fn missing_nvim_config() -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    missing_nvim_config_in(Path::new(&home))
+}
+
+/// The check itself, against an explicit home so it's testable without mutating
+/// env (tests share a process).
+fn missing_nvim_config_in(home: &Path) -> Option<PathBuf> {
+    let cfg = home.join(".config/codeforge/init.lua");
+    // `exists` follows symlinks, so a dangling link reads as absent — which is
+    // exactly the case worth reporting.
+    (!cfg.exists()).then_some(cfg)
+}
+
 /// The Notes sync status line for the status bar: conflict, unsaved (needs
 /// Ctrl-s), or synced with the last-sync time. The script maintains the flag /
 /// timestamp files; dirtiness is a cheap `git status` (#71).
@@ -1236,6 +1254,14 @@ fn build_editor(
     }
     if is_nvim {
         c.env("NVIM_APPNAME", "codeforge");
+        // A dangling config symlink starts nvim with *nothing* — no keybinds, no
+        // plugins, no splash — and looks like CodeForge broke rather than like
+        // the config is missing. That's what a moved clone leaves behind, since
+        // install.sh links this absolutely into the repo (#130).
+        if let Some(missing) = missing_nvim_config() {
+            eprintln!("codeforge: Neovim config missing at {}", missing.display());
+            eprintln!("  the clone probably moved; re-run scripts/install.sh from it.");
+        }
         // Editor keybinds (open file, explorer, tab cycling, …) flow to init.lua
         // as `name=token` lines so the finder maps and the splash cheatsheet read
         // from config.toml's [editor_keys] (#28).
@@ -6988,6 +7014,36 @@ mod tests {
     /// Where Notes lives is now resolved rather than hardcoded (#129), so it can
     /// move into a group. The rules have to be exact: a wrong answer silently
     /// costs the pinned tab, autosave, sync status and prose wrapping.
+    /// A moved clone leaves `~/.config/codeforge/init.lua` dangling, and nvim
+    /// then starts with no configuration at all — which looks like CodeForge
+    /// broke rather than like the config is missing (#130).
+    #[test]
+    fn a_dangling_nvim_config_is_detected() {
+        let home = std::env::temp_dir().join(format!("cf-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let dir = home.join(".config/codeforge");
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("init.lua");
+
+        // Nothing there at all.
+        assert_eq!(missing_nvim_config_in(&home), Some(link.clone()));
+
+        // A symlink to a file that doesn't exist — what moving the clone leaves
+        // behind. `exists()` follows the link, so this reads as missing.
+        std::os::unix::fs::symlink(home.join("gone/init.lua"), &link).unwrap();
+        assert_eq!(missing_nvim_config_in(&home), Some(link.clone()));
+
+        // Pointing at a real file: nothing to report.
+        let real = home.join("clone/config/nvim");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("init.lua"), "-- cfg").unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(real.join("init.lua"), &link).unwrap();
+        assert_eq!(missing_nvim_config_in(&home), None);
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn notes_dir_resolves_config_then_default_then_discovery() {
         let root = std::env::temp_dir().join(format!("cf-notes-{}", std::process::id()));

@@ -49,8 +49,9 @@ cargo test
 The TUI needs a real terminal — it can't be driven from a non-TTY harness. Verify
 interactive changes by running `cargo run` in a real terminal.
 
-**Shared-clone install model.** One clone at `/home/bbell/projects/CodeForge`
-(NFS) serves the team; `~/.local/bin/forge` runs the installed release binary.
+**Shared-clone install model.** One clone on NFS serves the team (its path is
+not fixed — it has moved); `~/.local/bin/forge` runs the installed release
+binary from wherever that clone is.
 Two roles, decided by whether you can write the clone:
 - **Owner** (writable): a fresh `forge` fast-forwards + rebuilds the shared
   binary, so everyone rides the latest.
