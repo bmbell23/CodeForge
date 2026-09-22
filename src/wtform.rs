@@ -17,7 +17,7 @@ use crossterm::style::{
 };
 use crossterm::{cursor, queue};
 
-use crate::worktree::{default_branch, is_sfa_clone, WorktreeSpec};
+use crate::worktree::{clone_base, default_branch, is_sfa_clone, WorktreeSpec};
 
 /// Max clone rows shown while selecting.
 const MAX_ROWS: usize = 8;
@@ -140,10 +140,17 @@ impl WorktreeForm {
         self.matches.get(self.sel).map(|&i| self.clones[i].clone())
     }
 
+    /// Whether the chosen clone is sfaos, by the repo's own name — a clone can
+    /// now sit inside a group, so the selection is a path like `SFA/x/sfaos`
+    /// rather than a bare name (#123).
+    fn is_sfaos(&self) -> bool {
+        self.clone.as_deref().map(clone_base) == Some("sfaos")
+    }
+
     /// The active tab order — the AlsoAuto row exists only for sfaos.
     fn fields(&self) -> Vec<Field> {
         let mut v = vec![Field::Clone];
-        if self.clone.as_deref() == Some("sfaos") {
+        if self.is_sfaos() {
             v.push(Field::AlsoAuto);
         }
         v.extend([Field::Ticket, Field::Name, Field::Upstream]);
@@ -169,7 +176,7 @@ impl WorktreeForm {
                 };
             }
             self.clone = Some(c);
-            self.focus = if self.clone.as_deref() == Some("sfaos") {
+            self.focus = if self.is_sfaos() {
                 Field::AlsoAuto
             } else {
                 Field::Ticket
@@ -344,7 +351,7 @@ impl WorktreeForm {
     pub fn render(&self, out: &mut Vec<u8>, cols: u16, rows: u16) -> Result<()> {
         let w: u16 = 54.min(cols.saturating_sub(2)).max(20);
         let inner_w = (w - 2) as usize;
-        let is_sfaos = self.clone.as_deref() == Some("sfaos");
+        let is_sfaos = self.is_sfaos();
         let clone_rows = if self.focus == Field::Clone {
             self.matches.len().clamp(1, MAX_ROWS)
         } else {

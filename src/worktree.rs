@@ -133,34 +133,63 @@ pub fn is_sfa_clone(clone_dir: &Path) -> bool {
         .is_some_and(|ns| ns == "sfa")
 }
 
-/// Create one worktree from `clone` off `origin/<upstream>` at
-/// `<projects_root>/<name>`, symlinking `/home/logs/<ticket>` if present.
-/// Returns the new worktree's path.
+/// The repo's own directory name, from a possibly-nested relative path:
+/// `SFA/eng/eng` -> `eng` (#123). A worktree is named after the repo, not after
+/// the group the repo is filed under.
+pub fn clone_base(clone: &str) -> &str {
+    clone.rsplit('/').next().unwrap_or(clone)
+}
+
+/// Where a worktree for `clone_dir` belongs: beside its clone. This used to be
+/// the projects root, which was the same thing only while every clone sat
+/// directly under it — for a nested clone it scattered worktrees into the root,
+/// away from the repo they belong to (#123).
+pub fn worktree_dest(clone_dir: &Path, name: &str) -> PathBuf {
+    clone_dir.parent().unwrap_or(clone_dir).join(name)
+}
+
+/// The clone named `name` sitting beside `clone_dir`, falling back to one
+/// directly under the root. That's how the sfaos/auto pairing finds its partner
+/// once repos can be grouped: look in the group first, the root second (#123).
+pub fn sibling_clone(clone_dir: &Path, projects_root: &Path, name: &str) -> PathBuf {
+    let beside = clone_dir.parent().unwrap_or(clone_dir).join(name);
+    if beside.join(".git").exists() {
+        return beside;
+    }
+    projects_root.join(name)
+}
+
+/// Create one worktree from the clone at `clone_dir`, off `origin/<upstream>`,
+/// beside that clone. Symlinks `/home/logs/<ticket>` if present. Returns the new
+/// worktree's path.
 fn create_one(
-    projects_root: &Path,
-    clone: &str,
+    clone_dir: &Path,
     ticket: &str,
     desc: &str,
     upstream: &str,
     progress: &dyn Fn(&str),
 ) -> Result<PathBuf> {
-    let clone_dir = projects_root.join(clone);
     if !clone_dir.join(".git").exists() {
         bail!("{} is not a git clone", clone_dir.display());
     }
+    let clone = clone_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let clone = clone.as_str();
     let name = worktree_name(clone, ticket, desc);
-    let dest = projects_root.join(&name);
+    let dest = worktree_dest(clone_dir, &name);
 
     // Fetch the base branch so origin/<upstream> is current.
     progress(&format!("fetching {clone} origin/{upstream}…"));
-    git(&clone_dir, &["fetch", "origin", upstream])
+    git(clone_dir, &["fetch", "origin", upstream])
         .map_err(|e| anyhow::anyhow!(e))
         .with_context(|| format!("git fetch origin {upstream} in {clone}"))?;
 
     // If the branch already exists but isn't checked out in a worktree, it's an
     // orphan from a prior run — delete it. If it *is* attached, refuse.
     if git(
-        &clone_dir,
+        clone_dir,
         &[
             "show-ref",
             "--verify",
@@ -170,16 +199,16 @@ fn create_one(
     )
     .is_ok()
     {
-        let list = git(&clone_dir, &["worktree", "list"]).unwrap_or_default();
+        let list = git(clone_dir, &["worktree", "list"]).unwrap_or_default();
         if list.contains(&format!("[{name}]")) {
             bail!("worktree {name} already exists");
         }
-        let _ = git(&clone_dir, &["branch", "-D", &name]);
+        let _ = git(clone_dir, &["branch", "-D", &name]);
     }
 
     progress(&format!("adding worktree {name}…"));
     git(
-        &clone_dir,
+        clone_dir,
         &[
             "worktree",
             "add",
@@ -238,26 +267,24 @@ pub fn create(
     }
     let upstream = upstream_or_default(&spec.upstream, &clone_dir);
 
-    let primary = create_one(
-        projects_root,
-        &spec.clone,
-        &ticket,
-        &desc,
-        &upstream,
-        progress,
-    )?;
+    let primary = create_one(&clone_dir, &ticket, &desc, &upstream, progress)?;
+    // The repo's own name, so the sfaos/auto conventions still match once repos
+    // can live inside a group (#123).
+    let base = clone_base(&spec.clone);
 
     // sfaos + "both": also make the auto worktree and cross-link the sfaos
     // scripts/lib to the *auto worktree's* lib (worktree.sh both-mode).
-    if spec.clone == "sfaos" && spec.also_auto {
-        let auto = create_one(projects_root, "auto", &ticket, &desc, &upstream, progress)?;
+    if base == "sfaos" && spec.also_auto {
+        let auto_clone = sibling_clone(&clone_dir, projects_root, "auto");
+        let auto = create_one(&auto_clone, &ticket, &desc, &upstream, progress)?;
         progress("linking sfaos ↔ auto…");
         link_sfaos_lib(&primary, &auto.join("lib"));
         run_sfaos_venv(&primary, progress);
-    } else if spec.clone == "sfaos" {
+    } else if base == "sfaos" {
         // Single sfaos: link to the base auto clone's lib.
         progress("linking lib…");
-        link_sfaos_lib(&primary, &projects_root.join("auto/lib"));
+        let auto_clone = sibling_clone(&clone_dir, projects_root, "auto");
+        link_sfaos_lib(&primary, &auto_clone.join("lib"));
         run_sfaos_venv(&primary, progress);
     }
 
@@ -287,6 +314,111 @@ mod tests {
                                                               // Off an SFA clone a bare number is not an SFAP ticket (#102).
         assert_eq!(normalize_ticket("225", false), "225");
         assert_eq!(normalize_ticket("mlai-225", false), "MLAI-225");
+    }
+
+    /// Worktrees belong beside their clone, and are named after the repo — not
+    /// after the group it's filed under (#123). Before nesting, "beside the
+    /// clone" and "at the projects root" were the same place; for a nested
+    /// clone they are not, and using the root scattered worktrees away from the
+    /// repo they belong to.
+    #[test]
+    fn nested_clones_put_worktrees_beside_themselves() {
+        let root = Path::new("/home/u/projects");
+
+        // The repo's own name, however deep it's filed.
+        assert_eq!(clone_base("sfaos"), "sfaos");
+        assert_eq!(clone_base("SFA/eng/eng"), "eng");
+        assert_eq!(clone_base(""), "");
+
+        // Top-level clone: unchanged — beside the clone *is* the root.
+        let top = root.join("sfaos");
+        assert_eq!(
+            worktree_dest(&top, "sfaos-SFAP-1-fix"),
+            root.join("sfaos-SFAP-1-fix")
+        );
+        // Nested clone: beside the clone, inside its group.
+        let nested = root.join("SFA/eng/eng");
+        assert_eq!(
+            worktree_dest(&nested, "eng-SFAP-1-fix"),
+            root.join("SFA/eng/eng-SFAP-1-fix"),
+            "a nested worktree must not land at the root"
+        );
+
+        // The sfaos/auto pairing looks in the group first, the root second.
+        let tmp = std::env::temp_dir().join(format!("cf-sib-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let grouped = tmp.join("SFA/sfa/sfaos");
+        std::fs::create_dir_all(&grouped).unwrap();
+        std::fs::create_dir_all(tmp.join("auto/.git")).unwrap();
+        // No `auto` beside it yet: fall back to the root's.
+        assert_eq!(sibling_clone(&grouped, &tmp, "auto"), tmp.join("auto"));
+        // Once one exists in the group, prefer it.
+        std::fs::create_dir_all(tmp.join("SFA/sfa/auto/.git")).unwrap();
+        assert_eq!(
+            sibling_clone(&grouped, &tmp, "auto"),
+            tmp.join("SFA/sfa/auto")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn scratch_e2e_nested_create() {
+        let tmp = std::env::temp_dir().join(format!("cf-e2e-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        let run = |d: &Path, a: &[&str]| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .args(a)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {a:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run(&origin, &["init", "-q", "-b", "main"]);
+        run(&origin, &["config", "user.email", "t@t"]);
+        run(&origin, &["config", "user.name", "t"]);
+        std::fs::write(origin.join("f"), "x").unwrap();
+        run(&origin, &["add", "."]);
+        run(&origin, &["commit", "-qm", "one"]);
+        // Nested exactly like the real layout: <root>/SFA/eng/eng
+        std::fs::create_dir_all(tmp.join("SFA/eng")).unwrap();
+        let o = Command::new("git")
+            .arg("-C")
+            .arg(tmp.join("SFA/eng"))
+            .args(["clone", "-q", origin.to_str().unwrap(), "eng"])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+        let spec = WorktreeSpec {
+            clone: "SFA/eng/eng".into(),
+            ticket: "SFAP-1".into(),
+            description: "nested test".into(),
+            upstream: String::new(),
+            also_auto: false,
+        };
+        let made = create(&tmp, &spec, &|m| println!("  progress: {m}")).unwrap();
+        println!("E2E created at: {}", made.display());
+        println!(
+            "  exists={} is_worktree={}",
+            made.is_dir(),
+            is_linked_worktree(&made)
+        );
+        println!(
+            "  root polluted={:?}",
+            std::fs::read_dir(&tmp)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
