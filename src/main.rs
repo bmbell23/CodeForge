@@ -53,6 +53,7 @@ mod protocol;
 mod worktree;
 mod wtform;
 
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -1841,6 +1842,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // Transient confirmation for a favorite toggle, shown on the status bar
     // until the next one — the editor pane gives no feedback of its own.
     let mut fav_note: Option<String> = None;
+    // Worktree classifications, reused across manager opens within the TTL
+    // (#125). Display only — never consulted when deciding what may be deleted.
+    let mut wt_cache: HashMap<PathBuf, (Instant, worktree::WtState)> = HashMap::new();
     let mut diff: Option<DiffList> = None;
     let mut diff_zoom: Option<DiffZoom> = None;
     // Editor fullscreen while a grug-far search is open (#53), mirroring the
@@ -1953,6 +1957,21 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         }
                         let mut failures = Vec::new();
                         for e in &doomed {
+                            // The list may have been drawn from the cache, and a
+                            // classification can be minutes old — the user can
+                            // have edited or committed since. Deletion is
+                            // irreversible, so it gets a fresh full check (fetch
+                            // included) and refuses anything no longer clean
+                            // (#125). The cache never authorises a delete.
+                            let now = worktree::classify(&e.path);
+                            wt_cache.insert(e.path.clone(), (Instant::now(), now));
+                            if now != worktree::WtState::Clean {
+                                failures.push(format!(
+                                    "{}: changed since the list — not deleted",
+                                    e.name
+                                ));
+                                continue;
+                            }
                             // Close a window on this worktree first: deleting the
                             // directory under a live nvim/shell would leave broken
                             // panes writing to a path that no longer exists.
@@ -1996,8 +2015,12 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 .filter(|e| !failures.iter().any(|f| f.starts_with(&e.name)))
                                 .map(|e| e.path.clone())
                                 .collect();
-                            let m =
-                                wtman.get_or_insert_with(|| WtManager::new(&proot, &proot, &tx));
+                            for p in &gone {
+                                wt_cache.remove(p);
+                            }
+                            let m = wtman.get_or_insert_with(|| {
+                                WtManager::new(&proot, &proot, &tx, &wt_cache)
+                            });
                             m.remove_paths(&gone);
                             m.note = Some(if failures.is_empty() {
                                 format!("deleted {}", gone.len())
@@ -2641,11 +2664,12 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     needs_clear = true;
                 }
                 Msg::OpenWorktrees => {
-                    wtman = Some(WtManager::new(&proot, &windows[cur].dir, &tx));
+                    wtman = Some(WtManager::new(&proot, &windows[cur].dir, &tx, &wt_cache));
                     dirty = true;
                     needs_clear = true;
                 }
                 Msg::WorktreeState(path, state) => {
+                    wt_cache.insert(path.clone(), (Instant::now(), state));
                     if let Some(m) = wtman.as_mut() {
                         m.apply(&path, state);
                         dirty = true;
@@ -4371,6 +4395,13 @@ struct WtManager {
     note: Option<String>,
 }
 
+/// How long a worktree's classification is reused before being recomputed
+/// (#125). Short enough that the list isn't visibly out of date, long enough
+/// that flipping in and out of the manager doesn't refetch everything. It
+/// governs *display* only: a delete always re-checks against git first, because
+/// a stale "clean" reaching a delete would destroy real work.
+const WT_CACHE_TTL: Duration = Duration::from_secs(120);
+
 /// Where the manager's cursor starts: on the worktree `here` names when it's one
 /// of them, otherwise the top. Opening the manager from inside a worktree should
 /// land on it rather than making you find it (#120).
@@ -4387,24 +4418,71 @@ enum WtTarget {
 }
 
 impl WtManager {
-    /// Build the list and kick off one classification per worktree. Each runs on
-    /// its own thread and reports back as a message, so a slow `git fetch` on one
-    /// worktree never blocks the list or the event loop.
-    /// `here` is the directory of the window the manager was opened from: when
-    /// it *is* one of the worktrees, start the cursor on it, so deleting the one
-    /// you're standing in doesn't mean hunting for it in the list (#120).
-    fn new(root: &Path, here: &Path, tx: &Sender<Msg>) -> WtManager {
-        let entries = worktree::list_worktrees(root);
+    /// Build the list, seed what the cache still vouches for, and classify the
+    /// rest off-thread so nothing blocks the event loop.
+    ///
+    /// This used to spawn a thread per worktree, each running its own `git
+    /// fetch` — 63 threads and 63 fetches across only 8 clones on the real tree
+    /// (#125). Now: one coordinator, one fetch per clone, and the local checks
+    /// over a small pool.
+    fn new(
+        root: &Path,
+        here: &Path,
+        tx: &Sender<Msg>,
+        cache: &HashMap<PathBuf, (Instant, worktree::WtState)>,
+    ) -> WtManager {
+        let mut entries = worktree::list_worktrees(root);
         let sel = preselect(&entries, here);
-        for e in &entries {
-            let (path, tx) = (e.path.clone(), tx.clone());
+
+        // Anything the cache still vouches for shows immediately; only the rest
+        // costs anything. The cache decides what is *displayed* — never what may
+        // be deleted, which is re-checked against git at delete time.
+        let mut stale: Vec<PathBuf> = Vec::new();
+        for e in &mut entries {
+            match cache.get(&e.path) {
+                Some((at, state)) if at.elapsed() < WT_CACHE_TTL => e.state = *state,
+                _ => stale.push(e.path.clone()),
+            }
+        }
+        let pending = stale.len();
+        if !stale.is_empty() {
+            let tx = tx.clone();
             thread::spawn(move || {
-                let state = worktree::classify(&path);
-                let _ = tx.send(Msg::WorktreeState(path, state));
+                // One fetch per clone: worktrees of a clone share an object
+                // store and remote-tracking refs, so fetching in one of them
+                // updates all of them.
+                let fetchers: Vec<_> = worktree::fetch_targets(&stale)
+                    .into_iter()
+                    .map(|d| thread::spawn(move || worktree::fetch(&d)))
+                    .collect();
+                for f in fetchers {
+                    let _ = f.join();
+                }
+                // Then the local checks, over a bounded pool. Measured on the
+                // real tree (63 worktrees): pool of 8 took 8.6s, 16 took 4.0s,
+                // 24 took 3.8s, 32 took 2.7s — past that it flattens, and 32 is
+                // still half the threads the old thread-per-worktree shape used.
+                const POOL: usize = 32;
+                let chunk = stale.len().div_ceil(POOL).max(1);
+                let workers: Vec<_> = stale
+                    .chunks(chunk)
+                    .map(|c| {
+                        let (c, tx) = (c.to_vec(), tx.clone());
+                        thread::spawn(move || {
+                            for path in c {
+                                let state = worktree::classify_local(&path);
+                                let _ = tx.send(Msg::WorktreeState(path, state));
+                            }
+                        })
+                    })
+                    .collect();
+                for w in workers {
+                    let _ = w.join();
+                }
             });
         }
         WtManager {
-            pending: entries.len(),
+            pending,
             entries,
             sel,
             auto_confirm: false,

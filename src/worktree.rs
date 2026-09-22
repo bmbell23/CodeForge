@@ -520,12 +520,46 @@ pub fn list_worktrees(root: &Path) -> Vec<WtEntry> {
     out
 }
 
-/// Classify one worktree. Fetches first so "unpushed" is judged against current
-/// remote state — `fetch` only updates remote-tracking refs, so the worktree
-/// being inspected is never modified (a `pull` could conflict or fail on a
-/// dirty tree, which is precisely the case we most need to classify).
-pub fn classify(dir: &Path) -> WtState {
-    // Bounded: a hung network must not freeze the list.
+/// The clone a worktree belongs to — its shared git directory. Every worktree of
+/// one clone shares this, and therefore shares one object store and one set of
+/// remote-tracking refs, so fetching in any of them updates all of them (#125).
+pub fn common_dir(dir: &Path) -> Option<PathBuf> {
+    git_out(
+        dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .map(|s| PathBuf::from(s.trim()))
+}
+
+/// One fetch per clone, for a set of worktrees. Returns the distinct clones so
+/// the caller can report progress; worktrees whose clone can't be resolved fall
+/// back to fetching individually.
+///
+/// This used to be one fetch per *worktree*: 63 of them across 8 clones on the
+/// real tree, so 55 were exact duplicates of work already done (#125).
+pub fn fetch_targets(dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        match common_dir(d) {
+            Some(c) => {
+                if !seen.contains(&c) {
+                    seen.push(c);
+                    // Fetch *in the worktree*, not in the bare common dir: the
+                    // remote is configured there and the refs it updates are
+                    // shared anyway.
+                    out.push(d.clone());
+                }
+            }
+            // Unresolvable: don't let it silently skip its own fetch.
+            None => out.push(d.clone()),
+        }
+    }
+    out
+}
+
+/// Fetch, bounded so a hung network can't freeze the list.
+pub fn fetch(dir: &Path) {
     let _ = Command::new("timeout")
         .arg("20")
         .arg("git")
@@ -533,7 +567,26 @@ pub fn classify(dir: &Path) -> WtState {
         .arg(dir)
         .args(["fetch", "--quiet"])
         .output();
+}
 
+/// Classify a worktree using the remote-tracking refs as they stand, without
+/// fetching. Callers that need current remote state fetch first — once per
+/// clone, via `fetch_targets` (#125).
+pub fn classify_local(dir: &Path) -> WtState {
+    classify_inner(dir)
+}
+
+/// Classify one worktree. Fetches first so "unpushed" is judged against current
+/// remote state — `fetch` only updates remote-tracking refs, so the worktree
+/// being inspected is never modified (a `pull` could conflict or fail on a
+/// dirty tree, which is precisely the case we most need to classify).
+pub fn classify(dir: &Path) -> WtState {
+    fetch(dir);
+    classify_inner(dir)
+}
+
+/// The classification itself, with no network access.
+fn classify_inner(dir: &Path) -> WtState {
     match git_out(dir, &["status", "--porcelain"]) {
         Some(s) if !s.trim().is_empty() => return WtState::Dirty,
         None => return WtState::Error("status failed"),
@@ -661,6 +714,69 @@ mod manager_tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}");
+    }
+
+    /// Worktrees of one clone share an object store and remote-tracking refs, so
+    /// one fetch covers all of them (#125). On the real tree that's 63 worktrees
+    /// over 8 clones — 55 of the fetches were exact duplicates.
+    #[test]
+    fn one_fetch_per_clone_not_per_worktree() {
+        let tmp = std::env::temp_dir().join(format!("cf-fetch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        git_in(&origin, &["init", "-q", "-b", "main"]);
+        git_in(&origin, &["config", "user.email", "t@t"]);
+        git_in(&origin, &["config", "user.name", "t"]);
+        std::fs::write(origin.join("f"), "x").unwrap();
+        git_in(&origin, &["add", "."]);
+        git_in(&origin, &["commit", "-qm", "one"]);
+        git_in(&tmp, &["clone", "-q", origin.to_str().unwrap(), "clone"]);
+        let clone = tmp.join("clone");
+
+        // Three worktrees of one clone, plus a second clone with one.
+        let mut dirs = Vec::new();
+        for n in ["a", "b", "c"] {
+            let d = tmp.join(format!("wt-{n}"));
+            git_in(
+                &clone,
+                &["worktree", "add", "-q", d.to_str().unwrap(), "-b", n],
+            );
+            dirs.push(d);
+        }
+        git_in(&tmp, &["clone", "-q", origin.to_str().unwrap(), "clone2"]);
+        let clone2 = tmp.join("clone2");
+        let d2 = tmp.join("wt-z");
+        git_in(
+            &clone2,
+            &["worktree", "add", "-q", d2.to_str().unwrap(), "-b", "z"],
+        );
+        dirs.push(d2);
+
+        // All three of the first clone's worktrees report the same common dir.
+        let commons: Vec<_> = dirs.iter().filter_map(|d| common_dir(d)).collect();
+        assert_eq!(commons.len(), 4);
+        assert_eq!(commons[0], commons[1]);
+        assert_eq!(commons[1], commons[2]);
+        assert_ne!(
+            commons[0], commons[3],
+            "a different clone is a different target"
+        );
+
+        // So four worktrees collapse to two fetches, one per clone.
+        let targets = fetch_targets(&dirs);
+        assert_eq!(targets.len(), 2, "got {targets:?}");
+        assert!(targets.contains(&dirs[0]));
+        assert!(targets.contains(&dirs[3]));
+
+        // A directory git can't resolve still gets its own fetch rather than
+        // being silently skipped.
+        let bogus = tmp.join("not-a-repo");
+        std::fs::create_dir_all(&bogus).unwrap();
+        let targets = fetch_targets(&[bogus.clone()]);
+        assert_eq!(targets, vec![bogus]);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// A clone on `main` must not be told its base branch is `master` (#102),
