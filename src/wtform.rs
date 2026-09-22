@@ -503,23 +503,12 @@ impl WorktreeForm {
     }
 }
 
-/// Immediate, non-hidden subdirectories of `root` that are git clones — i.e.
-/// their `.git` is a *directory*. A linked worktree's `.git` is a *file* (a
-/// gitfile pointing back at the main repo), so this excludes worktrees and
-/// leaves only the clones you can branch new worktrees from.
+/// Every clone under `root`, named by its path relative to it (#122). Only
+/// clones: a linked worktree's `.git` is a file, and you can't branch a new
+/// worktree from one.
 fn list_clones(root: &Path) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() && p.join(".git").is_dir() {
-                if let Some(name) = e.file_name().to_str() {
-                    if !name.starts_with('.') {
-                        v.push(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-    v
+    crate::projects::clones(root)
+        .into_iter()
+        .map(|p| p.rel)
+        .collect()
 }

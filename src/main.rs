@@ -48,6 +48,7 @@ mod gitdiff;
 mod layout;
 mod pane;
 mod picker;
+mod projects;
 mod protocol;
 mod worktree;
 mod wtform;
@@ -2605,6 +2606,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     switcher = Some(WinSwitcher {
                         filter: String::new(),
                         sel: 0,
+                        root: proot.clone(),
                     });
                     dirty = true;
                     needs_clear = true;
@@ -4121,6 +4123,24 @@ struct WinSwitcher {
     filter: String,
     /// Highlighted position within the filtered rows.
     sel: usize,
+    /// Projects root, so rows can be named by their path relative to it (#122).
+    root: PathBuf,
+}
+
+/// A window's name for a *list*: its path relative to the projects root, so
+/// `SFA/eng/eng` is distinguishable from a top-level `eng` (#122). Falls back to
+/// the tab title for anything that isn't under the root — Notes lives elsewhere,
+/// and a project can be opened by absolute path.
+///
+/// The status-bar tab strip deliberately keeps the short title instead: it's
+/// width-critical (#107 exists because it overflows) and a list has room.
+fn window_label(root: &Path, w: &Window) -> String {
+    w.dir
+        .strip_prefix(root)
+        .ok()
+        .map(|r| r.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| w.title.clone())
 }
 
 /// One row of the switcher: which window, and the `mod-N` number it answers to
@@ -4155,7 +4175,12 @@ impl WinSwitcher {
         let f = self.filter.to_lowercase();
         Self::rows(windows, cur)
             .into_iter()
-            .filter(|r| f.is_empty() || windows[r.idx].title.to_lowercase().contains(&f))
+            .filter(|r| {
+                f.is_empty()
+                    || window_label(&self.root, &windows[r.idx])
+                        .to_lowercase()
+                        .contains(&f)
+            })
             .collect()
     }
 
@@ -4210,7 +4235,7 @@ impl WinSwitcher {
         let hint = " type to filter · number jumps · Enter open · Esc cancel ";
         let widest = rows
             .iter()
-            .map(|r| windows[r.idx].title.chars().count() + 6)
+            .map(|r| window_label(&self.root, &windows[r.idx]).chars().count() + 6)
             .chain(std::iter::once(hint.chars().count()))
             .max()
             .unwrap_or(20);
@@ -4267,7 +4292,10 @@ impl WinSwitcher {
             } else {
                 queue!(out, ResetColor)?;
             }
-            queue!(out, Print(line(&format!(" {tag}  {}", w.title))))?;
+            queue!(
+                out,
+                Print(line(&format!(" {tag}  {}", window_label(&self.root, w))))
+            )?;
             queue!(out, ResetColor, SetForegroundColor(Color::Cyan), Print("│"))?;
         }
         queue!(
@@ -6483,6 +6511,35 @@ mod tests {
         );
     }
 
+    /// Lists name a window by its path under the root, so a nested project is
+    /// distinguishable from a same-named one elsewhere (#122). Anything outside
+    /// the root keeps its short title.
+    #[test]
+    fn window_label_disambiguates_nested_projects() {
+        let root = PathBuf::from("/home/u/projects");
+        let mk = |dir: &str, title: &str| {
+            let mut w = win(title, false, 0);
+            w.dir = PathBuf::from(dir);
+            w
+        };
+        assert_eq!(
+            window_label(&root, &mk("/home/u/projects/SFA/eng/eng", "eng")),
+            "SFA/eng/eng"
+        );
+        assert_eq!(
+            window_label(&root, &mk("/home/u/projects/eng", "eng")),
+            "eng",
+            "top-level is unchanged"
+        );
+        // Outside the root (Notes, or a project opened by absolute path) and the
+        // root itself both fall back to the tab title rather than showing "".
+        assert_eq!(window_label(&root, &mk("/home/u/Notes", "Notes")), "Notes");
+        assert_eq!(
+            window_label(&root, &mk("/home/u/projects", "projects")),
+            "projects"
+        );
+    }
+
     #[test]
     fn window_after_close_follows_recency() {
         // mod-1 sits above the closed window: its index shifts down one.
@@ -6893,6 +6950,7 @@ mod tests {
         let mut sw = WinSwitcher {
             filter: String::new(),
             sel: 0,
+            root: PathBuf::from("/projects"),
         };
         // Rows lead with the numbered projects, then Notes, then where you are.
         let rows = sw.filtered(&ws, cur);
@@ -6912,6 +6970,7 @@ mod tests {
         let mut sw = WinSwitcher {
             filter: String::new(),
             sel: 0,
+            root: PathBuf::from("/projects"),
         };
         let mut done = false;
         for &b in b"bet" {
@@ -6926,6 +6985,7 @@ mod tests {
         let mut sw = WinSwitcher {
             filter: String::new(),
             sel: 0,
+            root: PathBuf::from("/projects"),
         };
         let mut done = false;
         assert_eq!(sw.feed(&ws, cur, 0x1b, &mut done), None);

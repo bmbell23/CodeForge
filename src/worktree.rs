@@ -372,19 +372,15 @@ fn git_out(dir: &Path, args: &[&str]) -> Option<String> {
 /// Every linked worktree directly under `root`, sorted by name. Clones are
 /// skipped: they aren't linked worktrees, so they can't reach the delete path.
 pub fn list_worktrees(root: &Path) -> Vec<WtEntry> {
-    let Ok(rd) = std::fs::read_dir(root) else {
-        return Vec::new();
-    };
-    let mut out: Vec<WtEntry> = rd
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.is_dir() && is_linked_worktree(p))
-        .map(|path| WtEntry {
-            name: path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            path,
+    let mut out: Vec<WtEntry> = crate::projects::find(root)
+        .into_iter()
+        // `projects` classifies by whether `.git` is a file, which is cheap but
+        // only a hint. `is_linked_worktree` asks git itself, and deletion is
+        // irreversible — keep the authoritative check.
+        .filter(|p| is_linked_worktree(&p.path))
+        .map(|p| WtEntry {
+            name: p.rel,
+            path: p.path,
             state: WtState::Unknown,
         })
         .collect();

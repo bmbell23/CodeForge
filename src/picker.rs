@@ -336,21 +336,14 @@ impl Picker {
     }
 }
 
-/// Immediate, non-hidden subdirectories of `root`.
+/// Every project under `root`, named by its path relative to it (#122). A bare
+/// name stopped being unique once projects could be grouped: `SFA/eng/eng` and
+/// a top-level `eng` are different projects and can both be open.
 fn list_dirs(root: &Path) -> Vec<String> {
-    let mut v = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(root) {
-        for e in rd.flatten() {
-            if e.path().is_dir() {
-                if let Some(name) = e.file_name().to_str() {
-                    if !name.starts_with('.') {
-                        v.push(name.to_string());
-                    }
-                }
-            }
-        }
-    }
-    v
+    crate::projects::find(root)
+        .into_iter()
+        .map(|p| p.rel)
+        .collect()
 }
 
 #[cfg(test)]
