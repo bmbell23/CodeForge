@@ -44,6 +44,12 @@ pub struct Config {
     /// `mod-Tab` switcher, so the bar only has to cover what you're moving
     /// between. 0 means no cap.
     pub status_tabs: usize,
+    /// Where the Notes project lives (#129). Absolute, or relative to the
+    /// projects root (`"BMB/Notes"`). Empty means: use `<root>/Notes` if it
+    /// exists, else a uniquely-named `Notes` project found anywhere under the
+    /// root. Notes can be grouped like any other project now (#122), so a fixed
+    /// top-level name is the wrong shape.
+    pub notes_dir: String,
     /// Status-bar right side toggles (#16), left-to-right order when shown:
     /// metrics (cpu/ram/disk), weather, date, clock.
     pub status_metrics: bool,
@@ -283,6 +289,7 @@ impl Default for Config {
             start_terminal: true,
             start_ai: true,
             status_tabs: 5,
+            notes_dir: String::new(),
             status_metrics: true,
             status_weather: true,
             status_date: true,
@@ -811,6 +818,11 @@ autosave = true
 # Layout ratios.
 editor_ratio = 0.5   # editor width fraction (left column)
 right_ratio  = 0.5   # terminal height fraction of the right column
+
+# Where the Notes project lives. Absolute, or relative to the projects root
+# ("BMB/Notes"). Empty: <root>/Notes when it exists, otherwise a uniquely-named
+# "Notes" project found anywhere under the root.
+notes_dir = ""
 
 # Status-bar temperature location (empty "" disables it).
 weather = "Colorado Springs"

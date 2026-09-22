@@ -852,7 +852,53 @@ fn open_diff_view(
 /// pinned to window position 0 (mod-0). New notes are timestamped `.md` files
 /// filed under `History/YYYY/MM/DD/` (#70).
 fn notes_dir() -> PathBuf {
-    projects_root().join("Notes")
+    NOTES_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| projects_root().join("Notes"))
+}
+
+/// Resolved once per process: `notes_dir()` is called for every window and every
+/// pane spawn, and discovery walks the projects tree (#129). A reload restarts
+/// the process, so this can't go stale within a session.
+static NOTES_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Fix the Notes location for this process. Must run after the config is read
+/// and before the first window is built — a window opened on the real Notes
+/// directory is only *marked* as Notes if this already agrees with it.
+fn init_notes_dir(cfg: &Config, root: &Path) {
+    let _ = NOTES_DIR.set(resolve_notes_dir(&cfg.notes_dir, root));
+}
+
+/// Where Notes lives, given the configured value (possibly empty) and the
+/// projects root (#129):
+///
+/// 1. configured, absolute — taken as-is;
+/// 2. configured, relative — joined onto the root;
+/// 3. unconfigured — `<root>/Notes` when it exists;
+/// 4. unconfigured — a project named `Notes` anywhere under the root, but only
+///    if there's exactly one. Two candidates is not something to guess at;
+/// 5. otherwise `<root>/Notes`, so the paths that *create* Notes still have a
+///    location to create it at.
+fn resolve_notes_dir(configured: &str, root: &Path) -> PathBuf {
+    let c = configured.trim();
+    if !c.is_empty() {
+        let p = PathBuf::from(c);
+        return if p.is_absolute() { p } else { root.join(p) };
+    }
+    let default = root.join("Notes");
+    if default.is_dir() {
+        return default;
+    }
+    let mut found = projects::find(root)
+        .into_iter()
+        .filter(|p| p.path.file_name().is_some_and(|n| n == "Notes"));
+    match (found.next(), found.next()) {
+        // Exactly one: that's it.
+        (Some(only), None) => only.path,
+        // None, or ambiguous — don't guess between two Notes directories.
+        _ => default,
+    }
 }
 
 /// Path for a new timestamped note: `<notes>/History/YYYY/MM/DD/YYYY-MM-DD-HH:MM:SS.md`.
@@ -1471,6 +1517,8 @@ fn main() -> Result<()> {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(projects_root);
+    // Before anything asks where Notes is, and before any window is built (#129).
+    init_notes_dir(&cfg, &proot);
 
     // A CLI arg starts a fresh single-window session. Bare `forge` restores the
     // last saved session (resuming AI conversations); if none, shows the picker.
@@ -1681,6 +1729,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         .clone()
         .map(PathBuf::from)
         .unwrap_or_else(projects_root);
+    // Before anything asks where Notes is, and before any window is built (#129).
+    init_notes_dir(&cfg, &proot);
 
     // With dirs: one fresh window each. Without: restore the saved session.
     // The AI pane resumes per project only when that project has a prior
@@ -6933,6 +6983,55 @@ mod tests {
         // A non-claude AI CLI has no such flag; leave its command alone.
         cfg.ai = "auggie".to_string();
         assert_eq!(ai_cmd_for_spec(&cfg, &spec), "auggie");
+    }
+
+    /// Where Notes lives is now resolved rather than hardcoded (#129), so it can
+    /// move into a group. The rules have to be exact: a wrong answer silently
+    /// costs the pinned tab, autosave, sync status and prose wrapping.
+    #[test]
+    fn notes_dir_resolves_config_then_default_then_discovery() {
+        let root = std::env::temp_dir().join(format!("cf-notes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Nothing there at all: the default, so the paths that create Notes
+        // still have somewhere to create it.
+        assert_eq!(resolve_notes_dir("", &root), root.join("Notes"));
+
+        // Configured relative to the root, and configured absolute.
+        assert_eq!(
+            resolve_notes_dir("BMB/Notes", &root),
+            root.join("BMB/Notes")
+        );
+        assert_eq!(
+            resolve_notes_dir("/somewhere/else/Notes", &root),
+            PathBuf::from("/somewhere/else/Notes")
+        );
+        // Whitespace around a configured value doesn't change the answer.
+        assert_eq!(
+            resolve_notes_dir("  BMB/Notes  ", &root),
+            root.join("BMB/Notes")
+        );
+
+        // Discovery: a grouped Notes is found when there's no top-level one.
+        std::fs::create_dir_all(root.join("BMB/Notes/.git")).unwrap();
+        assert_eq!(resolve_notes_dir("", &root), root.join("BMB/Notes"));
+
+        // An explicit setting still wins over discovery.
+        assert_eq!(
+            resolve_notes_dir("other/Notes", &root),
+            root.join("other/Notes")
+        );
+
+        // Two candidates: refuse to guess, fall back to the default.
+        std::fs::create_dir_all(root.join("WORK/Notes/.git")).unwrap();
+        assert_eq!(resolve_notes_dir("", &root), root.join("Notes"));
+
+        // A real top-level Notes beats discovery outright.
+        std::fs::create_dir_all(root.join("Notes/.git")).unwrap();
+        assert_eq!(resolve_notes_dir("", &root), root.join("Notes"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
