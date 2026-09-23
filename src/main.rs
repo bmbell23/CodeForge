@@ -1125,6 +1125,10 @@ fn tab_order(windows: &[Window], cur: usize) -> Vec<usize> {
     order
 }
 
+/// Columns reserved for the "+N" off-strip count while the run is being fitted.
+/// Enough for three digits, which is more windows than anyone has open.
+const COUNT_SLOT: usize = 6;
+
 /// Trim the tab strip to `max` *recent* windows, returning it with the count
 /// left off (#107). The first `exempt` entries — the pinned Notes tab and the
 /// window you're on — are always drawn and don't count against `max`, so the
@@ -1992,7 +1996,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     let mut wtman: Option<WtManager> = None;
     // Transient confirmation for a favorite toggle, shown on the status bar
     // until the next one — the editor pane gives no feedback of its own.
-    let mut fav_note: Option<String> = None;
+    // A short-lived status-bar message: the text, when it was set, and whether
+    // it's a favourite (which earns the star). Notes expire rather than being
+    // cleared at each call site — there are several, and a new one would forget
+    // (#131).
+    let mut note: Option<(String, Instant, bool)> = None;
     // Worktree classifications, reused across manager opens within the TTL
     // (#125). Display only — never consulted when deciding what may be deleted.
     let mut wt_cache: HashMap<PathBuf, (Instant, worktree::WtState)> = HashMap::new();
@@ -2275,7 +2283,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 None => {
                                     // A mistyped id would otherwise fail inside
                                     // the pane, where the message is easy to miss.
-                                    fav_note = Some(format!("no Claude session {id}"));
+                                    note = Some((
+                                        format!("no Claude session {id}"),
+                                        Instant::now(),
+                                        false,
+                                    ));
                                     ai_id_input = None;
                                 }
                                 Some(path) => {
@@ -2291,7 +2303,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                         .map(|s| s.to_string_lossy().into_owned())
                                         .unwrap_or_default();
                                     if owner != here {
-                                        fav_note = Some(format!("resuming a session from {owner}"));
+                                        note = Some((
+                                            format!("resuming a session from {owner}"),
+                                            Instant::now(),
+                                            false,
+                                        ));
                                     }
                                     ai_id_input = None;
                                     ai_tab_prompt = false;
@@ -2880,7 +2896,11 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     } else {
                         // A clone or a plain project: nothing to delete, and
                         // silently doing nothing would read as a broken key.
-                        fav_note = Some("not a worktree — nothing to delete".to_string());
+                        note = Some((
+                            "not a worktree — nothing to delete".to_string(),
+                            Instant::now(),
+                            false,
+                        ));
                     }
                     dirty = true;
                     needs_clear = true;
@@ -2907,13 +2927,17 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     // rides the status bar's right side (#80).
                     let w = &windows[cur];
                     let ed = w.active[role_index(PaneRole::Editor)];
-                    fav_note = match nvim_current_file(&nvim_sock(ed)) {
+                    // A real favourite toggle earns the star; the failure cases
+                    // are plain messages (#131).
+                    note = match nvim_current_file(&nvim_sock(ed)) {
                         Some(file) => match favorites::toggle(&w.dir, &file) {
-                            Some(true) => Some("favorited".to_string()),
-                            Some(false) => Some("unfavorited".to_string()),
-                            None => Some("not inside a git repo".to_string()),
+                            Some(true) => Some(("favorited".to_string(), Instant::now(), true)),
+                            Some(false) => Some(("unfavorited".to_string(), Instant::now(), true)),
+                            None => {
+                                Some(("not inside a git repo".to_string(), Instant::now(), false))
+                            }
                         },
-                        None => Some("no file in the editor".to_string()),
+                        None => Some(("no file in the editor".to_string(), Instant::now(), false)),
                     };
                     dirty = true;
                 }
@@ -2988,7 +3012,10 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             }
                             w.focus_id = w.active[1];
                         }
-                        None => fav_note = Some("no file in the editor".to_string()),
+                        None => {
+                            note =
+                                Some(("no file in the editor".to_string(), Instant::now(), false))
+                        }
                     }
                     dirty = true;
                 }
@@ -3583,11 +3610,10 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     segs.push(now.format("%H:%M").to_string());
                 }
                 // A favorite toggle has no other feedback — the editor pane
-                // looks identical — so lead the status bar with it (#80).
-                let right_info = match &fav_note {
-                    Some(n) => format!("★ {n}   {}", segs.join("  ")),
-                    None => segs.join("  "),
-                };
+                // looks identical — so lead the status bar with it (#80). The
+                // note expires so it stops eating the bar forever (#131); the
+                // star belongs to favourites, not to every message.
+                let right_info = right_info_with_note(note.as_ref(), &segs);
                 framebuf.clear();
                 let ksnap = *keys.lock().unwrap();
                 let eksnap = editor_keys.lock().unwrap().clone();
@@ -4657,6 +4683,29 @@ struct WtManager {
     note: Option<String>,
 }
 
+/// How long a status-bar note stays up (#131). Long enough to read, short
+/// enough that it isn't still there when you next look at the bar. Expiry is
+/// checked when the bar is drawn rather than cleared at each call site: there
+/// are several of those and a new one would forget.
+const NOTE_TTL: Duration = Duration::from_secs(6);
+
+/// Whether a note set at `at` has aged out.
+fn note_expired(at: Instant) -> bool {
+    at.elapsed() >= NOTE_TTL
+}
+
+/// The status bar's right-hand text: a live note ahead of the metrics/clock
+/// segments, or just the segments. A favourite toggle keeps its star (#80); the
+/// other messages don't, and an expired one shows nothing at all (#131).
+fn right_info_with_note(note: Option<&(String, Instant, bool)>, segs: &[String]) -> String {
+    let tail = segs.join("  ");
+    match note.filter(|(_, at, _)| !note_expired(*at)) {
+        Some((n, _, true)) => format!("★ {n}   {tail}"),
+        Some((n, _, false)) => format!("{n}   {tail}"),
+        None => tail,
+    }
+}
+
 /// How long a worktree's classification is reused before being recomputed
 /// (#125). Short enough that the list isn't visibly out of date, long enough
 /// that flipping in and out of the manager doesn't refetch everything. It
@@ -5461,13 +5510,17 @@ fn draw_status(
     // The strip itself is ordered by recency (#77): the project you're on sits
     // first with no number, then mod-1, mod-2, … behind it, with Notes (mod-0)
     // pinned to the end. So the tab you'd reach for is always in the same place.
-    // Only the front of the recency order is drawn (#107) — the rest are a
-    // "+N" count, and the full list is a mod-Tab away. The pinned Notes tab and
-    // the current window are always drawn and don't spend the budget, so the
-    // bar is "where you are, plus the last `status_tabs` you were in".
+    // By default every window is a candidate and the strip simply fills the
+    // width (#132) — `visible_tabs` only admits a tab whose *whole* label fits,
+    // so a wider terminal shows more and a narrower one shows fewer, and the
+    // strip can never wrap to a second row (which would scroll the layout, the
+    // hazard #107 was about). `status_tabs` remains an explicit cap for a
+    // deliberately shorter strip; the pinned Notes tab and the current window
+    // are exempt from it. Whatever ends up off-strip, capped or simply not
+    // fitting, is reported as a "+N".
     let order = tab_order(windows, cur);
     let exempt = order.len() - mru_order(windows, cur).len();
-    let (order, hidden) = capped_tabs(order, max_tabs, exempt);
+    let (order, capped_off) = capped_tabs(order, max_tabs, exempt);
     let labels: Vec<String> = order
         .iter()
         .map(|&i| match numbers[i] {
@@ -5481,19 +5534,25 @@ fn draw_status(
     } else {
         right_info.chars().count() + 2
     };
-    // The "+N" count is reserved out of the tab budget up front, so it can't be
-    // squeezed off the row by the labels it's counting.
+    // Space for the "+N" has to be reserved *before* fitting the run, or the
+    // labels it counts would push it off the row. But how many are hidden isn't
+    // known until the run is fitted, so reserve a worst-case slot whenever
+    // anything could be hidden and print the real number into it afterwards.
+    let could_hide = capped_off > 0 || widths.iter().sum::<usize>() + rwidth + 1 > cols as usize;
+    let reserve = if could_hide { COUNT_SLOT } else { 0 };
+    // Leave the final column untouched so nothing triggers an auto-wrap/scroll.
+    let avail = (cols as usize).saturating_sub(rwidth + reserve + 1);
+    // Scrolling anchors on wherever the current window landed in the strip
+    // (position 1 when Notes is pinned ahead of it).
+    let anchor = order.iter().position(|&i| i == cur).unwrap_or(0);
+    let (start, end) = visible_tabs(&widths, anchor, avail);
+    // Everything the cap dropped, plus everything that didn't fit.
+    let hidden = capped_off + (order.len() - (end - start));
     let more = if hidden > 0 {
         format!(" +{hidden} ")
     } else {
         String::new()
     };
-    // Leave the final column untouched so nothing triggers an auto-wrap/scroll.
-    let avail = (cols as usize).saturating_sub(rwidth + more.chars().count() + 1);
-    // Scrolling anchors on wherever the current window landed in the strip
-    // (position 1 when Notes is pinned ahead of it).
-    let anchor = order.iter().position(|&i| i == cur).unwrap_or(0);
-    let (start, end) = visible_tabs(&widths, anchor, avail);
     if start > 0 {
         queue!(
             out,
@@ -7136,6 +7195,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Notes are transient and only favourites wear a star (#131). The old
+    /// field was never cleared anywhere, so any message stayed on the bar for
+    /// the rest of the session.
+    #[test]
+    fn status_notes_expire_and_only_favourites_get_a_star() {
+        let segs = vec!["cpu 4%".to_string(), "12:00".to_string()];
+        let fresh = Instant::now();
+        let stale = fresh - NOTE_TTL - Duration::from_secs(1);
+
+        // A favourite keeps the star it has always had.
+        let fav = ("favorited".to_string(), fresh, true);
+        assert_eq!(
+            right_info_with_note(Some(&fav), &segs),
+            "★ favorited   cpu 4%  12:00"
+        );
+        // Everything else is plain — a star on "resuming a session from …" says
+        // nothing true about it.
+        let plain = (
+            "resuming a session from -home-u-auto".to_string(),
+            fresh,
+            false,
+        );
+        assert_eq!(
+            right_info_with_note(Some(&plain), &segs),
+            "resuming a session from -home-u-auto   cpu 4%  12:00"
+        );
+        // Expired notes vanish, star or not, leaving the bar to the segments.
+        let old_fav = ("favorited".to_string(), stale, true);
+        assert_eq!(right_info_with_note(Some(&old_fav), &segs), "cpu 4%  12:00");
+        assert_eq!(right_info_with_note(None, &segs), "cpu 4%  12:00");
+        // And the boundary itself counts as expired.
+        assert!(note_expired(Instant::now() - NOTE_TTL));
+        assert!(!note_expired(Instant::now()));
+    }
+
     #[test]
     fn tab_colour_matches_the_manager_and_stays_quiet_when_unknown() {
         use worktree::WtState;
@@ -7380,6 +7474,44 @@ mod tests {
         // No recency candidate (only Notes left): the old index clamp.
         assert_eq!(window_after_close(2, None, 1), 0);
         assert_eq!(window_after_close(0, None, 2), 0);
+    }
+
+    /// With no cap the strip fills the width and never admits a tab it would
+    /// have to cut (#132) — the run-fitting is what keeps the bar on one row,
+    /// which is the hazard #107 was actually about.
+    #[test]
+    fn an_uncapped_strip_fills_the_width_without_clipping() {
+        // Ten tabs of 10 columns each.
+        let w = vec![10usize; 10];
+        // No cap: capped_tabs is a pass-through, so everything reaches the fit.
+        let order: Vec<usize> = (0..10).collect();
+        assert_eq!(capped_tabs(order.clone(), 0, 1), (order.clone(), 0));
+
+        // 100 columns: everything fits, no markers, nothing hidden.
+        let (s, e) = visible_tabs(&w, 0, 100);
+        assert_eq!((s, e), (0, 10));
+        assert_eq!(order.len() - (e - s), 0);
+
+        // 45 columns: only whole tabs are taken, and the count reflects the
+        // rest. (Two columns of the budget go to the ‹/› markers.)
+        let (s, e) = visible_tabs(&w, 0, 45);
+        let shown = e - s;
+        assert!(shown * 10 <= 45, "run must fit: {shown} tabs in 45 cols");
+        assert_eq!(order.len() - shown, 10 - shown, "the rest are counted");
+        assert!(shown < 10, "a narrow bar must hide some");
+
+        // Wider terminal, more tabs — the point of the change.
+        let narrow = visible_tabs(&w, 0, 45);
+        let wide = visible_tabs(&w, 0, 80);
+        assert!(
+            (wide.1 - wide.0) > (narrow.1 - narrow.0),
+            "more room must show more tabs"
+        );
+
+        // An explicit cap still wins over available width.
+        let (capped, off) = capped_tabs(order, 2, 1);
+        assert_eq!(capped.len(), 3, "current + 2 recents");
+        assert_eq!(off, 7);
     }
 
     #[test]

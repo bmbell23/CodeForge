@@ -38,8 +38,9 @@ pub struct Config {
     pub start_editor: bool,
     pub start_terminal: bool,
     pub start_ai: bool,
-    /// How many *recent* window tabs the status bar draws alongside the one
-    /// you're on (#107) — the current window and the pinned Notes tab are
+    /// An optional cap on how many *recent* window tabs the status bar draws
+    /// alongside the one you're on (0 = no cap, the default: fill the width,
+    /// #132) (#107) — the current window and the pinned Notes tab are
     /// always drawn and don't count against this. The full list lives in the
     /// `mod-Tab` switcher, so the bar only has to cover what you're moving
     /// between. 0 means no cap.
@@ -288,7 +289,7 @@ impl Default for Config {
             start_editor: true,
             start_terminal: true,
             start_ai: true,
-            status_tabs: 5,
+            status_tabs: 0,
             notes_dir: String::new(),
             status_metrics: true,
             status_weather: true,
@@ -827,10 +828,11 @@ notes_dir = ""
 # Status-bar temperature location (empty "" disables it).
 weather = "Colorado Springs"
 
-# How many recent windows the bottom bar shows *besides* the one you're on (the
-# current window and Notes are always shown). The rest are a "+N" count and live
-# in the mod-Tab switcher. 0 shows every window (#107).
-status_tabs = 5
+# An optional cap on how many recent windows the bottom bar shows *besides* the
+# one you're on (the current window and Notes are always shown). 0 — the default
+# — means no cap: the strip fills the terminal's width, showing as many whole
+# tabs as fit and counting the rest as "+N" (#132).
+status_tabs = 0
 
 # Status-bar right side (#16). Shown left-to-right: metrics, weather, date, clock.
 status_metrics = true   # cpu / ram / disk usage
