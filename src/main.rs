@@ -95,6 +95,13 @@ struct WindowSpec {
     /// to the resume picker. One per window, because a restore rebuilds a single
     /// AI pane regardless of how many tabs were open.
     ai_resume: Option<String>,
+    /// The recency tick behind `mod-N`'s ordering (#77). Persisted so a restart
+    /// comes back in the order you left it rather than in creation order (#136).
+    used: u64,
+    /// This was the window in focus. `switch_window` stamps the window being
+    /// *left*, so the current one doesn't have the highest tick and can't be
+    /// identified from the ticks alone — it has to be marked (#136).
+    current: bool,
 }
 
 impl WindowSpec {
@@ -104,6 +111,8 @@ impl WindowSpec {
             shell_cwd: None,
             files: Vec::new(),
             ai_resume: None,
+            used: 0,
+            current: false,
         }
     }
 }
@@ -453,11 +462,14 @@ fn nvim_open_file(sock: &Path, file: &Path) {
         .output();
 }
 
-/// Capture a restorable spec for every window (open files + shell cwd).
-fn capture_specs(windows: &[Window]) -> Vec<WindowSpec> {
+/// Capture a restorable spec for every window (open files + shell cwd), plus
+/// the recency tick and which window was focused, so a restart comes back in
+/// the order you left it rather than in creation order (#136).
+fn capture_specs(windows: &[Window], cur: usize) -> Vec<WindowSpec> {
     windows
         .iter()
-        .map(|w| {
+        .enumerate()
+        .map(|(i, w)| {
             let files = w
                 .panes
                 .iter()
@@ -475,6 +487,8 @@ fn capture_specs(windows: &[Window]) -> Vec<WindowSpec> {
                 shell_cwd,
                 files,
                 ai_resume: w.ai_resume.clone(),
+                used: w.used,
+                current: i == cur,
             }
         })
         .collect()
@@ -1051,7 +1065,9 @@ fn new_window(
         notes: spec.dir == notes_dir(),
         // Ordered behind every window already in use, so a newly opened project
         // slots in as the least-recent until you switch to it (#77).
-        used: 0,
+        // Restored from the snapshot; 0 for a newly opened project, which puts
+        // it behind everything already in use (#77, #136).
+        used: spec.used,
         ai_resume: spec.ai_resume.clone(),
     })
 }
@@ -1581,9 +1597,9 @@ fn snapshot_path() -> PathBuf {
 }
 
 /// Save window specs, best-effort. One window per line, tab-separated:
-/// `dir \t shell_cwd \t file1,file2,... \t ai_session_id`. The last field was
-/// added later (#127); a snapshot written without it loads with no resume id,
-/// which is exactly the old behaviour.
+/// `dir \t shell_cwd \t files \t ai_session_id \t used \t current`. Fields have
+/// been appended over time (#127, #136); a snapshot missing any of them loads
+/// with that field's default, which is exactly the older behaviour.
 fn save_snapshot(specs: &[WindowSpec]) {
     let path = snapshot_path();
     if let Some(parent) = path.parent() {
@@ -1605,7 +1621,9 @@ fn save_snapshot(specs: &[WindowSpec]) {
                 .collect::<Vec<_>>()
                 .join(",");
             let resume = s.ai_resume.clone().unwrap_or_default();
-            format!("{dir}\t{cwd}\t{files}\t{resume}")
+            let used = s.used;
+            let current = u8::from(s.current);
+            format!("{dir}\t{cwd}\t{files}\t{resume}\t{used}\t{current}")
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1654,11 +1672,20 @@ fn parse_snapshot(text: &str) -> Vec<WindowSpec> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        // Absent in snapshots written before #136: no recency, nothing current,
+        // which is how restores behaved then.
+        let used = fields
+            .next()
+            .and_then(|f| f.trim().parse().ok())
+            .unwrap_or(0);
+        let current = fields.next().map(|f| f.trim() == "1").unwrap_or(false);
         specs.push(WindowSpec {
             dir,
             shell_cwd,
             files,
             ai_resume,
+            used,
+            current,
         });
     }
     specs
@@ -1966,16 +1993,32 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
             shell_cwd: None,
             files: vec![note],
             ai_resume: None,
+            used: 0,
+            current: false,
         };
         let w = new_window(&spec, &cfg, &shell, next_id, &tx)?;
         next_id += 3;
         windows.insert(0, w);
     }
     // Land on the first real project window when there is one, not Notes.
-    let mut cur = windows.iter().position(|w| !w.notes).unwrap_or(0);
+    // Come back on the window that was focused, when it's still there (#136);
+    // otherwise the first real project, as before.
+    // Matched by directory, not by index: the Notes window is moved to the
+    // front after the windows are built, and duplicate dirs are filtered out
+    // before that, so spec positions and window positions don't correspond.
+    let mut cur = specs
+        .iter()
+        .find(|s| s.current)
+        .and_then(|s| windows.iter().position(|w| w.dir == s.dir))
+        .or_else(|| windows.iter().position(|w| !w.notes))
+        .unwrap_or(0);
     // Monotonic clock behind `mod-N`'s recency order (#77); the window we start
     // on is stamped as the newest below.
-    let mut use_tick: u64 = 0;
+    //
+    // Resume *above* every restored tick. Starting from 0 would make the first
+    // switch stamp 1, which sorts below everything restored, and the order you
+    // just came back with would collapse on the first keypress (#136).
+    let mut use_tick: u64 = windows.iter().map(|w| w.used).max().unwrap_or(0);
     let mut help: Option<HelpState> = None;
     let mut copy: Option<CopyMode> = None;
     let mut msel: Option<MouseSel> = None;
@@ -3184,6 +3227,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                             shell_cwd: None,
                             files: vec![note],
                             ai_resume: None,
+                            used: 0,
+                            current: false,
                         };
                         let w = new_window(&spec, &cfg, &shell, base, &tx)?;
                         windows.insert(0, w);
@@ -3452,7 +3497,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     // windows (open files, shell cwd, resumed AI). Capture state,
                     // tell the client to reconnect, tear down, and hand off to a
                     // fresh detached server that restores from the snapshot.
-                    save_snapshot(&capture_specs(&windows));
+                    save_snapshot(&capture_specs(&windows, cur));
                     if let Some(cl) = client.as_mut() {
                         let _ = protocol::write_frame(cl, protocol::RECONNECT, &[]);
                     }
@@ -3489,7 +3534,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         if quit {
             // Capture a rich snapshot so a later `forge` restores files + cwd.
             if save_enabled {
-                save_snapshot(&capture_specs(&windows));
+                save_snapshot(&capture_specs(&windows, cur));
             }
             if let Some(mut cl) = client.take() {
                 let _ = protocol::write_frame(&mut cl, protocol::DETACH, &[]);
@@ -3535,7 +3580,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         let now_dirs: Vec<PathBuf> = windows.iter().map(|w| w.dir.clone()).collect();
         if now_dirs != last_dirs {
             if save_enabled {
-                save_snapshot(&capture_specs(&windows));
+                save_snapshot(&capture_specs(&windows, cur));
             }
             last_dirs = now_dirs;
         }
@@ -7053,6 +7098,57 @@ mod tests {
     /// A snapshot written before #127 has three fields, not four. It must load
     /// exactly as it used to — a restore that silently lost windows, or grew a
     /// bogus resume id, would be worse than the feature is worth.
+    /// Recency and focus survive a restart (#136). Without them every restored
+    /// window tied at tick 0 and `mru_order` fell back to creation order, so the
+    /// strip came back in the order windows were first opened.
+    #[test]
+    fn snapshots_round_trip_recency_and_focus() {
+        let tmp = std::env::temp_dir().join(format!("cf-recency-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (a, b, c) = (tmp.join("a"), tmp.join("b"), tmp.join("c"));
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (ad, bd, cd) = (a.display(), b.display(), c.display());
+
+        let text = format!("{ad}\t\t\t\t7\t0\n{bd}\t\t\t\t42\t1\n{cd}\t\t\t\t0\t0");
+        let specs = parse_snapshot(&text);
+        assert_eq!(specs.len(), 3);
+        assert_eq!((specs[0].used, specs[0].current), (7, false));
+        assert_eq!(
+            (specs[1].used, specs[1].current),
+            (42, true),
+            "b was focused"
+        );
+        assert_eq!((specs[2].used, specs[2].current), (0, false));
+
+        // The tick counter must resume above everything restored. Starting at 0
+        // would make the next switch stamp 1, sorting below 42 and 7, and the
+        // restored order would collapse on the first keypress.
+        let resumed = specs.iter().map(|s| s.used).max().unwrap_or(0);
+        assert_eq!(resumed, 42);
+        assert!(resumed + 1 > 42);
+
+        // Older snapshots: three and four fields, loading as they always did.
+        let three = format!("{ad}\t\tf.rs");
+        let s3 = parse_snapshot(&three);
+        assert_eq!((s3[0].used, s3[0].current), (0, false));
+        assert_eq!(s3[0].files.len(), 1);
+        let four = format!("{ad}\t\t\tsess-1");
+        let s4 = parse_snapshot(&four);
+        assert_eq!(s4[0].ai_resume.as_deref(), Some("sess-1"));
+        assert_eq!((s4[0].used, s4[0].current), (0, false));
+
+        // Garbage in the new fields degrades to the default rather than failing
+        // the whole line — a restore losing windows is worse than losing order.
+        let junk = format!("{ad}\t\t\t\tnotanumber\tx");
+        let sj = parse_snapshot(&junk);
+        assert_eq!(sj.len(), 1);
+        assert_eq!((sj[0].used, sj[0].current), (0, false));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn snapshots_without_a_session_id_still_load() {
         let tmp = std::env::temp_dir().join(format!("cf-snap-{}", std::process::id()));
