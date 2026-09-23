@@ -121,18 +121,14 @@ impl Picker {
         (start, visible)
     }
 
-    /// Project at visible row `n` (0-based), if that row exists on screen.
-    fn at_visible(&self, n: usize) -> Option<PathBuf> {
-        let (start, visible) = self.window();
-        if n < visible {
-            let mi = self.matches[start + n];
-            Some(self.root.join(&self.all[mi]))
-        } else {
-            None
-        }
-    }
-
     /// Drive the picker from raw input bytes (main-loop / overlay mode).
+    ///
+    /// Digits are ordinary filter text. They used to open the numbered visible
+    /// row, which swallowed the first digit of any ticket number you tried to
+    /// search for — and worktree names are mostly ticket numbers (#137). The row
+    /// a digit referred to also changed as you filtered, so it named nothing
+    /// stable; the `mod-Tab` switcher's digits are a window's own `mod-N`
+    /// number, which is why they stay.
     pub fn feed_bytes(&mut self, bytes: &[u8]) -> PickerAction {
         for &b in bytes {
             match self.esc {
@@ -144,15 +140,6 @@ impl Picker {
                         if let Some(p) = self.selected() {
                             return PickerAction::Chosen(p);
                         }
-                    }
-                    // A digit opens the numbered row directly (shown 1-9). If no
-                    // such row is on screen, fall through and treat it as filter
-                    // text so a project name with a digit is still typable.
-                    b'1'..=b'9' => {
-                        if let Some(p) = self.at_visible((b - b'1') as usize) {
-                            return PickerAction::Chosen(p);
-                        }
-                        self.input_char(b as char);
                     }
                     0x7f | 0x08 => self.backspace(),
                     0x20..=0x7e => self.input_char(b as char),
@@ -211,14 +198,6 @@ impl Picker {
                     KeyCode::Backspace => self.backspace(),
                     KeyCode::Up => self.up(),
                     KeyCode::Down => self.down(),
-                    // Digit opens the numbered row (see feed_bytes); otherwise
-                    // it's filter text.
-                    KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
-                        if let Some(p) = self.at_visible(c as usize - '1' as usize) {
-                            return Ok(Some(p));
-                        }
-                        self.input_char(c);
-                    }
                     KeyCode::Char(c) => self.input_char(c),
                     _ => {}
                 },
@@ -279,7 +258,7 @@ impl Picker {
             out,
             row,
             format!(
-                " {} matches · 1-9 open · ^n worktree · Esc",
+                " {} matches · type to filter · ^n worktree · Esc",
                 self.matches.len()
             ),
         )?;
@@ -376,6 +355,49 @@ fn list_dirs(root: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Digits filter like any other character (#137). They used to open the
+    /// numbered visible row, which ate the first digit of every ticket number —
+    /// and a worktree's distinguishing part *is* its ticket number.
+    #[test]
+    fn digits_filter_instead_of_selecting_a_row() {
+        let root = std::env::temp_dir().join(format!("cf-digits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for n in [
+            "infra-SFAP-108563-thing",
+            "infra-SFAP-107968-other",
+            "auto-SFAP-108134-metrics",
+            "sfaos",
+        ] {
+            std::fs::create_dir_all(root.join(n)).unwrap();
+        }
+        let mut p = Picker::new(root.clone());
+        assert_eq!(p.matches.len(), 4);
+
+        // Typing a ticket number narrows to it rather than opening row 1.
+        for c in "108563".chars() {
+            assert!(
+                matches!(p.feed_bytes(&[c as u8]), PickerAction::None),
+                "digit '{c}' must not choose anything"
+            );
+        }
+        assert_eq!(p.filter, "108563");
+        assert_eq!(p.matches.len(), 1);
+        assert_eq!(p.selected(), Some(root.join("infra-SFAP-108563-thing")));
+
+        // A partial number still narrows progressively.
+        let mut p = Picker::new(root.clone());
+        for c in "1081".chars() {
+            p.feed_bytes(&[c as u8]);
+        }
+        assert_eq!(p.matches.len(), 1, "1081 matches only 108134");
+        assert_eq!(p.selected(), Some(root.join("auto-SFAP-108134-metrics")));
+
+        // Enter still opens the highlighted row.
+        assert!(matches!(p.feed_bytes(b"\r"), PickerAction::Chosen(_)));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// The box grows to fit its longest entry and stops at the terminal edge
     /// (#128). Nested paths are long and it's their *tail* that identifies them,
