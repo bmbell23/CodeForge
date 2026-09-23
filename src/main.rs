@@ -4765,6 +4765,24 @@ fn tabs_needing_refresh(
     out
 }
 
+/// The slice of rows a list of `n` entries shows when only `room` fit and the
+/// cursor is at `sel`: `(start, count)`. Keeps the selection on screen, and
+/// prefers to fill `room` rather than leave a gap after scrolling.
+///
+/// The manager used to draw every entry and bail out entirely when the box
+/// didn't fit — with 65 worktrees that meant a 69-row box and, on any shorter
+/// terminal, nothing drawn at all (#133).
+fn list_window(n: usize, sel: usize, room: usize) -> (usize, usize) {
+    if n == 0 || room == 0 {
+        return (0, 0);
+    }
+    let count = n.min(room);
+    // Scroll only as far as needed to keep `sel` visible, then clamp so the
+    // last screenful is full rather than trailing off the end.
+    let start = sel.saturating_sub(count.saturating_sub(1)).min(n - count);
+    (start, count)
+}
+
 /// Where the manager's cursor starts: on the worktree `here` names when it's one
 /// of them, otherwise the top. Opening the manager from inside a worktree should
 /// land on it rather than making you find it (#120).
@@ -5020,12 +5038,21 @@ impl WtManager {
         let title = if self.pending > 0 {
             format!(" worktrees · updating… ({} left) ", self.pending)
         } else {
-            format!(
-                " worktrees · {} clean of {} ",
-                self.clean_indices().len(),
-                self.entries.len()
-            )
+            {
+                // With a viewport the count on screen may be a fraction of the
+                // list, so say so rather than leaving it to be guessed (#133).
+                let clean = self.clean_indices().len();
+                let n = self.entries.len();
+                format!(" worktrees · {clean} clean of {n} ")
+            }
         };
+        // Rows the box spends on itself: two borders, the title and the hint.
+        const CHROME: u16 = 4;
+        // Only ever ask for rows that exist. The box used to be sized to the
+        // whole list and silently skipped when it didn't fit (#133).
+        let room = rows_h.saturating_sub(CHROME).max(1) as usize;
+        let (first, shown) = list_window(self.entries.len(), self.sel, room);
+        let offscreen = self.entries.len() - shown;
         let hint = match &self.note {
             Some(n) => format!(" {n} "),
             None if !self.marked.is_empty() => {
@@ -5033,6 +5060,11 @@ impl WtManager {
                     " {} marked · d delete them · space unmark · Esc ",
                     self.marked.len()
                 )
+            }
+            // Say what the viewport is hiding, rather than letting the list look
+            // shorter than it is.
+            None if offscreen > 0 => {
+                format!(" j/k move ({offscreen} more) · space mark · d delete · a all · Esc ")
             }
             None => " j/k move · space mark · d delete · a all clean · Esc ".to_string(),
         };
@@ -5045,7 +5077,7 @@ impl WtManager {
             .unwrap_or(30);
         let iw = widest.min(cols.saturating_sub(4) as usize);
         let bw = iw as u16 + 2;
-        let bh = self.entries.len().max(1) as u16 + 4;
+        let bh = shown.max(1) as u16 + CHROME;
         if bw > cols || bh > rows_h {
             return Ok(());
         }
@@ -5080,7 +5112,10 @@ impl WtManager {
             )?;
             row = 1;
         }
-        for (i, e) in self.entries.iter().enumerate() {
+        // `idx` indexes the list (so the selection and marks stay correct);
+        // `vis` is the row on screen, which starts at the top of the viewport.
+        for (idx, e) in self.entries.iter().enumerate().skip(first).take(shown) {
+            let vis = (idx - first) as u16;
             let (label, colour) = match e.state {
                 worktree::WtState::Unknown => ("  …    ", Color::DarkGrey),
                 worktree::WtState::Dirty => ("dirty  ", Color::Red),
@@ -5090,12 +5125,12 @@ impl WtManager {
             };
             queue!(
                 out,
-                cursor::MoveTo(x, y + 1 + i as u16),
+                cursor::MoveTo(x, y + 1 + vis),
                 ResetColor,
                 SetForegroundColor(Color::Cyan),
                 Print("│"),
             )?;
-            if i == self.sel {
+            if idx == self.sel {
                 queue!(
                     out,
                     SetBackgroundColor(Color::Cyan),
@@ -5118,7 +5153,7 @@ impl WtManager {
                 Print(pad(&format!("{mark}{label} {}{reason}", e.name)))
             )?;
             queue!(out, ResetColor, SetForegroundColor(Color::Cyan), Print("│"))?;
-            row = i as u16 + 1;
+            row = vis + 1;
         }
         let h: String = hint.chars().take(iw).collect();
         queue!(
@@ -7352,6 +7387,52 @@ mod tests {
         // Not a worktree (a clone, or the root itself): top of the list.
         assert_eq!(preselect(&entries, &PathBuf::from("/p/sfaos")), 0);
         assert_eq!(preselect(&[], &PathBuf::from("/p/b")), 0);
+    }
+
+    /// The manager's viewport (#133). Before this it sized the box to the whole
+    /// list and drew nothing at all when that didn't fit — 65 worktrees meant a
+    /// 69-row box, so on any normal terminal `mod-D` showed an empty screen.
+    #[test]
+    fn list_window_keeps_the_selection_visible() {
+        // Everything fits: show it all from the top.
+        assert_eq!(list_window(5, 0, 20), (0, 5));
+        assert_eq!(list_window(5, 4, 20), (0, 5));
+
+        // 65 entries, 20 rows of room — the reported case.
+        let (start, count) = list_window(65, 0, 20);
+        assert_eq!((start, count), (0, 20));
+        // Selection near the end scrolls just enough to show it...
+        let (start, count) = list_window(65, 30, 20);
+        assert_eq!(count, 20);
+        assert!(
+            start <= 30 && 30 < start + count,
+            "sel {start}..{}",
+            start + count
+        );
+        // ...and the last screenful is full, not a trailing sliver.
+        let (start, count) = list_window(65, 64, 20);
+        assert_eq!((start, count), (45, 20));
+
+        // Degenerate inputs don't panic or produce a nonsense window.
+        assert_eq!(list_window(0, 0, 20), (0, 0));
+        assert_eq!(list_window(5, 0, 0), (0, 0));
+        assert_eq!(list_window(1, 0, 1), (0, 1));
+
+        // Whatever the selection, it is always on screen and the count never
+        // exceeds the room offered.
+        for n in [1usize, 2, 7, 65] {
+            for room in [1usize, 3, 20] {
+                for sel in 0..n {
+                    let (start, count) = list_window(n, sel, room);
+                    assert!(count <= room && count <= n, "n={n} room={room} sel={sel}");
+                    assert!(
+                        start <= sel && sel < start + count,
+                        "sel {sel} off screen: {start}..{}",
+                        start + count
+                    );
+                }
+            }
+        }
     }
 
     #[test]
