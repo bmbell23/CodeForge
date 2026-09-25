@@ -2227,7 +2227,15 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 wt_cache.remove(p);
                             }
                             let m = wtman.get_or_insert_with(|| {
-                                WtManager::new(&proot, &proot, &tx, &wt_cache, &jira_cache)
+                                WtManager::new(
+                                    &proot,
+                                    &proot,
+                                    &tx,
+                                    &wt_cache,
+                                    &jira_cache,
+                                    &cfg.jira_email,
+                                    &cfg.jira_token_cmd,
+                                )
                             });
                             m.remove_paths(&gone);
                             m.note = Some(if failures.is_empty() {
@@ -2961,6 +2969,8 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         &tx,
                         &wt_cache,
                         &jira_cache,
+                        &cfg.jira_email,
+                        &cfg.jira_token_cmd,
                     ));
                     dirty = true;
                     needs_clear = true;
@@ -4738,6 +4748,8 @@ struct WtManager {
     /// why not. The manager is reused rather than given a second delete path so
     /// there is one confirmation rule, not a laxer one for the current worktree.
     auto_confirm: bool,
+    /// Why Jira lookups can't run, when they can't (#139).
+    jira_hint: Option<&'static str>,
     /// Jira status per ticket, for the rows that have one (#135). Advisory:
     /// displayed and used to flag, never used to decide what may be deleted.
     tickets: HashMap<String, Option<String>>,
@@ -4910,6 +4922,8 @@ impl WtManager {
         tx: &Sender<Msg>,
         cache: &HashMap<PathBuf, (Instant, worktree::WtState)>,
         jira: &HashMap<String, (Instant, Option<String>)>,
+        jira_email: &str,
+        jira_token_cmd: &str,
     ) -> WtManager {
         let mut entries = worktree::list_worktrees(root);
         let sel = preselect(&entries, here);
@@ -4944,8 +4958,12 @@ impl WtManager {
                 }
             }
         }
-        if !want.is_empty() && jira::credentials().is_some() {
-            let tx = tx.clone();
+        if !want.is_empty() && jira::credentials(jira_email, jira_token_cmd).is_some() {
+            let (tx, jira_email, jira_token_cmd) = (
+                tx.clone(),
+                jira_email.to_string(),
+                jira_token_cmd.to_string(),
+            );
             thread::spawn(move || {
                 // Small pool: this is someone else's API, and a worktree list
                 // can carry dozens of distinct tickets.
@@ -4955,9 +4973,10 @@ impl WtManager {
                     .chunks(chunk)
                     .map(|c| {
                         let (c, tx) = (c.to_vec(), tx.clone());
+                        let (em, tc) = (jira_email.clone(), jira_token_cmd.clone());
                         thread::spawn(move || {
                             for t in c {
-                                let st = jira::status(&t);
+                                let st = jira::status(&t, &em, &tc);
                                 let _ = tx.send(Msg::TicketStatus(t, st));
                             }
                         })
@@ -4969,6 +4988,12 @@ impl WtManager {
             });
         }
 
+        // Computed before `entries` is moved into the struct.
+        let jira_hint = if entries.iter().any(|e| jira::ticket_of(&e.path).is_some()) {
+            jira::credentials_hint(jira_email, jira_token_cmd)
+        } else {
+            None
+        };
         let pending = stale.len();
         if !stale.is_empty() {
             let tx = tx.clone();
@@ -5011,6 +5036,7 @@ impl WtManager {
             entries,
             sel,
             auto_confirm: false,
+            jira_hint,
             tickets,
             marked: Vec::new(),
             confirm: None,
@@ -5031,6 +5057,7 @@ impl WtManager {
             entries: vec![entry],
             sel: 0,
             auto_confirm: true,
+            jira_hint: None,
             tickets: HashMap::new(),
             marked: Vec::new(),
             confirm: None,
@@ -5209,6 +5236,8 @@ impl WtManager {
             }
             // Say what the viewport is hiding, rather than letting the list look
             // shorter than it is.
+            // One clear line beats a column of unexplained "?" (#139).
+            None if self.jira_hint.is_some() => format!(" {} ", self.jira_hint.unwrap()),
             None if offscreen > 0 => {
                 format!(" j/k move ({offscreen} more) · space mark · d delete · a all · Esc ")
             }
@@ -7555,6 +7584,7 @@ mod tests {
                 sel: 0,
                 pending: 1,
                 auto_confirm: true,
+                jira_hint: None,
                 tickets: HashMap::new(),
                 marked: Vec::new(),
                 confirm: None,
@@ -7704,6 +7734,7 @@ mod tests {
             sel: 0,
             pending: 0,
             auto_confirm: false,
+            jira_hint: None,
             tickets: HashMap::new(),
             marked: Vec::new(),
             confirm: None,

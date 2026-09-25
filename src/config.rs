@@ -45,6 +45,14 @@ pub struct Config {
     /// `mod-Tab` switcher, so the bar only has to cover what you're moving
     /// between. 0 means no cap.
     pub status_tabs: usize,
+    /// Jira account for the worktree manager's ticket status (#135). Falls back
+    /// to `JIRA_EMAIL` / `JIRA_IME_EMAIL` from the environment.
+    pub jira_email: String,
+    /// A command whose stdout is the Jira API token. A command rather than the
+    /// token itself keeps the secret out of this file and leaves OpenBao the
+    /// source of truth — and lets a long-lived server fetch one even though it
+    /// inherited an environment without it (#139).
+    pub jira_token_cmd: String,
     /// Where the Notes project lives (#129). Absolute, or relative to the
     /// projects root (`"BMB/Notes"`). Empty means: use `<root>/Notes` if it
     /// exists, else a uniquely-named `Notes` project found anywhere under the
@@ -290,6 +298,8 @@ impl Default for Config {
             start_terminal: true,
             start_ai: true,
             status_tabs: 0,
+            jira_email: String::new(),
+            jira_token_cmd: String::new(),
             notes_dir: String::new(),
             status_metrics: true,
             status_weather: true,
@@ -819,6 +829,13 @@ autosave = true
 # Layout ratios.
 editor_ratio = 0.5   # editor width fraction (left column)
 right_ratio  = 0.5   # terminal height fraction of the right column
+
+# Jira, for the worktree manager's ticket status. Both are optional and the
+# environment wins: JIRA_EMAIL / JIRA_API_TOKEN (or JIRA_IME_*) are used when
+# set. `jira_token_cmd` runs a command and takes its first line of output as the
+# token, so the secret isn't stored here — e.g. a `bao kv get` invocation.
+jira_email = ""
+jira_token_cmd = ""
 
 # Where the Notes project lives. Absolute, or relative to the projects root
 # ("BMB/Notes"). Empty: <root>/Notes when it exists, otherwise a uniquely-named

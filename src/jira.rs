@@ -17,12 +17,29 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Jira instance. Overridable for anyone pointed at a different tenant.
+/// The issue endpoint for `ticket`.
+///
+/// `JIRA_URL` is written two ways in practice: a bare host
+/// (`https://ime-ddn.atlassian.net`) and a full API root
+/// (`https://api.atlassian.com/ex/jira/<cloud-id>/rest/api/latest/`, which is
+/// what the `ime-ddn-jira` MCP server is configured with). Appending a path to
+/// the second produces `…/rest/api/latest/rest/api/3/issue/KEY` and a 404, so
+/// a URL that already names an API root is used as one (#139).
+pub fn issue_url(base: &str, ticket: &str) -> String {
+    let base = base.trim().trim_end_matches('/');
+    if base.contains("/rest/api") {
+        format!("{base}/issue/{ticket}?fields=status")
+    } else {
+        format!("{base}/rest/api/3/issue/{ticket}?fields=status")
+    }
+}
+
+/// Configured Jira base, however it's spelled.
 fn base_url() -> String {
     std::env::var("JIRA_URL")
-        .unwrap_or_else(|_| "https://ime-ddn.atlassian.net".to_string())
-        .trim_end_matches('/')
-        .to_string()
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "https://ime-ddn.atlassian.net".to_string())
 }
 
 /// `(email, token)` from the environment, or `None` when they aren't there.
@@ -30,16 +47,54 @@ fn base_url() -> String {
 /// Two spellings are accepted: `JIRA_EMAIL`/`JIRA_API_TOKEN`, which is what
 /// `~/.config/ddn-mcp/env` exports here, and `JIRA_IME_*`, which is what the
 /// request named. Whichever is set wins, so neither spelling is wrong.
-pub fn credentials() -> Option<(String, String)> {
+pub fn credentials(cfg_email: &str, cfg_token_cmd: &str) -> Option<(String, String)> {
     let pick = |a: &str, b: &str| {
         std::env::var(a)
             .ok()
             .or_else(|| std::env::var(b).ok())
             .filter(|v| !v.trim().is_empty())
     };
-    let email = pick("JIRA_EMAIL", "JIRA_IME_EMAIL")?;
-    let token = pick("JIRA_API_TOKEN", "JIRA_IME_API_TOKEN")?;
+    let email = pick("JIRA_EMAIL", "JIRA_IME_EMAIL")
+        .or_else(|| Some(cfg_email.trim().to_string()).filter(|v| !v.is_empty()))?;
+    let token = match pick("JIRA_API_TOKEN", "JIRA_IME_API_TOKEN") {
+        Some(t) => t,
+        // No env token: run the configured command and take its stdout. A
+        // command rather than a literal keeps the secret out of config.toml and
+        // leaves OpenBao the source of truth — and the long-lived server can
+        // fetch one even though it inherited an environment without it.
+        None => run_token_cmd(cfg_token_cmd)?,
+    };
     Some((email, token))
+}
+
+/// Run `cmd` through a shell and take the first line of its stdout as a token.
+fn run_token_cmd(cmd: &str) -> Option<String> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let token = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    (!token.is_empty()).then_some(token)
+}
+
+/// Why a lookup can't run, for a message the user can act on — `?` on every row
+/// with no explanation is the thing to avoid (#139).
+pub fn credentials_hint(cfg_email: &str, cfg_token_cmd: &str) -> Option<&'static str> {
+    if credentials(cfg_email, cfg_token_cmd).is_some() {
+        return None;
+    }
+    Some("no Jira credentials (set JIRA_EMAIL/JIRA_API_TOKEN, or jira_token_cmd in config)")
 }
 
 /// The ticket key embedded in a worktree's directory name, if there is one.
@@ -67,8 +122,8 @@ pub fn ticket_of(path: &Path) -> Option<String> {
 /// A ticket's status name (`In Progress`, `Closed`, …), or `None` when it can't
 /// be determined — no credentials, no network, unknown issue. Bounded so a slow
 /// Jira can't wedge the caller.
-pub fn status(ticket: &str) -> Option<String> {
-    let (email, token) = credentials()?;
+pub fn status(ticket: &str, cfg_email: &str, cfg_token_cmd: &str) -> Option<String> {
+    let (email, token) = credentials(cfg_email, cfg_token_cmd)?;
     // The key goes into a URL; anything that isn't a key shape is not ours to
     // send anywhere.
     if !ticket
@@ -77,7 +132,7 @@ pub fn status(ticket: &str) -> Option<String> {
     {
         return None;
     }
-    let url = format!("{}/rest/api/3/issue/{ticket}?fields=status", base_url());
+    let url = issue_url(&base_url(), ticket);
     let out = Command::new("curl")
         .args(["-s", "--max-time", "15", "-H", "Accept: application/json"])
         .arg("-u")
@@ -152,6 +207,58 @@ mod tests {
             status_from_json(br#"{"fields":{"status":{"name":""}}}"#),
             None
         );
+    }
+
+    /// Both shapes of `JIRA_URL` seen in practice (#139). Appending to the API
+    /// root gives `…/rest/api/latest/rest/api/3/issue/KEY`, which 404s.
+    #[test]
+    fn issue_url_handles_a_bare_host_and_an_api_root() {
+        assert_eq!(
+            issue_url("https://ime-ddn.atlassian.net", "SFAP-1"),
+            "https://ime-ddn.atlassian.net/rest/api/3/issue/SFAP-1?fields=status"
+        );
+        // Trailing slash shouldn't double up.
+        assert_eq!(
+            issue_url("https://ime-ddn.atlassian.net/", "SFAP-1"),
+            "https://ime-ddn.atlassian.net/rest/api/3/issue/SFAP-1?fields=status"
+        );
+        // What the ime-ddn-jira MCP server is configured with.
+        assert_eq!(
+            issue_url(
+                "https://api.atlassian.com/ex/jira/abc-123/rest/api/latest/",
+                "SFAP-1"
+            ),
+            "https://api.atlassian.com/ex/jira/abc-123/rest/api/latest/issue/SFAP-1?fields=status"
+        );
+    }
+
+    /// Credentials resolve from config when the environment has none — which is
+    /// the normal case for a long-lived server that launched before `baoin`.
+    #[test]
+    fn credentials_fall_back_to_the_configured_command() {
+        // Env is not touched here; on a machine that has JIRA_EMAIL set this
+        // still holds, since env only ever wins.
+        let got = credentials("me@ddn.com", "printf 'tok-123\n'");
+        assert!(got.is_some(), "config should satisfy it");
+        let (_, token) = got.unwrap();
+        assert_eq!(token, "tok-123");
+
+        // A command that fails, prints nothing, or isn't set yields no
+        // credentials rather than an empty token that 401s confusingly.
+        assert!(
+            credentials("me@ddn.com", "exit 1").is_none()
+                || std::env::var("JIRA_API_TOKEN").is_ok()
+        );
+        assert!(
+            credentials("me@ddn.com", "true").is_none() || std::env::var("JIRA_API_TOKEN").is_ok()
+        );
+        assert!(credentials("", "").is_none() || std::env::var("JIRA_EMAIL").is_ok());
+
+        // And the hint names what to do about it.
+        if credentials("", "").is_none() {
+            assert!(credentials_hint("", "").unwrap().contains("JIRA_EMAIL"));
+        }
+        assert!(credentials_hint("me@ddn.com", "printf tok").is_none());
     }
 
     #[test]
