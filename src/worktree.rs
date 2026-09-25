@@ -251,6 +251,17 @@ fn run_sfaos_venv(worktree: &Path, progress: &dyn Fn(&str)) {
     }
 }
 
+/// Run `env/venv.sh` at the root of an infra worktree (#138). It writes the
+/// gitignored `<worktree>/py3` stub -> the /home/pve/infra venv, which the
+/// repo's pre-push hooks run through; without it the first push fails.
+/// Best-effort, and output is captured so it can't draw over the TUI.
+fn run_infra_venv(worktree: &Path, progress: &dyn Fn(&str)) {
+    if worktree.join("env/venv.sh").is_file() {
+        progress("writing py3 stub…");
+        let _ = Command::new("env/venv.sh").current_dir(worktree).output();
+    }
+}
+
 /// Create the worktree(s) for `spec` and return the primary one's path (the
 /// path CodeForge should open as a window). `progress` is called with a short
 /// human status at each step so the form can show live progress (#50).
@@ -286,6 +297,8 @@ pub fn create(
         let auto_clone = sibling_clone(&clone_dir, projects_root, "auto");
         link_sfaos_lib(&primary, &auto_clone.join("lib"));
         run_sfaos_venv(&primary, progress);
+    } else if base == "infra" {
+        run_infra_venv(&primary, progress);
     }
 
     progress("opening…");
@@ -419,6 +432,57 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn infra_create_writes_py3_stub() {
+        // #138: an infra worktree gets its gitignored py3 stub from env/venv.sh.
+        let tmp = std::env::temp_dir().join(format!("cf-infra-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let origin = tmp.join("origin");
+        std::fs::create_dir_all(origin.join("env")).unwrap();
+        let run = |d: &Path, a: &[&str]| {
+            let o = Command::new("git")
+                .arg("-C")
+                .arg(d)
+                .args(a)
+                .output()
+                .unwrap();
+            assert!(
+                o.status.success(),
+                "git {a:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        };
+        run(&origin, &["init", "-q", "-b", "master"]);
+        run(&origin, &["config", "user.email", "t@t"]);
+        run(&origin, &["config", "user.name", "t"]);
+        let venv_sh = origin.join("env/venv.sh");
+        std::fs::write(&venv_sh, "#!/bin/bash\necho stub > py3\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&venv_sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(origin.join(".gitignore"), "py3\n").unwrap();
+        run(&origin, &["add", "."]);
+        run(&origin, &["commit", "-qm", "one"]);
+        let o = Command::new("git")
+            .arg("-C")
+            .arg(&tmp)
+            .args(["clone", "-q", origin.to_str().unwrap(), "infra"])
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+
+        let spec = WorktreeSpec {
+            clone: "infra".into(),
+            ticket: "SFAP-1".into(),
+            description: "py3 stub".into(),
+            upstream: String::new(),
+            also_auto: false,
+        };
+        let made = create(&tmp, &spec, &|_| {}).unwrap();
+        let stub = std::fs::read_to_string(made.join("py3"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(stub.unwrap(), "stub\n");
     }
 
     #[test]

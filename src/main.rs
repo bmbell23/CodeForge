@@ -45,6 +45,7 @@
 mod config;
 mod favorites;
 mod gitdiff;
+mod jira;
 mod layout;
 mod pane;
 mod picker;
@@ -534,6 +535,8 @@ pub enum Msg {
     OpenWorktrees,
     /// Delete the current window's worktree (#124).
     DeleteWorktree,
+    /// A ticket's Jira status came back (#135). `None` = couldn't be determined.
+    TicketStatus(String, Option<String>),
     /// Open the history of the file the editor is showing (#92).
     OpenFileLog,
     /// A background classification finished: worktree path -> state (#83).
@@ -2047,6 +2050,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     // Worktree classifications, reused across manager opens within the TTL
     // (#125). Display only — never consulted when deciding what may be deleted.
     let mut wt_cache: HashMap<PathBuf, (Instant, worktree::WtState)> = HashMap::new();
+    // Jira status per ticket (#135). Advisory only: it colours and flags rows,
+    // and is never consulted when deciding what may be deleted.
+    let mut jira_cache: HashMap<String, (Instant, Option<String>)> = HashMap::new();
     let mut diff: Option<DiffList> = None;
     let mut diff_zoom: Option<DiffZoom> = None;
     // Editor fullscreen while a grug-far search is open (#53), mirroring the
@@ -2221,7 +2227,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 wt_cache.remove(p);
                             }
                             let m = wtman.get_or_insert_with(|| {
-                                WtManager::new(&proot, &proot, &tx, &wt_cache)
+                                WtManager::new(&proot, &proot, &tx, &wt_cache, &jira_cache)
                             });
                             m.remove_paths(&gone);
                             m.note = Some(if failures.is_empty() {
@@ -2949,9 +2955,22 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     needs_clear = true;
                 }
                 Msg::OpenWorktrees => {
-                    wtman = Some(WtManager::new(&proot, &windows[cur].dir, &tx, &wt_cache));
+                    wtman = Some(WtManager::new(
+                        &proot,
+                        &windows[cur].dir,
+                        &tx,
+                        &wt_cache,
+                        &jira_cache,
+                    ));
                     dirty = true;
                     needs_clear = true;
+                }
+                Msg::TicketStatus(ticket, status) => {
+                    jira_cache.insert(ticket.clone(), (Instant::now(), status.clone()));
+                    if let Some(m) = wtman.as_mut() {
+                        m.tickets.insert(ticket, status);
+                        dirty = true;
+                    }
                 }
                 Msg::WorktreeState(path, state) => {
                     wt_cache.insert(path.clone(), (Instant::now(), state));
@@ -4719,6 +4738,9 @@ struct WtManager {
     /// why not. The manager is reused rather than given a second delete path so
     /// there is one confirmation rule, not a laxer one for the current worktree.
     auto_confirm: bool,
+    /// Jira status per ticket, for the rows that have one (#135). Advisory:
+    /// displayed and used to flag, never used to decide what may be deleted.
+    tickets: HashMap<String, Option<String>>,
     /// Rows picked out for a batch delete, by path — indices shift as entries
     /// are removed, paths don't (#118).
     marked: Vec<PathBuf>,
@@ -4757,6 +4779,11 @@ fn right_info_with_note(note: Option<&(String, Instant, bool)>, segs: &[String])
 /// governs *display* only: a delete always re-checks against git first, because
 /// a stale "clean" reaching a delete would destroy real work.
 const WT_CACHE_TTL: Duration = Duration::from_secs(120);
+
+/// How long a Jira status is reused (#135). Longer than the git classification:
+/// a ticket's status changes on human timescales, and this is someone else's
+/// API — refetching a list's worth of tickets on every `mod-D` would be rude.
+const JIRA_CACHE_TTL: Duration = Duration::from_secs(600);
 
 /// How stale an *open* window's classification may get before the tick
 /// refreshes it (#126). Shorter than the manager's TTL because the tab strip is
@@ -4828,6 +4855,32 @@ fn list_window(n: usize, sel: usize, room: usize) -> (usize, usize) {
     (start, count)
 }
 
+/// The ticket column for a row: the status, plus a flag when the worktree looks
+/// finished but its ticket doesn't (#135).
+///
+/// Purely advisory. `⚠` means "worth a look before you delete this", never
+/// "don't" — and nothing here feeds the delete gate.
+fn ticket_cell(ticket: Option<&str>, status: Option<&Option<String>>, clean: bool) -> String {
+    let Some(t) = ticket else {
+        return String::new();
+    };
+    match status {
+        // Fetched and known.
+        Some(Some(st)) => {
+            let flag = if clean && !jira::is_closed(st) {
+                " ⚠"
+            } else {
+                ""
+            };
+            format!("  {t} · {st}{flag}")
+        }
+        // Asked, and Jira couldn't say.
+        Some(None) => format!("  {t} · ?"),
+        // Not asked yet.
+        None => format!("  {t} · …"),
+    }
+}
+
 /// Where the manager's cursor starts: on the worktree `here` names when it's one
 /// of them, otherwise the top. Opening the manager from inside a worktree should
 /// land on it rather than making you find it (#120).
@@ -4856,6 +4909,7 @@ impl WtManager {
         here: &Path,
         tx: &Sender<Msg>,
         cache: &HashMap<PathBuf, (Instant, worktree::WtState)>,
+        jira: &HashMap<String, (Instant, Option<String>)>,
     ) -> WtManager {
         let mut entries = worktree::list_worktrees(root);
         let sel = preselect(&entries, here);
@@ -4870,6 +4924,51 @@ impl WtManager {
                 _ => stale.push(e.path.clone()),
             }
         }
+        // Ticket statuses: seed what's cached, fetch the rest once per distinct
+        // ticket in the background (#135). Skipped entirely without credentials
+        // — no point spawning curl to fail.
+        let mut tickets: HashMap<String, Option<String>> = HashMap::new();
+        let mut want: Vec<String> = Vec::new();
+        for e in &entries {
+            let Some(t) = jira::ticket_of(&e.path) else {
+                continue;
+            };
+            match jira.get(&t) {
+                Some((at, st)) if at.elapsed() < JIRA_CACHE_TTL => {
+                    tickets.insert(t, st.clone());
+                }
+                _ => {
+                    if !want.contains(&t) {
+                        want.push(t);
+                    }
+                }
+            }
+        }
+        if !want.is_empty() && jira::credentials().is_some() {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                // Small pool: this is someone else's API, and a worktree list
+                // can carry dozens of distinct tickets.
+                const POOL: usize = 6;
+                let chunk = want.len().div_ceil(POOL).max(1);
+                let workers: Vec<_> = want
+                    .chunks(chunk)
+                    .map(|c| {
+                        let (c, tx) = (c.to_vec(), tx.clone());
+                        thread::spawn(move || {
+                            for t in c {
+                                let st = jira::status(&t);
+                                let _ = tx.send(Msg::TicketStatus(t, st));
+                            }
+                        })
+                    })
+                    .collect();
+                for w in workers {
+                    let _ = w.join();
+                }
+            });
+        }
+
         let pending = stale.len();
         if !stale.is_empty() {
             let tx = tx.clone();
@@ -4912,6 +5011,7 @@ impl WtManager {
             entries,
             sel,
             auto_confirm: false,
+            tickets,
             marked: Vec::new(),
             confirm: None,
             note: None,
@@ -4931,6 +5031,7 @@ impl WtManager {
             entries: vec![entry],
             sel: 0,
             auto_confirm: true,
+            tickets: HashMap::new(),
             marked: Vec::new(),
             confirm: None,
             note: Some("checking…".into()),
@@ -5116,7 +5217,18 @@ impl WtManager {
         let widest = self
             .entries
             .iter()
-            .map(|e| e.name.chars().count() + 12)
+            .map(|e| {
+                let t = jira::ticket_of(&e.path);
+                e.name.chars().count()
+                    + 12
+                    + ticket_cell(
+                        t.as_deref(),
+                        t.as_ref().and_then(|t| self.tickets.get(t)),
+                        false,
+                    )
+                    .chars()
+                    .count()
+            })
             .chain([title.chars().count(), hint.chars().count()])
             .max()
             .unwrap_or(30);
@@ -5193,9 +5305,17 @@ impl WtManager {
             } else {
                 " "
             };
+            let tcell = {
+                let t = jira::ticket_of(&e.path);
+                ticket_cell(
+                    t.as_deref(),
+                    t.as_ref().and_then(|t| self.tickets.get(t)),
+                    e.deletable(),
+                )
+            };
             queue!(
                 out,
-                Print(pad(&format!("{mark}{label} {}{reason}", e.name)))
+                Print(pad(&format!("{mark}{label} {}{reason}{tcell}", e.name)))
             )?;
             queue!(out, ResetColor, SetForegroundColor(Color::Cyan), Print("│"))?;
             row = vis + 1;
@@ -7435,6 +7555,7 @@ mod tests {
                 sel: 0,
                 pending: 1,
                 auto_confirm: true,
+                tickets: HashMap::new(),
                 marked: Vec::new(),
                 confirm: None,
                 note: Some("checking…".into()),
@@ -7488,6 +7609,41 @@ mod tests {
     /// The manager's viewport (#133). Before this it sized the box to the whole
     /// list and drew nothing at all when that didn't fit — 65 worktrees meant a
     /// 69-row box, so on any normal terminal `mod-D` showed an empty screen.
+    /// The ticket column (#135). The flag is the whole point of the feature —
+    /// "clean, but the ticket is still open" is the case worth a second look —
+    /// and it must never read as permission to delete.
+    #[test]
+    fn ticket_cell_flags_clean_worktrees_with_open_tickets() {
+        let closed = Some(Some("Closed".to_string()));
+        let open = Some(Some("In Progress".to_string()));
+
+        // Clean + still open: flagged.
+        let c = ticket_cell(Some("SFAP-108563"), open.as_ref(), true);
+        assert!(
+            c.contains("SFAP-108563") && c.contains("In Progress"),
+            "{c}"
+        );
+        assert!(c.contains('⚠'), "clean + open should be flagged: {c}");
+
+        // Clean + closed: the uncontroversial case, no flag.
+        let c = ticket_cell(Some("SFAP-108563"), closed.as_ref(), true);
+        assert!(!c.contains('⚠'), "{c}");
+
+        // Not clean: no flag regardless of the ticket. The worktree's own state
+        // is the thing that matters, and it already says "dirty".
+        assert!(!ticket_cell(Some("SFAP-1"), open.as_ref(), false).contains('⚠'));
+        assert!(!ticket_cell(Some("SFAP-1"), closed.as_ref(), false).contains('⚠'));
+
+        // Unknown states are shown as unknown, never guessed into a flag.
+        let pending = ticket_cell(Some("SFAP-1"), None, true);
+        assert!(pending.contains('…') && !pending.contains('⚠'), "{pending}");
+        let failed = ticket_cell(Some("SFAP-1"), Some(&None), true);
+        assert!(failed.contains('?') && !failed.contains('⚠'), "{failed}");
+
+        // No ticket (a clone, or SFAP-NONE): no column at all.
+        assert_eq!(ticket_cell(None, closed.as_ref(), true), "");
+    }
+
     #[test]
     fn list_window_keeps_the_selection_visible() {
         // Everything fits: show it all from the top.
@@ -7548,6 +7704,7 @@ mod tests {
             sel: 0,
             pending: 0,
             auto_confirm: false,
+            tickets: HashMap::new(),
             marked: Vec::new(),
             confirm: None,
             note: None,
