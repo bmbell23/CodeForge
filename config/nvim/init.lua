@@ -889,7 +889,7 @@ require("lazy").setup({
             { CFKeys.pdisp("win_list"), "switch window" },
             { CFKeys.pdisp("favorites", "favorite_toggle"), "favorites / mark" },
             { CFKeys.pdisp("worktrees", "worktree_delete"), "worktrees / delete this one" },
-            { CFKeys.pdisp("copy"), "scroll/copy" },
+            { CFKeys.pdisp("copy"), "scroll/copy (W grabs a URL)" },
             { CFKeys.pdisp("help"), "all keys" },
           },
         }

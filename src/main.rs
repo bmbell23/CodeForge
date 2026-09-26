@@ -4449,7 +4449,8 @@ fn render(
                 p.title.clone()
             };
             if copy.is_some_and(|cm| cm.pane_id == *id) {
-                title.push_str("  COPY: j/k scroll · v select · y copy · Esc exit");
+                title
+                    .push_str("  COPY: hjkl/wb move · 0$ ends · W token · v select · y copy · Esc");
             }
             draw_border(out, rect, &title, *id == w.focus_id)?;
             if let Some(inner) = rect.inner() {
@@ -6159,6 +6160,15 @@ enum CopyKey {
     Select,
     Yank,
     Esc,
+    /// Word forward / back, and line start / end (#140). Horizontal movement
+    /// was one column per press, which made copying a URL a fifty-key job.
+    WordFwd,
+    WordBack,
+    LineStart,
+    LineEnd,
+    /// Select the whitespace-delimited token under the cursor — a URL, a path
+    /// or a ticket id — in one key.
+    SelectToken,
 }
 
 /// Decode input bytes into copy-mode keys (hjkl + arrows, C-u/C-d + PageUp/Dn,
@@ -6200,6 +6210,11 @@ fn decode_copy_keys(bytes: &[u8]) -> Vec<CopyKey> {
             b'l' => v.push(CopyKey::Right),
             b'g' => v.push(CopyKey::Top),
             b'G' => v.push(CopyKey::Bottom),
+            b'w' => v.push(CopyKey::WordFwd),
+            b'b' => v.push(CopyKey::WordBack),
+            b'0' | b'^' => v.push(CopyKey::LineStart),
+            b'$' => v.push(CopyKey::LineEnd),
+            b'W' => v.push(CopyKey::SelectToken),
             b'v' | b' ' => v.push(CopyKey::Select),
             b'q' => v.push(CopyKey::Esc),
             _ => {}
@@ -6207,6 +6222,94 @@ fn decode_copy_keys(bytes: &[u8]) -> Vec<CopyKey> {
         i += 1;
     }
     v
+}
+
+/// The characters on one screen row, as a plain string — the basis for the
+/// word motions (#140). Trailing blanks are kept so column indices line up with
+/// what's on screen.
+fn row_text(screen: &vt100::Screen, row: u16) -> Vec<char> {
+    let (_, cols) = screen.size();
+    (0..cols)
+        .map(|c| {
+            screen
+                .cell(row, c)
+                .map(|cell| cell.contents())
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.chars().next())
+                .unwrap_or(' ')
+        })
+        .collect()
+}
+
+/// Next word start at or after `col`, vi-style `w`: leave the current run, then
+/// skip blanks. Stops at the last column rather than wrapping — copy mode moves
+/// within a row.
+fn word_forward(row: &[char], col: u16) -> u16 {
+    let n = row.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut i = (col as usize).min(n - 1);
+    let start_blank = row[i] == ' ';
+    // Step off the current token (unless sitting on blanks already).
+    if !start_blank {
+        while i < n && row[i] != ' ' {
+            i += 1;
+        }
+    }
+    while i < n && row[i] == ' ' {
+        i += 1;
+    }
+    (i.min(n - 1)) as u16
+}
+
+/// Previous word start, vi-style `b`.
+fn word_back(row: &[char], col: u16) -> u16 {
+    let n = row.len();
+    if n == 0 {
+        return 0;
+    }
+    let mut i = (col as usize).min(n - 1);
+    // Step back over blanks, then to the start of the token we land in.
+    i = i.saturating_sub(1);
+    while i > 0 && row[i] == ' ' {
+        i -= 1;
+    }
+    while i > 0 && row[i - 1] != ' ' {
+        i -= 1;
+    }
+    i as u16
+}
+
+/// Last non-blank column, vi-style `$`. Zero for a blank row.
+fn line_end(row: &[char]) -> u16 {
+    row.iter().rposition(|c| *c != ' ').unwrap_or(0) as u16
+}
+
+/// First non-blank column, vi-style `^`.
+fn line_start(row: &[char]) -> u16 {
+    row.iter().position(|c| *c != ' ').unwrap_or(0) as u16
+}
+
+/// The whitespace-delimited token under `col`, as `(start, end)` inclusive, or
+/// `None` when the cursor is on blanks. Whitespace-delimited rather than
+/// URL-aware on purpose: it grabs links, paths and `SFAP-108563` with one rule
+/// and no guessing about what any of them look like (#140).
+fn token_at(row: &[char], col: u16) -> Option<(u16, u16)> {
+    let n = row.len();
+    let i = (col as usize).min(n.saturating_sub(1));
+    if n == 0 || row[i] == ' ' {
+        return None;
+    }
+    let mut a = i;
+    while a > 0 && row[a - 1] != ' ' {
+        a -= 1;
+    }
+    let mut b = i;
+    while b + 1 < n && row[b + 1] != ' ' {
+        b += 1;
+    }
+    Some((a as u16, b as u16))
 }
 
 /// Leave copy mode: unfreeze the pane (apply buffered output) and clear state.
@@ -6282,6 +6385,27 @@ fn copy_input(cm: &mut CopyMode, p: &mut Pane, bytes: &[u8]) -> (bool, Option<St
                 } else {
                     Some((cm.row, cm.col))
                 };
+            }
+            // Horizontal motions over the current row (#140).
+            CopyKey::WordFwd => {
+                cm.col = word_forward(&row_text(p.screen(), cm.row), cm.col).min(maxc);
+            }
+            CopyKey::WordBack => {
+                cm.col = word_back(&row_text(p.screen(), cm.row), cm.col).min(maxc);
+            }
+            CopyKey::LineStart => {
+                cm.col = line_start(&row_text(p.screen(), cm.row)).min(maxc);
+            }
+            CopyKey::LineEnd => {
+                cm.col = line_end(&row_text(p.screen(), cm.row)).min(maxc);
+            }
+            // Anchor at the token's start and put the cursor on its last
+            // character, so the existing selection/yank path copies exactly it.
+            CopyKey::SelectToken => {
+                if let Some((a, b)) = token_at(&row_text(p.screen(), cm.row), cm.col) {
+                    cm.anchor = Some((cm.row, a.min(maxc)));
+                    cm.col = b.min(maxc);
+                }
             }
             CopyKey::Yank => {
                 let text = extract_selection(p.screen(), cm);
@@ -7642,6 +7766,57 @@ mod tests {
     /// The ticket column (#135). The flag is the whole point of the feature —
     /// "clean, but the ticket is still open" is the case worth a second look —
     /// and it must never read as permission to delete.
+    /// Copy-mode motions (#140). Horizontal movement used to be one column per
+    /// press, which is why grabbing a URL never felt possible.
+    #[test]
+    fn copy_mode_word_motions_and_token_selection() {
+        let row: Vec<char> = "  see https://x.test/a?b=1 and SFAP-108563 too   "
+            .chars()
+            .collect();
+        // Derived, not hardcoded: counting columns by hand gets it wrong.
+        let text: String = row.iter().collect();
+        let at = |t: &str| text.find(t).expect(t) as u16;
+        let (see, url, and, tkt) = (at("see"), at("https"), at("and"), at("SFAP"));
+
+        // `^` and `$` skip the padding at both ends.
+        assert_eq!(line_start(&row), see);
+        assert_eq!(row[line_end(&row) as usize], 'o', "last non-blank");
+
+        // `w` steps token to token rather than column to column.
+        assert_eq!(word_forward(&row, 0), see);
+        assert_eq!(word_forward(&row, see), url);
+        assert_eq!(word_forward(&row, url), and, "a URL is one word, not many");
+        assert_eq!(word_forward(&row, and), tkt);
+        // At the end it stops instead of running off the row.
+        let last = (row.len() - 1) as u16;
+        assert_eq!(word_forward(&row, last), last);
+
+        // `b` is the inverse.
+        assert_eq!(word_back(&row, tkt), and);
+        assert_eq!(word_back(&row, and), url);
+        assert_eq!(word_back(&row, url), see);
+        assert_eq!(word_back(&row, 0), 0);
+
+        // `W` grabs the whole token under the cursor, from anywhere inside it.
+        let (a, b) = token_at(&row, url + 5).expect("inside the URL");
+        let got: String = row[a as usize..=b as usize].iter().collect();
+        assert_eq!(got, "https://x.test/a?b=1");
+        let (a, b) = token_at(&row, tkt + 2).expect("inside the ticket");
+        let got: String = row[a as usize..=b as usize].iter().collect();
+        assert_eq!(got, "SFAP-108563");
+        // On blanks there is nothing to select, and that must not panic.
+        assert_eq!(token_at(&row, 0), None);
+        assert_eq!(token_at(&row, last), None);
+        assert_eq!(token_at(&[], 0), None);
+
+        // A blank row degrades rather than panicking.
+        let blank: Vec<char> = "     ".chars().collect();
+        assert_eq!(line_start(&blank), 0);
+        assert_eq!(line_end(&blank), 0);
+        assert_eq!(word_forward(&blank, 0), 4);
+        assert_eq!(word_back(&blank, 4), 0);
+    }
+
     #[test]
     fn ticket_cell_flags_clean_worktrees_with_open_tickets() {
         let closed = Some(Some("Closed".to_string()));
