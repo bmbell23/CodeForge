@@ -373,10 +373,7 @@ pub const EDITABLE: [(&str, &str); 30] = [
     ("tab_next", "next tab (focused slot)"),
     ("tab_prev", "prev tab (focused slot)"),
     ("tab_close", "close tab (focused slot)"),
-    (
-        "copy",
-        "copy/scroll: hjkl wb 0$ · W token · v select · y copy",
-    ),
+    ("copy", "scroll back and copy text with the keyboard"),
     ("focus_left", "focus left"),
     ("focus_down", "focus down"),
     ("focus_up", "focus up"),

@@ -4449,8 +4449,12 @@ fn render(
                 p.title.clone()
             };
             if copy.is_some_and(|cm| cm.pane_id == *id) {
-                title
-                    .push_str("  COPY: hjkl/wb move · 0$ ends · W token · v select · y copy · Esc");
+                // Whatever the border can still hold after the pane's own name.
+                let avail = (rect.w as usize)
+                    .saturating_sub(title.chars().count())
+                    .saturating_sub(6);
+                title.push_str("  ");
+                title.push_str(copy_hint(avail));
             }
             draw_border(out, rect, &title, *id == w.focus_id)?;
             if let Some(inner) = rect.inner() {
@@ -6224,6 +6228,33 @@ fn decode_copy_keys(bytes: &[u8]) -> Vec<CopyKey> {
     v
 }
 
+/// The copy-mode hint for the pane border, in the longest phrasing that fits
+/// `avail` columns (#141).
+///
+/// The first version compressed everything into one line —
+/// `hjkl/wb move · 0$ ends · W token · v select · y copy` — which only reads if
+/// you already know what it means, and a hint exists for the person who
+/// doesn't. Tiers instead, so a narrow pane gets a shorter *sentence* rather
+/// than a longer one chopped mid-word by the border.
+///
+/// Every tier keeps `y copies`, so someone who reads only the narrowest one can
+/// still get text out.
+fn copy_hint(avail: usize) -> &'static str {
+    const TIERS: [&str; 4] = [
+        "COPY MODE — arrows/hjkl move · w/b by word · 0/$ line ends · v starts a selection, move, then y copies it · W grabs the word under the cursor · Esc exits",
+        "COPY MODE — arrows or hjkl move · w/b by word · v starts a selection, y copies it · W grabs a word · Esc exits",
+        "COPY — move, v to start selecting, y copies · W grabs a word · Esc",
+        "COPY — v select · y copies · Esc",
+    ];
+    TIERS
+        .iter()
+        .find(|t| t.chars().count() <= avail)
+        .copied()
+        // Even the shortest doesn't fit; the border truncates it, and the first
+        // word still says which mode you're in.
+        .unwrap_or(TIERS[TIERS.len() - 1])
+}
+
 /// The characters on one screen row, as a plain string — the basis for the
 /// word motions (#140). Trailing blanks are kept so column indices line up with
 /// what's on screen.
@@ -7768,6 +7799,93 @@ mod tests {
     /// and it must never read as permission to delete.
     /// Copy-mode motions (#140). Horizontal movement used to be one column per
     /// press, which is why grabbing a URL never felt possible.
+    /// The border hint has to be readable, not merely short (#141). Tiers mean
+    /// a narrow pane gets a shorter sentence instead of a longer one cut
+    /// mid-word by the border.
+    /// Mark a start, move somewhere else — including onto another line — and
+    /// copy everything between. This is what copy mode has always done; the
+    /// hint just never said so (#141). Pinned here so it stays true.
+    #[test]
+    fn a_selection_spans_lines_from_anchor_to_cursor() {
+        let mut parser = vt100::Parser::new(4, 40, 0);
+        parser.process(b"first line here\r\nsecond line\r\nthird line\r\nfourth");
+        let screen = parser.screen();
+
+        // Start on line 0 at "line", end mid-way through line 2.
+        let cm = CopyMode {
+            pane_id: 0,
+            row: 2,
+            col: 4,
+            anchor: Some((0, 6)),
+        };
+        let got = extract_selection(screen, &cm);
+        assert_eq!(got, "line here\nsecond line\nthird");
+
+        // Anchor after the cursor is the same region: selection() normalises.
+        let flipped = CopyMode {
+            pane_id: 0,
+            row: 0,
+            col: 6,
+            anchor: Some((2, 4)),
+        };
+        assert_eq!(extract_selection(screen, &flipped), got);
+
+        // No anchor: the cursor's whole line, which is what scrolling then
+        // pressing y gives you.
+        let none = CopyMode {
+            pane_id: 0,
+            row: 1,
+            col: 0,
+            anchor: None,
+        };
+        assert_eq!(extract_selection(screen, &none), "second line");
+    }
+
+    #[test]
+    fn copy_hint_picks_the_longest_phrasing_that_fits() {
+        // Whatever is returned must actually fit the width it was chosen for,
+        // at every width — that's the whole contract.
+        for avail in 0..200usize {
+            let h = copy_hint(avail);
+            if avail >= copy_hint(200).chars().count() {
+                assert_eq!(h, copy_hint(200), "a wide pane should get the fullest one");
+            }
+            // The only case allowed to overflow is a pane too narrow for even
+            // the shortest tier, where the border truncates.
+            let shortest = copy_hint(0).chars().count();
+            if avail >= shortest {
+                assert!(
+                    h.chars().count() <= avail,
+                    "{avail} got {} chars",
+                    h.chars().count()
+                );
+            }
+        }
+
+        // Wider never means less information.
+        let widths = [20usize, 60, 90, 140, 200];
+        for pair in widths.windows(2) {
+            let (narrow, wide) = (copy_hint(pair[0]), copy_hint(pair[1]));
+            assert!(
+                wide.chars().count() >= narrow.chars().count(),
+                "{} -> {} shrank",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // Every tier says how to copy and says which mode you're in — the two
+        // things someone reading it for the first time actually needs.
+        for avail in [0usize, 30, 60, 90, 200] {
+            let h = copy_hint(avail);
+            assert!(h.contains('y'), "{avail}: {h}");
+            assert!(h.starts_with("COPY"), "{avail}: {h}");
+        }
+
+        // And the old cryptic phrasing is gone.
+        assert!(!copy_hint(200).contains("hjkl/wb"));
+    }
+
     #[test]
     fn copy_mode_word_motions_and_token_selection() {
         let row: Vec<char> = "  see https://x.test/a?b=1 and SFAP-108563 too   "
