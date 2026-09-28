@@ -4612,8 +4612,19 @@ fn render(
         if let (Some(inner), Some(p)) = (rect.inner(), w.panes.iter().find(|p| p.id == w.focus_id))
         {
             let screen = p.screen();
-            let (crow, ccol) = screen.cursor_position();
-            if !screen.hide_cursor() && crow < inner.h && ccol < inner.w {
+            // In copy mode the pane's own cursor is irrelevant — and alt-screen
+            // apps like Claude and nvim hide it, so there'd be no cursor at all.
+            // Put the terminal's cursor on the copy position instead; it blinks,
+            // which is the clearest "you are here" available (#145).
+            let copy_here = copy.filter(|cm| cm.pane_id == w.focus_id);
+            let (crow, ccol, show) = match copy_here {
+                Some(cm) => (cm.row, cm.col, true),
+                None => {
+                    let (r, c) = screen.cursor_position();
+                    (r, c, !screen.hide_cursor())
+                }
+            };
+            if show && crow < inner.h && ccol < inner.w {
                 queue!(
                     out,
                     cursor::MoveTo(inner.x + ccol, inner.y + crow),
@@ -6314,6 +6325,11 @@ fn decode_copy_keys(bytes: &[u8]) -> Vec<CopyKey> {
                     b'D' => v.push(CopyKey::Left),
                     b'5' => v.push(CopyKey::PageUp),
                     b'6' => v.push(CopyKey::PageDown),
+                    // Home / End. Terminals disagree about the encoding — the
+                    // xterm `H`/`F` forms and the vt220 `1~`/`4~`/`7~`/`8~`
+                    // forms are all in use — so take all of them (#145).
+                    b'H' | b'1' | b'7' => v.push(CopyKey::LineStart),
+                    b'F' | b'4' | b'8' => v.push(CopyKey::LineEnd),
                     _ => {}
                 }
                 // Swallow a trailing '~' (ESC [ 5 ~ / 6 ~).
@@ -6764,11 +6780,49 @@ fn draw_copy_overlay(
                 .map(|cell| cell.contents())
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| " ".to_string());
+            // The cursor cell gets its own colour rather than the same reverse
+            // video as everything else (#145). Inverting the whole row and the
+            // whole selection identically meant moving within either changed
+            // nothing on screen: you could not see where a selection would
+            // start before pressing `v`, nor where its moving end had got to
+            // after.
+            if r == cm.row && c == cm.col {
+                queue!(
+                    out,
+                    cursor::MoveTo(inner.x + c, inner.y + r),
+                    SetBackgroundColor(Color::Yellow),
+                    SetForegroundColor(Color::Black),
+                    Print(ch),
+                    ResetColor,
+                    SetAttribute(Attribute::Reset)
+                )?;
+                continue;
+            }
             queue!(
                 out,
                 cursor::MoveTo(inner.x + c, inner.y + r),
                 SetAttribute(Attribute::Reverse),
                 Print(ch),
+                SetAttribute(Attribute::Reset)
+            )?;
+        }
+    }
+    // The anchor is under the selection highlight and otherwise indistinguish-
+    // able from it; mark it so both ends of a selection are visible at once.
+    if let Some((ar, ac)) = cm.anchor {
+        if (ar, ac) != (cm.row, cm.col) && ar < rows.min(inner.h) && ac < cols.min(inner.w) {
+            let ch = screen
+                .cell(ar, ac)
+                .map(|cell| cell.contents())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| " ".to_string());
+            queue!(
+                out,
+                cursor::MoveTo(inner.x + ac, inner.y + ar),
+                SetBackgroundColor(Color::Green),
+                SetForegroundColor(Color::Black),
+                Print(ch),
+                ResetColor,
                 SetAttribute(Attribute::Reset)
             )?;
         }
@@ -8124,6 +8178,92 @@ mod tests {
 
         // And the old cryptic phrasing is gone.
         assert!(!copy_hint(200).contains("hjkl/wb"));
+    }
+
+    /// Home/End reach the line ends (#145). Terminals disagree about the
+    /// encoding, so all the forms in circulation are accepted.
+    /// The cursor has to look different from the highlight around it (#145):
+    /// inverting the row and the selection identically meant moving inside
+    /// either changed nothing on screen. Replayed through a mirror so the
+    /// rendered attributes, not the intent, are what's checked.
+    #[test]
+    fn the_copy_cursor_and_anchor_are_visibly_distinct() {
+        let mut pane = vt100::Parser::new(2, 20, 0);
+        pane.process(b"hello world here");
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 2,
+        };
+        let replay = |cm: &CopyMode| {
+            let mut out = Vec::new();
+            blit_pane(&mut out, pane.screen(), inner).unwrap();
+            draw_copy_overlay(&mut out, pane.screen(), inner, cm).unwrap();
+            let mut mirror = vt100::Parser::new(2, 20, 0);
+            mirror.process(&out);
+            mirror
+        };
+
+        // No selection yet: the cursor still has to stand out from the
+        // row highlight, or you can't see where `v` would start.
+        let cm = CopyMode {
+            pane_id: 0,
+            row: 0,
+            col: 6,
+            anchor: None,
+        };
+        let m = replay(&cm);
+        let at = |m: &vt100::Parser, c: u16| {
+            let cell = m.screen().cell(0, c).unwrap();
+            (cell.bgcolor(), cell.inverse())
+        };
+        assert_ne!(
+            at(&m, 6),
+            at(&m, 7),
+            "cursor must differ from the rest of the highlighted row"
+        );
+        assert_ne!(at(&m, 6), at(&m, 5), "and from the cell before it");
+
+        // With a selection, both ends are marked and differ from the middle.
+        let cm = CopyMode {
+            pane_id: 0,
+            row: 0,
+            col: 10,
+            anchor: Some((0, 2)),
+        };
+        let m = replay(&cm);
+        let (cursor, anchor, middle) = (at(&m, 10), at(&m, 2), at(&m, 6));
+        assert_ne!(cursor, middle, "the moving end must be visible");
+        assert_ne!(anchor, middle, "the start must be visible");
+        assert_ne!(cursor, anchor, "the two ends must be tellable apart");
+    }
+
+    #[test]
+    fn home_and_end_are_decoded_in_every_encoding() {
+        let is = |bytes: &[u8], want: CopyKey| {
+            let got = decode_copy_keys(bytes);
+            assert_eq!(got.len(), 1, "{bytes:?} decoded to {} keys", got.len());
+            assert!(
+                std::mem::discriminant(&got[0]) == std::mem::discriminant(&want),
+                "{bytes:?} decoded wrong"
+            );
+        };
+        // xterm.
+        is(b"\x1b[H", CopyKey::LineStart);
+        is(b"\x1b[F", CopyKey::LineEnd);
+        // vt220, both numberings.
+        is(b"\x1b[1~", CopyKey::LineStart);
+        is(b"\x1b[7~", CopyKey::LineStart);
+        is(b"\x1b[4~", CopyKey::LineEnd);
+        is(b"\x1b[8~", CopyKey::LineEnd);
+        // The existing keys still decode to the same thing.
+        is(b"0", CopyKey::LineStart);
+        is(b"$", CopyKey::LineEnd);
+        // And the arrows and paging are untouched by the new arms.
+        is(b"\x1b[A", CopyKey::Up);
+        is(b"\x1b[6~", CopyKey::PageDown);
+        is(b"\x1b[5~", CopyKey::PageUp);
     }
 
     #[test]
