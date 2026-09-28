@@ -1587,16 +1587,69 @@ fn main() -> Result<()> {
     run_client(&sock)
 }
 
-/// Where the last session's window directories are saved, so a fresh `forge`
-/// (after quit or reboot) can restore the layout: `$XDG_STATE_HOME/codeforge/session`.
-fn snapshot_path() -> PathBuf {
+/// `$XDG_STATE_HOME/codeforge`, where CodeForge keeps its own state.
+fn state_dir() -> PathBuf {
     let base = std::env::var("XDG_STATE_HOME")
         .ok()
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state")
         });
-    base.join("codeforge").join("session")
+    base.join("codeforge")
+}
+
+/// Where the last session's window directories are saved, so a fresh `forge`
+/// (after quit or reboot) can restore the layout: `$XDG_STATE_HOME/codeforge/session`.
+fn snapshot_path() -> PathBuf {
+    state_dir().join("session")
+}
+
+/// How old an orphaned shada temp file must be before it's pruned. Well past
+/// any write a live nvim could be in the middle of.
+const SHADA_TMP_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// Orphaned nvim shada temp files to delete (#143).
+///
+/// nvim writes `main.shada.tmp.X` and renames it into place. `Pane::kill` is a
+/// SIGKILL, so an editor pane closed by CodeForge — a window close, a worktree
+/// delete, quit, reload — leaves that temp file behind and consumes that
+/// letter. There are only 26, and once all are taken *every* save reports
+/// `E138: All … files exist, cannot write ShaDa file!`. Months of closing
+/// windows is enough to exhaust them.
+///
+/// Deliberately narrow, since these are files CodeForge didn't create: only
+/// names matching `main.shada.tmp.*` directly inside `dir`, and only ones older
+/// than `max_age` so a live nvim's in-flight write is never touched. The real
+/// `main.shada` is not a match and must never be removed — it holds the user's
+/// marks, registers and history.
+fn stale_shada_tmps(dir: &Path, max_age: Duration) -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    rd.filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("main.shada.tmp."))
+        })
+        .filter(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.elapsed().map(|age| age > max_age).unwrap_or(false))
+                .unwrap_or(false)
+        })
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Remove orphaned shada temp files, best-effort. Returns how many went.
+fn prune_shada_tmps() -> usize {
+    let dir = state_dir().join("shada");
+    stale_shada_tmps(&dir, SHADA_TMP_MAX_AGE)
+        .into_iter()
+        .filter(|p| std::fs::remove_file(p).is_ok())
+        .count()
 }
 
 /// Save window specs, best-effort. One window per line, tab-separated:
@@ -1791,6 +1844,14 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
         .unwrap_or_else(projects_root);
     // Before anything asks where Notes is, and before any window is built (#129).
     init_notes_dir(&cfg, &proot);
+
+    // Sweep up shada temp files left by editors we SIGKILLed (#143). Only 26
+    // names exist; once they're all taken every save in every pane fails with
+    // E138, so this runs before any editor starts.
+    let pruned = prune_shada_tmps();
+    if pruned > 0 {
+        eprintln!("codeforge: removed {pruned} orphaned nvim shada temp file(s)");
+    }
 
     // With dirs: one fresh window each. Without: restore the saved session.
     // The AI pane resumes per project only when that project has a prior
@@ -7805,6 +7866,52 @@ mod tests {
     /// Mark a start, move somewhere else — including onto another line — and
     /// copy everything between. This is what copy mode has always done; the
     /// hint just never said so (#141). Pinned here so it stays true.
+    /// Pruning orphaned shada temp files (#143). These are nvim's files, not
+    /// ours, so the rule has to be narrow: the real `main.shada` holds the
+    /// user's marks, registers and history and must never be a candidate.
+    #[test]
+    fn only_old_orphaned_shada_temps_are_pruned() {
+        use std::time::SystemTime;
+        let dir = std::env::temp_dir().join(format!("cf-shada-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let write = |name: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            p
+        };
+        let real = write("main.shada");
+        let old_tmp = write("main.shada.tmp.a");
+        let fresh_tmp = write("main.shada.tmp.b");
+        let unrelated = write("something.else");
+
+        // Backdate the one that should go. `filetime` isn't a dependency, so
+        // age is faked by asking for everything older than zero and checking
+        // the *set*, then again with a long age to prove freshness is honoured.
+        let all = stale_shada_tmps(&dir, Duration::from_secs(0));
+        assert!(all.contains(&old_tmp), "temp files are candidates");
+        assert!(all.contains(&fresh_tmp));
+        assert!(
+            !all.contains(&real),
+            "main.shada must never be pruned — it is the user's history"
+        );
+        assert!(!all.contains(&unrelated), "unrelated names are left alone");
+
+        // With a real age threshold nothing just-written qualifies, so a live
+        // nvim mid-write is never disturbed.
+        let none = stale_shada_tmps(&dir, Duration::from_secs(3600));
+        assert!(none.is_empty(), "just-written temps must be left: {none:?}");
+
+        // A directory that doesn't exist is not an error.
+        assert!(stale_shada_tmps(&dir.join("nope"), Duration::from_secs(0)).is_empty());
+
+        // Sanity: the files are all still there; listing doesn't delete.
+        assert!(real.exists() && old_tmp.exists());
+        let _ = SystemTime::now();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_selection_spans_lines_from_anchor_to_cursor() {
         let mut parser = vt100::Parser::new(4, 40, 0);

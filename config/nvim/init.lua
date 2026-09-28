@@ -146,14 +146,19 @@ do
   local notes_dir = vim.env.CODEFORGE_NOTES_DIR
   local notes_sync = vim.env.CODEFORGE_NOTES_SYNC
   if notes_dir and notes_dir ~= "" and notes_sync and notes_sync ~= "" then
+    -- Always pass the directory. Without it the script falls back to a
+    -- hardcoded ~/projects/Notes, which stopped existing when Notes moved into
+    -- a group (#129) — and its `cd "$DIR" || exit 0` means it then does nothing
+    -- at all, successfully and silently, with output discarded by `detach`
+    -- (#142).
     -- Ctrl-s: write all + sync now.
     local function cf_notes_save()
       vim.cmd("silent! wall")
-      vim.fn.jobstart({ notes_sync, "--now" }, { detach = true })
+      vim.fn.jobstart({ notes_sync, "--now", notes_dir }, { detach = true })
       vim.notify("Notes: saving…")
     end
     local function cf_sync()
-      vim.fn.jobstart({ notes_sync, "--now" }, { detach = true })
+      vim.fn.jobstart({ notes_sync, "--now", notes_dir }, { detach = true })
     end
     -- Alt-s: rename + move the current note within the repo (#72). One path
     -- field, prefilled with the current path relative to the Notes root, with

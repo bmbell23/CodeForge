@@ -26,7 +26,13 @@ if [ "${1:-}" = "--now" ]; then
   FORCE=1
   shift
 fi
-DIR="${1:-${NOTES_DIR:-$HOME/projects/Notes}}"
+# Where Notes lives, in order: the argument CodeForge passes, then the variable
+# CodeForge exports, then NOTES_DIR for a hand-written cron entry, and only then
+# a guess. The guess was the whole default once, and when Notes moved into a
+# group it silently pointed at nothing (#142) — `cd "$DIR" || exit 0` below
+# turns a wrong path into a successful no-op, so a stale default is worse here
+# than elsewhere.
+DIR="${1:-${CODEFORGE_NOTES_DIR:-${NOTES_DIR:-$HOME/projects/Notes}}}"
 STATE="${XDG_RUNTIME_DIR:-/tmp}/codeforge-notes-sync.state"
 CONFLICT_FLAG="${XDG_RUNTIME_DIR:-/tmp}/codeforge-notes-conflict"
 # Unix epoch of the last successful sync (push), read by CodeForge's status bar.
