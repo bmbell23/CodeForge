@@ -241,6 +241,78 @@ fn query_nvim_files(sock: &Path) -> Vec<PathBuf> {
     }
 }
 
+/// How long a closing editor is given to exit on its own before it's killed.
+/// Short: this runs while the user is closing something, so a wedged nvim must
+/// not make the UI feel stuck. A clean exit is an optimisation, never a
+/// requirement (#144).
+const EDITOR_QUIT_GRACE: Duration = Duration::from_millis(400);
+
+/// Ask nvim to quit over its RPC socket, without waiting for it.
+///
+/// `:qa!` discards unsaved buffer changes — which is precisely what the SIGKILL
+/// this replaces did, so nothing is lost relative to the old behaviour, and in
+/// exchange nvim writes its shada and removes its swap file on the way out.
+/// Killing it mid-write is what orphaned `main.shada.tmp.*` files until saving
+/// broke entirely (#143), and what leaves the `E325: swap file already exists`
+/// prompt behind.
+///
+/// Fire-and-forget on purpose: `shutdown_panes` sends these to every editor
+/// before waiting for any of them, so eight windows close in one grace period
+/// rather than eight.
+fn nvim_request_quit(sock: &Path) {
+    if !sock.exists() {
+        return;
+    }
+    // Leave normal mode first: nvim ignores a command typed into insert mode or
+    // a pending operator, and a closing editor is often mid-edit.
+    let _ = Command::new("timeout")
+        .arg("2")
+        .arg("nvim")
+        .arg("--server")
+        .arg(sock)
+        .arg("--remote-send")
+        .arg("<C-\\><C-n>:qa!<CR>")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut c| {
+            // Don't leave a zombie behind; the wait is bounded by `timeout`.
+            thread::spawn(move || {
+                let _ = c.wait();
+            })
+        });
+}
+
+/// Close a set of panes, giving their editors a chance to exit cleanly first
+/// (#144). Every pane is killed regardless — this only changes whether nvim got
+/// to tidy up before that.
+fn shutdown_panes(panes: &mut [Pane]) {
+    let socks: Vec<PathBuf> = panes
+        .iter()
+        .filter(|p| p.role == PaneRole::Editor)
+        .map(|p| nvim_sock(p.id))
+        .collect();
+    if !socks.is_empty() {
+        // All of them first, so they shut down concurrently.
+        for s in &socks {
+            nvim_request_quit(s);
+        }
+        let deadline = Instant::now() + EDITOR_QUIT_GRACE;
+        while Instant::now() < deadline {
+            let still_running = panes
+                .iter_mut()
+                .any(|p| p.role == PaneRole::Editor && !p.is_dead());
+            if !still_running {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    for p in panes.iter_mut() {
+        p.kill();
+    }
+}
+
 /// Close nvim's current buffer (an editor "tab") over its RPC socket, keeping
 /// the window/nvim alive. The buffer juggling lives in `CF_close_buffer`, which
 /// handles the last-buffer case by opening a blank first — inline `bp|bd#`
@@ -2251,9 +2323,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                 // project, not whatever index shifts into the gap
                                 // (#111). Resolve it before the remove.
                                 let next = mru_order(&windows, i).first().copied();
-                                for p in &mut windows[i].panes {
-                                    p.kill();
-                                }
+                                shutdown_panes(&mut windows[i].panes);
                                 windows.remove(i);
                                 if !windows.is_empty() {
                                     cur = if i == cur {
@@ -2551,9 +2621,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                                     windows.push(new_window(&spec, &cfg, &shell, base, &tx)?);
                                     cur = windows.len() - 1;
                                 } else {
-                                    for p in &mut windows[cur].panes {
-                                        p.kill();
-                                    }
+                                    shutdown_panes(&mut windows[cur].panes);
                                     windows[cur] = new_window(&spec, &cfg, &shell, base, &tx)?;
                                 }
                                 let w = &mut windows[cur];
@@ -3338,9 +3406,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                     // No recency stamp here: `switch_window` stamps the window
                     // being *left*, and this one is being destroyed.
                     let next = mru_order(&windows, cur).first().copied();
-                    for p in &mut windows[cur].panes {
-                        p.kill();
-                    }
+                    shutdown_panes(&mut windows[cur].panes);
                     windows.remove(cur);
                     needs_clear = true;
                     dirty = true;
@@ -3592,9 +3658,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         let _ = protocol::write_frame(cl, protocol::RECONNECT, &[]);
                     }
                     for w in &mut windows {
-                        for p in &mut w.panes {
-                            p.kill();
-                        }
+                        shutdown_panes(&mut w.panes);
                     }
                     let _ = std::fs::remove_file(sock);
                     spawn_server(&[])?; // restore from the snapshot just saved
@@ -3798,9 +3862,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
     }
 
     for w in &mut windows {
-        for p in &mut w.panes {
-            p.kill();
-        }
+        shutdown_panes(&mut w.panes);
     }
     let _ = std::fs::remove_file(sock);
     Ok(())
@@ -7866,6 +7928,77 @@ mod tests {
     /// Mark a start, move somewhere else — including onto another line — and
     /// copy everything between. This is what copy mode has always done; the
     /// hint just never said so (#141). Pinned here so it stays true.
+    /// The point of #144: a real nvim, asked to quit over its socket, exits by
+    /// itself *and writes its shada*. SIGKILL left the temp file behind, which
+    /// is what eventually broke saving entirely (#143).
+    ///
+    /// Skipped when nvim isn't installed, so the suite still runs elsewhere.
+    #[test]
+    fn nvim_quits_cleanly_and_writes_its_shada() {
+        if Command::new("nvim").arg("--version").output().is_err() {
+            eprintln!("nvim not present; skipping");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("cf-quit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("nvim.sock");
+        let shada = dir.join("test.shada");
+
+        // -u NONE so no user config interferes; -i points shada at our file.
+        let mut child = Command::new("nvim")
+            .args(["--headless", "-u", "NONE", "-i"])
+            .arg(&shada)
+            .arg("--listen")
+            .arg(&sock)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn nvim");
+
+        // Wait for it to be listening.
+        let start = Instant::now();
+        while !sock.exists() && start.elapsed() < Duration::from_secs(10) {
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(sock.exists(), "nvim never created its socket");
+
+        nvim_request_quit(&sock);
+
+        // It should go on its own, well inside the grace period we allow.
+        let start = Instant::now();
+        let mut exited = false;
+        while start.elapsed() < Duration::from_secs(10) {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        if !exited {
+            let _ = child.kill();
+        }
+        // Reap it either way, so the test leaves no zombie behind.
+        let _ = child.wait();
+        assert!(
+            exited,
+            "nvim did not exit when asked — SIGKILL would be all we had"
+        );
+
+        // And it tidied up on the way out: shada written, no temp left behind.
+        assert!(shada.exists(), "nvim exited without writing its shada");
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "orphaned temp files: {leftovers:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Pruning orphaned shada temp files (#143). These are nvim's files, not
     /// ours, so the rule has to be narrow: the real `main.shada` holds the
     /// user's marks, registers and history and must never be a candidate.
