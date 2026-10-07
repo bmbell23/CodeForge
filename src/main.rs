@@ -3814,6 +3814,7 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                 // star belongs to favourites, not to every message.
                 let right_info = right_info_with_note(note.as_ref(), &segs);
                 framebuf.clear();
+                let mut links = Vec::new();
                 let ksnap = *keys.lock().unwrap();
                 let eksnap = editor_keys.lock().unwrap().clone();
                 // The diff panel hides while this window is zoomed for the
@@ -3852,8 +3853,9 @@ fn run_server(sock: &Path, dirs: Vec<String>) -> Result<()> {
                         let (s, e) = m.range();
                         (m.pane_id, s, e, m.gutter.unwrap_or(0))
                     }),
+                    &mut links,
                 )?;
-                let payload = differ.frame(&framebuf, size.0, size.1, needs_clear);
+                let payload = differ.frame(&framebuf, size.0, size.1, needs_clear, links);
                 if protocol::write_frame(cl, protocol::OUTPUT, &payload).is_err() {
                     client = None;
                 }
@@ -4464,6 +4466,8 @@ struct FrameDiffer {
     parser: vt100::Parser,
     prev: Option<vt100::Screen>,
     dims: (u16, u16), // (cols, rows)
+    /// The link segments the client currently has tagged (#147).
+    links: Vec<LinkSeg>,
 }
 
 impl FrameDiffer {
@@ -4472,6 +4476,7 @@ impl FrameDiffer {
             parser: vt100::Parser::new(rows.max(1), cols.max(1), 0),
             prev: None,
             dims: (cols, rows),
+            links: Vec::new(),
         }
     }
 
@@ -4479,7 +4484,20 @@ impl FrameDiffer {
     /// size change sends the whole screen; otherwise a minimal diff against the
     /// last presented screen. Wrapped in DEC 2026 synchronized output so the
     /// client still presents each frame atomically.
-    fn frame(&mut self, framebuf: &[u8], cols: u16, rows: u16, force_full: bool) -> Vec<u8> {
+    ///
+    /// `links` are the URLs visible in this frame (#147). The mirror drops OSC 8,
+    /// so they're applied after the diff, out of band: each segment is reprinted
+    /// from the mirror's own cells inside an OSC 8 wrapper. Only segments that
+    /// are new or whose cells the diff just rewrote (which strips the tag) are
+    /// sent, so an unchanged screen still ships nothing.
+    fn frame(
+        &mut self,
+        framebuf: &[u8],
+        cols: u16,
+        rows: u16,
+        force_full: bool,
+        links: Vec<LinkSeg>,
+    ) -> Vec<u8> {
         let mut full = force_full;
         if self.dims != (cols, rows) {
             // Resized: start a fresh mirror at the new geometry and repaint all.
@@ -4494,13 +4512,223 @@ impl FrameDiffer {
             (Some(prev), false) => cur.contents_diff(prev),
             _ => cur.contents_formatted(),
         };
+        let prev = if full { None } else { self.prev.as_ref() };
+        let tags = link_bytes(&cur, prev, &self.links, &links);
+        self.links = links;
         self.prev = Some(cur);
-        let mut out = Vec::with_capacity(body.len() + 16);
+        let mut out = Vec::with_capacity(body.len() + tags.len() + 16);
         out.extend_from_slice(b"\x1b[?2026h");
         out.extend_from_slice(&body);
+        out.extend_from_slice(&tags);
         out.extend_from_slice(b"\x1b[?2026l");
         out
     }
+}
+
+/// One row's run of a URL in the composited frame, in absolute coordinates
+/// (#147). A URL that wraps across rows is one segment per row, all sharing an
+/// `id`, which is how a terminal knows they're a single link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkSeg {
+    x: u16,
+    y: u16,
+    /// The cells' text: ASCII only, one char per cell.
+    text: String,
+    url: String,
+    id: u64,
+}
+
+/// The OSC 8 bytes that bring the client's link tags from `old` to `new`, drawn
+/// over the frame the mirror `cur` now holds. `prev` is the screen before this
+/// frame, or `None` when the whole screen was just repainted.
+fn link_bytes(
+    cur: &vt100::Screen,
+    prev: Option<&vt100::Screen>,
+    old: &[LinkSeg],
+    new: &[LinkSeg],
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    // A segment that's gone: its cells may still carry the tag on the client, so
+    // reprint them plain. Harmless if the diff already rewrote them.
+    for seg in old.iter().filter(|s| !new.contains(s)) {
+        put_cells(&mut out, cur, seg, None);
+    }
+    for seg in new {
+        let dirty = match prev {
+            None => true,
+            Some(prev) => !old.contains(seg) || cells_changed(cur, prev, seg),
+        };
+        // An overlay drawn over the URL changes the text: leave it alone rather
+        // than tag the overlay.
+        if dirty && cells_text(cur, seg) == seg.text {
+            put_cells(&mut out, cur, seg, Some(seg));
+        }
+    }
+    if !out.is_empty() {
+        // Hand the stream back exactly as the diff left it.
+        out.extend_from_slice(b"\x1b[m");
+        out.extend_from_slice(&cur.attributes_formatted());
+        out.extend_from_slice(&cur.cursor_state_formatted());
+    }
+    out
+}
+
+fn cells_text(screen: &vt100::Screen, seg: &LinkSeg) -> String {
+    (0..seg.text.len() as u16)
+        .map(|i| {
+            screen
+                .cell(seg.y, seg.x + i)
+                .map(|c| c.contents())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn cells_changed(cur: &vt100::Screen, prev: &vt100::Screen, seg: &LinkSeg) -> bool {
+    (0..seg.text.len() as u16).any(|i| cur.cell(seg.y, seg.x + i) != prev.cell(seg.y, seg.x + i))
+}
+
+/// Reprint `seg`'s cells from `screen` with their own styles, wrapped in an
+/// OSC 8 hyperlink when `link` is given.
+fn put_cells(out: &mut Vec<u8>, screen: &vt100::Screen, seg: &LinkSeg, link: Option<&LinkSeg>) {
+    let _ = queue!(
+        out,
+        cursor::MoveTo(seg.x, seg.y),
+        SetAttribute(Attribute::Reset)
+    );
+    if let Some(l) = link {
+        out.extend_from_slice(format!("\x1b]8;id=cf{:x};{}\x1b\\", l.id, l.url).as_bytes());
+    }
+    let mut style = CellStyle::default();
+    for i in 0..seg.text.len() as u16 {
+        let Some(cell) = screen.cell(seg.y, seg.x + i) else {
+            break;
+        };
+        let _ = apply_style(out, &mut style, CellStyle::of(cell));
+        let contents = cell.contents();
+        out.extend_from_slice(if contents.is_empty() {
+            b" "
+        } else {
+            contents.as_bytes()
+        });
+    }
+    if link.is_some() {
+        out.extend_from_slice(b"\x1b]8;;\x1b\\");
+    }
+}
+
+/// Characters that can appear in a URL (RFC 3986 unreserved, reserved, `%`).
+fn is_url_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "-._~:/?#[]@!$&'()*+,;=%".contains(c)
+}
+
+/// Find the URLs in a pane's visible screen and push them as frame-coordinate
+/// segments (#147). Rows are joined where the URL runs on: vt100 marks a row it
+/// soft-wrapped, and a program that breaks a long URL itself (rather than let
+/// the terminal wrap it) still fills the row to the last column and carries on
+/// at column 0 of the next — both count as one line.
+fn find_links(screen: &vt100::Screen, inner: Rect, pane_id: usize, out: &mut Vec<LinkSeg>) {
+    let (srows, scols) = screen.size();
+    let (h, w) = (inner.h.min(srows), inner.w.min(scols));
+    if w == 0 {
+        return;
+    }
+    // Each cell as a char; anything that isn't a single ASCII char (wide
+    // glyphs, combining marks) is a separator, which also keeps every URL cell
+    // exactly one column wide.
+    let ch = |r: u16, c: u16| -> char {
+        let s = screen.cell(r, c).map(|x| x.contents()).unwrap_or_default();
+        let mut it = s.chars();
+        match (it.next(), it.next()) {
+            (None, _) => ' ',
+            (Some(c), None) if c.is_ascii() => c,
+            _ => '\u{1}',
+        }
+    };
+    let mut row = 0;
+    while row < h {
+        // One logical line: the cells of every row it spans, with positions.
+        let mut line: Vec<(u16, u16, char)> = Vec::new();
+        loop {
+            line.extend((0..w).map(|c| (row, c, ch(row, c))));
+            let runs_on = row + 1 < h
+                && (screen.row_wrapped(row)
+                    || (is_url_char(ch(row, w - 1)) && is_url_char(ch(row + 1, 0))));
+            row += 1;
+            if !runs_on {
+                break;
+            }
+        }
+        let text: Vec<char> = line.iter().map(|&(_, _, c)| c).collect();
+        for (start, end) in url_spans(&text) {
+            let url: String = text[start..end].iter().collect();
+            let (r0, c0, _) = line[start];
+            let id = link_id(pane_id, r0, c0, &url);
+            for (k, &(r, c, chr)) in line[start..end].iter().enumerate() {
+                match out.last_mut() {
+                    Some(seg) if k > 0 && seg.id == id && seg.y == inner.y + r => {
+                        seg.text.push(chr)
+                    }
+                    _ => out.push(LinkSeg {
+                        x: inner.x + c,
+                        y: inner.y + r,
+                        text: chr.to_string(),
+                        url: url.clone(),
+                        id,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+/// `[start, end)` spans of `http://` / `https://` URLs in `text`, trimmed of
+/// trailing punctuation that belongs to the prose around them — a closing
+/// paren is kept only when the URL opened one.
+fn url_spans(text: &[char]) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let scheme = ["https://", "http://"]
+            .iter()
+            .find(|s| rest.iter().take(s.len()).copied().eq(s.chars()))
+            .map(|s| s.len());
+        // A scheme glued onto a word ("xhttps://") isn't a URL start.
+        let bounded = i == 0 || !text[i - 1].is_ascii_alphanumeric();
+        let Some(n) = scheme.filter(|_| bounded) else {
+            i += 1;
+            continue;
+        };
+        let mut end = i + n;
+        while end < text.len() && is_url_char(text[end]) {
+            end += 1;
+        }
+        loop {
+            let last = text[end - 1];
+            let opens = text[i..end].iter().filter(|&&c| c == '(').count();
+            let closes = text[i..end].iter().filter(|&&c| c == ')').count();
+            if ".,;:!?'\"".contains(last) || (last == ')' && closes > opens) {
+                end -= 1;
+            } else {
+                break;
+            }
+        }
+        if end > i + n {
+            spans.push((i, end));
+        }
+        i = end.max(i + 1);
+    }
+    spans
+}
+
+/// A link id that stays the same while the URL stays put, so a segment that
+/// gets reprinted joins the rows that weren't.
+fn link_id(pane_id: usize, row: u16, col: u16, url: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (pane_id, row, col, url).hash(&mut h);
+    h.finish()
 }
 
 /// Paint the current window's panes, the status bar, and any overlay, then
@@ -4533,6 +4761,8 @@ fn render(
     keys: Keys,
     editor_keys: &config::EditorKeys,
     msel: Option<Sel>,
+    // Filled with the URLs on screen, for the differ to tag (#147).
+    links: &mut Vec<LinkSeg>,
 ) -> Result<()> {
     let w = &windows[cur];
     let area = rows.saturating_sub(1);
@@ -4582,6 +4812,7 @@ fn render(
             draw_border(out, rect, &title, *id == w.focus_id)?;
             if let Some(inner) = rect.inner() {
                 blit_pane(out, p.screen(), inner)?;
+                find_links(p.screen(), inner, p.id, links);
                 // Copy/scroll-mode selection + cursor on this pane.
                 if let Some(cm) = copy.filter(|cm| cm.pane_id == *id) {
                     draw_copy_overlay(out, p.screen(), inner, cm)?;
@@ -7257,12 +7488,12 @@ mod tests {
         let mut d = FrameDiffer::new(20, 5);
 
         // First frame with no prior screen -> full repaint, includes the glyph.
-        let p1 = d.frame(&at('A'), 20, 5, false);
+        let p1 = d.frame(&at('A'), 20, 5, false, Vec::new());
         assert!(p1.windows(1).any(|w| w == b"A"), "first frame paints A");
 
         // Identical frame -> diff against an identical screen is empty; the
         // payload is just the sync wrappers, and much smaller than a full paint.
-        let p2 = d.frame(&at('A'), 20, 5, false);
+        let p2 = d.frame(&at('A'), 20, 5, false, Vec::new());
         assert!(p2.len() < p1.len(), "identical frame ships less than full");
         assert!(
             !p2.windows(1).any(|w| w == b"A"),
@@ -7271,7 +7502,7 @@ mod tests {
 
         // A changed cell -> a small delta that carries the new glyph, still
         // smaller than a full repaint.
-        let p3 = d.frame(&at('B'), 20, 5, false);
+        let p3 = d.frame(&at('B'), 20, 5, false, Vec::new());
         assert!(
             p3.windows(1).any(|w| w == b"B"),
             "change ships the new glyph"
@@ -7282,9 +7513,136 @@ mod tests {
         );
 
         // force_full repaints everything again even when nothing changed.
-        let p4 = d.frame(&at('B'), 20, 5, true);
+        let p4 = d.frame(&at('B'), 20, 5, true, Vec::new());
         assert!(p4.windows(1).any(|w| w == b"B"), "force_full repaints");
         assert!(p4.len() > p3.len(), "forced full is larger than a diff");
+    }
+
+    fn spans_of(s: &str) -> Vec<String> {
+        let t: Vec<char> = s.chars().collect();
+        url_spans(&t)
+            .into_iter()
+            .map(|(a, b)| t[a..b].iter().collect())
+            .collect()
+    }
+
+    #[test]
+    fn url_spans_trim_surrounding_prose() {
+        assert_eq!(
+            spans_of("see (https://x.io/browse/SFAP-1) open."),
+            ["https://x.io/browse/SFAP-1"]
+        );
+        assert_eq!(spans_of("at http://a.b/c."), ["http://a.b/c"]);
+        // A paren the URL opened is part of it.
+        assert_eq!(
+            spans_of("https://en.wikipedia.org/wiki/Foo_(bar) ok"),
+            ["https://en.wikipedia.org/wiki/Foo_(bar)"]
+        );
+        assert_eq!(
+            spans_of("a https://a.b b https://c.d"),
+            ["https://a.b", "https://c.d"]
+        );
+        assert!(spans_of("https:// nothing, xhttps://glued").is_empty());
+    }
+
+    /// A pane screen holding `text`, as a program would print it.
+    fn screen_of(cols: u16, rows: u16, text: &str) -> vt100::Parser {
+        let mut p = vt100::Parser::new(rows, cols, 0);
+        p.process(text.as_bytes());
+        p
+    }
+
+    #[test]
+    fn find_links_joins_a_soft_wrapped_url() {
+        // 20 columns: the URL soft-wraps over three rows.
+        let url = "https://claude.com/cai/oauth/authorize?code=true&x=1";
+        let p = screen_of(20, 5, &format!("{url}\r\nnext line"));
+        let inner = Rect {
+            x: 3,
+            y: 2,
+            w: 20,
+            h: 5,
+        };
+        let mut segs = Vec::new();
+        find_links(p.screen(), inner, 7, &mut segs);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        assert!(segs.iter().all(|s| s.url == url && s.id == segs[0].id));
+        let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, url);
+        assert_eq!((segs[0].x, segs[0].y), (3, 2));
+        assert_eq!((segs[1].x, segs[1].y), (3, 3));
+    }
+
+    #[test]
+    fn find_links_joins_a_hard_broken_url_that_fills_the_row() {
+        // The program broke the line itself, but the URL runs to the last column
+        // and carries on at column 0.
+        let p = screen_of(10, 3, "https://ab\r\ncd.ef/g h\r\n");
+        let mut segs = Vec::new();
+        find_links(
+            p.screen(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 3,
+            },
+            1,
+            &mut segs,
+        );
+        assert_eq!(segs.len(), 2, "{segs:?}");
+        assert_eq!(segs[0].url, "https://abcd.ef/g");
+    }
+
+    #[test]
+    fn find_links_keeps_short_lines_apart() {
+        let p = screen_of(30, 3, "go to https://a.b/c now\r\nhttps://d.e\r\n");
+        let mut segs = Vec::new();
+        find_links(
+            p.screen(),
+            Rect {
+                x: 0,
+                y: 0,
+                w: 30,
+                h: 3,
+            },
+            1,
+            &mut segs,
+        );
+        let urls: Vec<&str> = segs.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.b/c", "https://d.e"]);
+    }
+
+    #[test]
+    fn frame_differ_tags_links_only_when_they_change() {
+        let url = "https://a.io/xyz";
+        let frame = format!("\x1b[2;3H{url}").into_bytes();
+        let seg = LinkSeg {
+            x: 2,
+            y: 1,
+            text: url.into(),
+            url: url.into(),
+            id: 9,
+        };
+        let osc = b"\x1b]8;id=cf9;https://a.io/xyz\x1b\\";
+        let has = |p: &[u8], n: &[u8]| p.windows(n.len()).any(|w| w == n);
+        let mut d = FrameDiffer::new(30, 5);
+        let p1 = d.frame(&frame, 30, 5, false, vec![seg.clone()]);
+        assert!(has(&p1, osc), "first frame tags the link");
+        assert!(has(&p1, b"\x1b]8;;\x1b\\"), "and closes it");
+        // Nothing changed: nothing to retag.
+        let p2 = d.frame(&frame, 30, 5, false, vec![seg.clone()]);
+        assert!(!has(&p2, b"\x1b]8;"), "unchanged frame ships no tags");
+        // An overlay over the URL: its text no longer matches, so no tag.
+        let covered = format!("\x1b[2;3H{url}\x1b[2;5HPOPUP").into_bytes();
+        let p3 = d.frame(&covered, 30, 5, false, vec![seg.clone()]);
+        assert!(!has(&p3, osc), "an overlaid URL isn't tagged");
+        // Uncovered again: the diff rewrote its cells, so it's retagged.
+        let p4 = d.frame(&frame, 30, 5, false, vec![seg]);
+        assert!(has(&p4, osc), "retagged once visible again");
+        // Gone: reprinted without a tag, and the diff-only frame stays small.
+        let p5 = d.frame(&frame, 30, 5, false, Vec::new());
+        assert!(!has(&p5, osc) && has(&p5, url.as_bytes()));
     }
 
     #[test]
