@@ -38,10 +38,12 @@ first, then load the specific docs it points to. Don't load the whole tree.
 
 - [`architecture/render-ship-path.md`](architecture/render-ship-path.md) — how a
   frame reaches the user's terminal, and what the vt100 mirror silently drops on
-  the way (OSC 8 hyperlinks can't survive it; OSC 52 works only by bypassing it).
+  the way (OSC 8 and OSC 52 survive only by going around it; detected URLs
+  are tagged after the diff, #147).
   Also the wide-glyph column accounting `blit_pane` depends on.
   Keywords: FrameDiffer, contents_diff, OSC 8, hyperlink, OSC 52, blit_pane,
-  wide glyph, wide continuation, artifacts, clickable links.
+  wide glyph, wide continuation, artifacts, clickable links, LinkSeg,
+  find_links, wrapped URL.
 
 ## Components
 _(Add per-subsystem docs here as they're written — e.g. config loading &

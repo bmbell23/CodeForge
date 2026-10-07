@@ -38,9 +38,22 @@ dropped with a debug log. In particular:
   })
   ```
 
-  Making hyperlinks work in-app means tracking them per cell *beside* the
-  differ and re-applying them to the diff bytes each frame. That touches the
-  ship path on every frame — treat it as its own scoped ticket.
+  **Detected URLs do get OSC 8 now (#147), beside the mirror.** `render` collects
+  every `http(s)://` URL on screen (`find_links`), joining rows that vt100 marked
+  soft-wrapped, plus rows a URL fills to the last column and continues at column 0
+  of the next. Each row of a URL becomes a `LinkSeg`, and all of a URL's segments
+  share one id. `FrameDiffer::frame` then appends `link_bytes` after the diff:
+  every segment that's new, or whose cells the diff just rewrote (which strips the
+  tag), is reprinted from the mirror's own cells inside `OSC 8 ;id=…;url ST`.
+  After that the stream's attributes and cursor are restored. An unchanged screen
+  ships no tags. A segment whose mirror text no longer matches (an overlay on top
+  of it) is skipped. This is why a URL that wraps across pane rows is one
+  clickable link. WezTerm's own regex only matches within one terminal line, and
+  forge never lets the terminal wrap.
+
+  Still lost: a pane's *own* OSC 8 (link text that isn't itself a URL, e.g. the
+  Claude CLI's). Carrying those would mean tracking them per cell from the pane
+  parser, which vt100 also drops.
 
 - **OSC 52 (clipboard) is the exception**, and it works by *bypassing* this
   path: `Msg::Output` forwards OSC 52 ranges from a pane straight to the client
