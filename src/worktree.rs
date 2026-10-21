@@ -207,11 +207,16 @@ fn create_one(
     }
 
     progress(&format!("adding worktree {name}…"));
+    // --no-track: branching from a remote-tracking ref would otherwise make
+    // origin/<upstream> the branch's upstream (autoSetupMerge), so a bare
+    // `git push` from the ticket worktree lands on main (#153). With no
+    // upstream, that push fails until the first `git push -u origin <name>`.
     git(
         clone_dir,
         &[
             "worktree",
             "add",
+            "--no-track",
             "-b",
             &name,
             &dest.to_string_lossy(),
@@ -418,6 +423,20 @@ mod tests {
         };
         let made = create(&tmp, &spec, &|m| println!("  progress: {m}")).unwrap();
         println!("E2E created at: {}", made.display());
+        // The ticket branch must not track origin/main, or a bare push from it
+        // goes to main (#153): it has no upstream until its first push -u.
+        let u = Command::new("git")
+            .arg("-C")
+            .arg(&made)
+            .args(["rev-parse", "--abbrev-ref", "@{u}"])
+            .output()
+            .unwrap();
+        assert!(
+            !u.status.success(),
+            "new worktree branch tracks {}",
+            String::from_utf8_lossy(&u.stdout).trim()
+        );
+        assert_eq!(classify_local(&made), WtState::Clean);
         println!(
             "  exists={} is_worktree={}",
             made.is_dir(),
