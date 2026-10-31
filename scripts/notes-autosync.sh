@@ -56,11 +56,16 @@ pull_remote() {
 
 status="$(git status --porcelain)"
 
-# Clean tree: just pull so another device's notes show up promptly. Already
-# synced, so stamp the time (unless a conflict was raised).
+# Clean tree: pull so another device's notes show up promptly. Apps that commit
+# their own saves (LifeForge) leave a clean tree with unpushed commits (#154), so
+# push whenever we're ahead of upstream. Stamp the time only once nothing is
+# left unpushed (and no conflict was raised).
 if [ -z "$status" ]; then
   : >"$STATE" 2>/dev/null || true
   if pull_remote; then
+    if [ -n "$(git rev-list '@{u}..HEAD' 2>/dev/null)" ]; then
+      GIT_TERMINAL_PROMPT=0 git push -q || exit 0
+    fi
     date +%s >"$SYNCED_AT" 2>/dev/null || true
   fi
   exit 0
