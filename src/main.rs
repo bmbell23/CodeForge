@@ -4649,14 +4649,21 @@ fn find_links(screen: &vt100::Screen, inner: Rect, pane_id: usize, out: &mut Vec
     while row < h {
         // One logical line: the cells of every row it spans, with positions.
         let mut line: Vec<(u16, u16, char)> = Vec::new();
+        let mut from = 0;
         loop {
-            line.extend((0..w).map(|c| (row, c, ch(row, c))));
-            let runs_on = row + 1 < h
-                && (screen.row_wrapped(row)
-                    || (is_url_char(ch(row, w - 1)) && is_url_char(ch(row + 1, 0))));
+            line.extend((from..w).map(|c| (row, c, ch(row, c))));
+            from = 0;
+            let next = row + 1;
             row += 1;
-            if !runs_on {
+            if next >= h {
                 break;
+            }
+            if screen.row_wrapped(next - 1) {
+                continue;
+            }
+            match url_runs_on(&mut line, w, |c| ch(next, c)) {
+                Some(f) => from = f,
+                None => break,
             }
         }
         let text: Vec<char> = line.iter().map(|&(_, _, c)| c).collect();
@@ -4680,6 +4687,48 @@ fn find_links(screen: &vt100::Screen, inner: Rect, pane_id: usize, out: &mut Vec
             }
         }
     }
+}
+
+/// How far short of the right edge a self-wrapped URL row may end, and how deep
+/// its continuation may be indented (#156). Claude Code breaks long words
+/// itself, keeps a margin and indents every continuation under its `● ` /
+/// `  ⎿  ` gutter, so the row neither fills to the edge nor resumes at column 0.
+const LINK_EDGE_GAP: u16 = 3;
+const LINK_MAX_INDENT: u16 = 8;
+
+/// If the row at the end of `line` breaks a URL that carries on in the next row
+/// (read through `next`), trim `line`'s trailing blanks and return the column
+/// the continuation starts at. Only a URL still open at the break counts — its
+/// trailing token has a scheme — so prose that happens to reach the edge
+/// doesn't get glued to the next line.
+fn url_runs_on(
+    line: &mut Vec<(u16, u16, char)>,
+    w: u16,
+    next: impl Fn(u16) -> char,
+) -> Option<u16> {
+    let blanks = line.iter().rev().take_while(|&&(_, _, c)| c == ' ').count();
+    if blanks >= w as usize || blanks > LINK_EDGE_GAP as usize {
+        return None;
+    }
+    let body = &line[..line.len() - blanks];
+    let token: String = {
+        let tail: Vec<char> = body
+            .iter()
+            .rev()
+            .map(|&(_, _, c)| c)
+            .take_while(|&c| is_url_char(c))
+            .collect();
+        tail.into_iter().rev().collect()
+    };
+    if !token.contains("http://") && !token.contains("https://") {
+        return None;
+    }
+    let first = (0..w.min(LINK_MAX_INDENT + 1)).find(|&c| next(c) != ' ')?;
+    if !is_url_char(next(first)) {
+        return None;
+    }
+    line.truncate(line.len() - blanks);
+    Some(first)
 }
 
 /// `[start, end)` spans of `http://` / `https://` URLs in `text`, trimmed of
@@ -7592,6 +7641,52 @@ mod tests {
         );
         assert_eq!(segs.len(), 2, "{segs:?}");
         assert_eq!(segs[0].url, "https://abcd.ef/g");
+    }
+
+    #[test]
+    fn find_links_joins_a_url_claude_wrapped_under_its_gutter() {
+        // Claude Code breaks the URL itself, stops a cell short of the edge and
+        // indents each continuation under its gutter (#156).
+        let p = screen_of(
+            20,
+            4,
+            "\u{25cf} https://aws.co/a?\r\n  b=1&scope=openid\r\n  &redirect=x%2F\r\n  done.",
+        );
+        let mut segs = Vec::new();
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 4,
+        };
+        find_links(p.screen(), inner, 1, &mut segs);
+        assert_eq!(segs.len(), 3, "{segs:?}");
+        let url = "https://aws.co/a?b=1&scope=openid&redirect=x%2F";
+        assert!(segs.iter().all(|s| s.url == url && s.id == segs[0].id));
+        assert_eq!((segs[1].x, segs[1].y), (2, 1));
+        let joined: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(joined, url);
+    }
+
+    #[test]
+    fn find_links_doesnt_glue_prose_to_a_url_line() {
+        // Prose reaching the edge isn't an open URL, and a finished URL followed
+        // by a blank-led line doesn't swallow it.
+        let p = screen_of(
+            20,
+            4,
+            "words reach the edge\r\n  more words\r\nhttps://a.b/c\r\n  next",
+        );
+        let mut segs = Vec::new();
+        let inner = Rect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 4,
+        };
+        find_links(p.screen(), inner, 1, &mut segs);
+        let urls: Vec<&str> = segs.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(urls, ["https://a.b/c"]);
     }
 
     #[test]
